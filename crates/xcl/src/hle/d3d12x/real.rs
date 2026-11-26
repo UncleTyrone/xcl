@@ -1936,15 +1936,38 @@ fn note_buffer_view() {
     }
 }
 
+/// D3D12 rejects a constant view larger than 64 KiB; a larger SizeInBytes has removed the
+/// device on NVIDIA. Cap before writing the V# / forwarding to the PC.
+const CBV_SIZE_CAP: u32 = 64 * 1024;
+
+fn cap_cbv_size(size: u32) -> u32 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if size <= CBV_SIZE_CAP {
+        return size;
+    }
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        crate::xlog_warn!("D3D12.X: CreateConstantBufferView SizeInBytes capped at 64 KiB (was {size})");
+    }
+    CBV_SIZE_CAP
+}
+
 /// #17 CreateConstantBufferView: a V# of float4 rows at the buffer's console address
 /// (`desc::cbv_words`; unified memory, anything else gets an empty V#). No PC CBV: translated
 /// shaders read buffers through `mem`.
 unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12_CONSTANT_BUFFER_VIEW_DESC, cpu: u64) {
     let Some(slot) = super::console_heap::slot(cpu).filter(|s| !s.sampler) else {
         let f: unsafe extern "system" fn(*mut c_void, *const D3D12_CONSTANT_BUFFER_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 17));
+        if let Some(d) = desc.as_ref() {
+            if d.SizeInBytes > CBV_SIZE_CAP {
+                let mut capped = *d;
+                capped.SizeInBytes = cap_cbv_size(d.SizeInBytes);
+                return f(this, &capped, cpu);
+            }
+        }
         return f(this, desc, cpu);
     };
     let (va, size) = desc.as_ref().map_or((0, 0), |d| (d.BufferLocation, d.SizeInBytes));
+    let size = cap_cbv_size(size);
     let in_uma = crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
     if !in_uma {
         note_buffer_view();

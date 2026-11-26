@@ -308,13 +308,13 @@ pub fn geometry_program(es_blob: &[u8], gs_blob: &[u8]) -> Result<(Vec<u8>, GsIn
     Ok((code, g))
 }
 
-/// Non-system elements in register order – the order of `exp param N` / `v_interp attrN`.
+/// Non-system elements in the container's declaration order – the order of `exp param N` /
+/// `v_interp attrN`. The console's ISG1/OSG1 keep that order; sorting by register reordered
+/// packed rows and failed the PC validator (Kelvaroq 0047).
 pub fn ranked(sig: &[SigElement], with_clip: bool) -> Vec<&SigElement> {
     let mut user: Vec<&SigElement> = sig.iter().filter(|e| e.system_value == 0 && !e.name.starts_with("SV_")).collect();
-    user.sort_by_key(|e| e.register);
     if with_clip {
-        let mut clip: Vec<&SigElement> = sig.iter().filter(|e| matches!(e.system_value, 2 | 3)).collect();
-        clip.sort_by_key(|e| e.register);
+        let clip: Vec<&SigElement> = sig.iter().filter(|e| matches!(e.system_value, 2 | 3)).collect();
         user.extend(clip);
     }
     user

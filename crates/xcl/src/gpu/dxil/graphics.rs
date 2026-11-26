@@ -607,7 +607,8 @@ fn sig_part(p: &[Placed], output: bool, native16: bool) -> Vec<u8> {
             });
         }
     }
-    rows.sort_by_key(|r| (r.register, r.mask.trailing_zeros()));
+    // Keep the container's element order. Sorting by register reordered packed rows that
+    // already shared one interpolation mode (`place`) and failed the PC validator.
     let names: Vec<&str> = p.iter().map(|e| e.e.name.as_str()).collect();
     container::signature_part(&rows, &names)
 }
