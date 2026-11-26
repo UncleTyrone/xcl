@@ -76,6 +76,12 @@ pub fn constants_order() -> bool {
     latch(&ON, "XCL_PORT_CONSTANTS_ORDER")
 }
 
+/// With [`constants_order`]: in-place indirect clamps never share a prelude batch (unset or `=0` off).
+pub fn constants_order_alone() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_PORT_CONSTANTS_ORDER_ALONE").is_none_or(|v| v != "0"))
+}
+
 /// NVIDIA mesh amplification launch for indirect mesh draws.
 pub fn mesh_launch() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();

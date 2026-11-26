@@ -291,24 +291,6 @@ fn inline_guard_batch_on() -> bool {
 /// A recording's blocks of rewritten indirect arguments, and most bytes of them (past it, its
 /// two-pass ExecuteIndirects are skipped)
 const SCRATCH_BLOCK: u64 = 1 << 20;
-/// The first block of a recording's slot: 512 arguments of 256 bytes. A retail title's world has
-/// some 130 recordings a frame alive for several frames, most with a few indirect calls: at
-/// `SCRATCH_BLOCK` each, 493 blocks were made in 15 s and stayed alive (493 MiB of video memory,
-/// and as much commit). A slot that fills its first block goes on in `SCRATCH_BLOCK`s.
-const SCRATCH_FIRST_BLOCK: u64 = 128 << 10;
-
-/// The bytes of the block a slot takes for `bytes` of arguments: its first one small, the ones
-/// after it `SCRATCH_BLOCK`, and never less than what is asked.
-fn scratch_block_bytes(bytes: u64, first: bool) -> u64 {
-    bytes.max(if first { SCRATCH_FIRST_BLOCK } else { SCRATCH_BLOCK })
-}
-
-/// The free block (`FREE_RES`: buffer, bytes, device) to take for `size` bytes with `remaining`
-/// left of the recording's cap: the smallest that holds them, so a small first block does not
-/// take a record buffer of megabytes that the next two-pass draw then makes anew.
-fn pick_free_block(free: &[(u64, usize)], dev: usize, size: u64, remaining: u64) -> Option<usize> {
-    free.iter().enumerate().filter(|(_, (cap, d))| *d == dev && *cap >= size && *cap <= remaining).min_by_key(|(_, (cap, _))| *cap).map(|(i, _)| i)
-}
 /// Default per-recording cap on rewritten indirect-argument scratch (MiB). Overridable via
 /// `XCL_INDIRECT_SCRATCH_MB` (clamped 4..=128 MiB) so dense open-world indirect draw lists do
 /// not exhaust scratch mid-recording and drop trailing draws.
@@ -465,14 +447,6 @@ fn recycle_into_pool<T>(free: &Mutex<Vec<T>>, items: Vec<T>, mut keep: impl FnMu
         }
     }
     drop(overflow);
-}
-
-/// Give back scratch that completed recordings returned to the reuse pools. Drop COM objects
-/// outside the locks because their release hooks can re-enter `release_allocator_res`.
-pub(super) fn trim_free_scratch(dev_key: usize) {
-    let buffers: Vec<_> = FREE_RES.lock().unwrap().extract_if(.., |(_, _, dev)| *dev == dev_key).collect();
-    let io: Vec<_> = FREE_IO.lock().unwrap().extract_if(.., |block| block.dev_key == dev_key).collect();
-    drop((buffers, io));
 }
 
 pub(super) fn release_allocator_res(allocator: usize) {
@@ -2204,6 +2178,62 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
 }
 "#;
 
+fn constants_order_active(commands_at: Option<(usize, usize)>, count_at: Option<usize>, span: usize) -> bool {
+    super::port::constants_order()
+        && super::port_constants::on()
+        && (commands_at.is_some_and(|(p, n)| {
+            let len = span.min(n);
+            len > 0 && super::port_constants::touches_range(p, len)
+        }) || count_at.is_some_and(|p| super::port_constants::touches_range(p, 4)))
+}
+
+/// In-place indirect arguments: clamp at ExecuteIndirect time, not in the prelude batch.
+fn prepare_constants_order_indirect(this: *mut c_void) {
+    flush_window_draw(this);
+    invalidate_inline_guard(this);
+    with(this, |s| {
+        if super::port::constants_order_alone() || super::clamp::indirect_batch() != 1 {
+            s.prelude_guards.clear();
+            s.prelude_scales.clear();
+            s.prelude_draws.clear();
+        }
+        s.prelude_blocked = true;
+        s.arg_order_clean = false;
+    });
+}
+
+pub(super) unsafe fn prepare_deferred_indirect_execute(
+    list: *mut c_void,
+    sig: usize,
+    max: u32,
+    args: usize,
+    args_off: u64,
+    count_buf: usize,
+    count_off: u64,
+) {
+    if !super::port::constants_order() {
+        return;
+    }
+    let commands_at = super::real::console_buffer(args).and_then(|(p, n)| {
+        let off = usize::try_from(args_off).ok()?;
+        (off <= n).then(|| p.checked_add(off).map(|addr| (addr, n - off))).flatten()
+    });
+    let count_at = super::real::console_buffer(count_buf).and_then(|(p, n)| {
+        let off = usize::try_from(count_off).ok()?;
+        (off.checked_add(4)? <= n).then(|| p.checked_add(off)).flatten()
+    });
+    let span = if signature_dispatches(sig) {
+        (max as usize).saturating_mul(12)
+    } else if let Some(dsig) = draw_sig_of(sig) {
+        (max as usize).saturating_mul(dsig.byte_stride as usize)
+    } else {
+        0
+    };
+    if constants_order_active(commands_at, count_at, span) {
+        prepare_constants_order_indirect(list);
+    }
+}
+
 fn flush_window_draw(this: *mut c_void) {
     with(this, |s| {
         let w = s.window_clamp;
@@ -2442,7 +2472,7 @@ unsafe fn alloc_prelude_scratch(this: *mut c_void, dev: &ID3D12Device, bytes: u6
     }) {
         return Ok(r);
     }
-    let size = scratch_block_bytes(bytes, with(this, |s| s.prelude_scratch.buf.is_none()));
+    let size = bytes.max(SCRATCH_BLOCK);
     let cap = scratch_cap();
     let remaining = cap.saturating_sub(with(this, |s| s.scratch_taken));
     if size > remaining {
@@ -2451,8 +2481,7 @@ unsafe fn alloc_prelude_scratch(this: *mut c_void, dev: &ID3D12Device, bytes: u6
     let dev_key = dev.as_raw() as usize;
     let picked = {
         let mut free = FREE_RES.lock().unwrap();
-        let shapes: Vec<(u64, usize)> = free.iter().map(|(_, cap, d)| (*cap, *d)).collect();
-        pick_free_block(&shapes, dev_key, size, remaining).map(|i| free.swap_remove(i))
+        free.iter().position(|(_, cap, d)| *d == dev_key && *cap >= size && *cap <= remaining).map(|i| free.swap_remove(i))
     };
     let block = match picked {
         Some(e) => e,
@@ -3346,7 +3375,7 @@ unsafe fn scratch_args_in(this: *mut c_void, dev: &ID3D12Device, bytes: u64, slo
     }) {
         return Ok(r);
     }
-    let size = scratch_block_bytes(bytes, with(this, |s| s.scratch[slot].buf.is_none()));
+    let size = bytes.max(SCRATCH_BLOCK);
     let cap = scratch_cap();
     let remaining = cap.saturating_sub(with(this, |s| s.scratch_taken));
     if size > remaining {
@@ -3355,8 +3384,7 @@ unsafe fn scratch_args_in(this: *mut c_void, dev: &ID3D12Device, bytes: u64, slo
     let dev_key = dev.as_raw() as usize;
     let picked = {
         let mut free = FREE_RES.lock().unwrap();
-        let shapes: Vec<(u64, usize)> = free.iter().map(|(_, cap, d)| (*cap, *d)).collect();
-        pick_free_block(&shapes, dev_key, size, remaining).map(|i| free.swap_remove(i))
+        free.iter().position(|(_, cap, d)| *d == dev_key && *cap >= size && *cap <= remaining).map(|i| free.swap_remove(i))
     };
     let block = match picked {
         Some(e) => e,
@@ -3572,17 +3600,13 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             }
             bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
             let m1 = super::culprit::before_dispatch(list, raw_pso, pso, [n, 1, 1]);
-            let t1 = super::gpu_profile::begin(this, [raw_pso, pso], super::gpu_profile::Kind::Dispatch, [n, 1, 1]);
             list.Dispatch(n, 1, 1);
-            super::gpu_profile::end(this, t1);
             super::culprit::after_dispatch(list, m1);
             emit_uav_barrier(list, Some(&res_buf));
             bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
             // (the mesh pass: what the marker says is its groups; 0x3e2 marks a mesh draw in the log)
             let m2 = super::culprit::before_dispatch(list, raw_pso, pso, [n * tp.mesh_groups_per_record, 0x3e2, 1]);
-            let t2 = super::gpu_profile::begin(this, [raw_pso, pso], super::gpu_profile::Kind::Draw, [n * tp.mesh_groups_per_record, 1, 0]);
             pc_dm(this, n * tp.mesh_groups_per_record, 1, 1);
-            super::gpu_profile::end(this, t2);
             super::culprit::after_dispatch(list, m2);
             emit_uav_barrier(list, Some(&res_buf));
             with(this, |s| {
@@ -3660,6 +3684,17 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     });
     let (args_off_title, count_off_title) = (args_off, count_off);
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
+    let indirect_span = if signature_dispatches(sig) {
+        (max as usize).saturating_mul(12)
+    } else if let Some(dsig) = draw_sig_of(sig) {
+        (max as usize).saturating_mul(dsig.byte_stride as usize)
+    } else {
+        0
+    };
+    let constants_ordered = constants_order_active(commands_at, count_at, indirect_span);
+    if constants_ordered {
+        prepare_constants_order_indirect(this);
+    }
     if let Some(tp) = super::real::two_pass_of(pso) {
         if skip_mesh() {
             count(DRAWS_SKIPPED);
@@ -3703,9 +3738,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     bind_two_pass_stage(this, list, pso, &tp, res_va, compute)?;
                     let (s, first) = if compute { (msig.companion_dispatch, at) } else { (sig, at + commands as u64) };
                     let mark = super::culprit::before_dispatch(list, raw_pso, pso, [0, 0, if compute { 1 } else { 0x3e2 }]);
-                    let t = super::gpu_profile::begin(this, [raw_pso, pso], if compute { super::gpu_profile::Kind::IndirectDispatch } else { super::gpu_profile::Kind::IndirectDraw }, [1, 0, 0]);
                     pc(this, s, 1, scaled.as_raw() as usize, first + k as u64 * msig.byte_stride as u64, 0, 0);
-                    super::gpu_profile::end(this, t);
                     super::culprit::after_dispatch(list, mark);
                     emit_uav_barrier(list, Some(&res_buf));
                 }
@@ -3849,9 +3882,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // Run split compute ExecuteIndirects through their already-built chain pieces on the GPU
         // instead of stalling or skipping while the whole form compiles in the background.
         let ei = || {
-            if guarded.is_some() {
+            if guarded.is_some() && count_buf == 0 && !constants_ordered {
                 pc(this, sig, max, exec_args, exec_args_off, count_buf, count_off);
             } else {
+                if constants_ordered {
+                    with(this, |s| s.arg_order_clean = false);
+                }
                 fresh_indirect_arguments(this, || pc(this, sig, max, exec_args, exec_args_off, count_buf, count_off));
             }
         };
@@ -3859,8 +3895,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if let Some((p, _)) = commands_at.filter(|&(_, n)| n >= 12) {
             super::culprit::indirect_args(mark, p);
         }
-        let t = super::gpu_profile::begin(this, [raw_pso, pso], super::gpu_profile::Kind::IndirectDispatch, [max, 0, 0]);
-        let chained = chained_indirect(
+        match chained_indirect(
             this,
             list,
             pso,
@@ -3871,9 +3906,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             (count_buf, count_off_title, count_off),
             preset_io,
             ei,
-        );
-        super::gpu_profile::end(this, t);
-        match chained {
+        ) {
             Ok(true) => {
                 super::culprit::after_dispatch(list, mark);
                 if super::ambient::has_compute_psos() {
@@ -3955,13 +3988,14 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             if let Some((p, _)) = commands_at.filter(|&(_, n)| n >= 12) {
                 super::culprit::indirect_args(mark, p);
             }
-            let t = super::gpu_profile::begin(this, [with(this, |s| s.pso), pso], if gfx { super::gpu_profile::Kind::IndirectDraw } else { super::gpu_profile::Kind::IndirectDispatch }, [max, 0, 0]);
-            if guarded.is_some() && count_buf == 0 {
+            if guarded.is_some() && count_buf == 0 && !constants_ordered {
                 pc(this, sig, max, args, args_off, count_buf, count_off);
             } else {
+                if constants_ordered {
+                    with(this, |s| s.arg_order_clean = false);
+                }
                 fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off))
             }
-            super::gpu_profile::end(this, t);
             super::culprit::after_dispatch(list, mark);
             if compute {
                 if super::ambient::has_compute_psos() {
@@ -4234,9 +4268,7 @@ pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices:
             return;
         }
         super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
-        let t = super::gpu_profile::begin(this, [with(this, |s| s.pso), 0], super::gpu_profile::Kind::Draw, [vertices, instances, 0]);
         list.DrawInstanced(vertices, instances, first_vertex, first_instance);
-        super::gpu_profile::end(this, t);
         if super::ambient::has_sky_psos() {
             let pso = pso_for_draw(with(this, |s| s.pso));
             super::ambient::after_draw(this, pso);
@@ -4282,10 +4314,7 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
     base_vertex: i32,
     first_instance: u32,
 ) {
-    let this = list.as_raw();
-    let t = super::gpu_profile::begin(this, [with(this, |s| s.pso), 0], super::gpu_profile::Kind::Draw, [indices, instances, 0]);
     list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
-    super::gpu_profile::end(this, t);
 }
 
 /// The pipeline a draw (or an ExecuteIndirect) uses now: both graphics and compute pipelines wait
@@ -4681,7 +4710,10 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         return;
     }
     match translated_dispatch(this, list, pso, x, y, z) {
-        Ok(()) => count(DISPATCHES),
+        Ok(()) => {
+            count(DISPATCHES);
+            super::list_x::note_shader_pass(this);
+        }
         Err(e) => {
             count(DISPATCHES_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -4805,9 +4837,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     let (limit, [x, y, z]) = fold(x, y, z);
     bind_abi(this, list, pso, false, limit, None)?;
     let mark = super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [x, y, z]);
-    let t = super::gpu_profile::begin(this, [with(this, |s| s.pso), pso], super::gpu_profile::Kind::Dispatch, [x, y, z]);
     let r = super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z]);
-    super::gpu_profile::end(this, t);
     super::culprit::after_dispatch(list, mark);
     if super::ambient::has_compute_psos() {
         let (layout, args, view_heap) = with(this, |s| (s.layout.clone(), s.args.clone(), s.heaps[0]));
@@ -5071,27 +5101,6 @@ mod tests {
         assert_eq!(two_pass_list_mb(Some("1000")), 128);
     }
 
-    /// A slot's first block of rewritten arguments is small, the ones after it are
-    /// `SCRATCH_BLOCK`, a request larger than either gets its own size; and a free block is
-    /// taken smallest first, of the same device, within what the recording may still take.
-    #[test]
-    fn a_recordings_first_argument_block_is_small_and_free_blocks_go_smallest_first() {
-        assert_eq!(scratch_block_bytes(256, true), SCRATCH_FIRST_BLOCK);
-        assert_eq!(scratch_block_bytes(256, false), SCRATCH_BLOCK);
-        assert_eq!(scratch_block_bytes(SCRATCH_FIRST_BLOCK + 256, true), SCRATCH_FIRST_BLOCK + 256);
-        assert_eq!(scratch_block_bytes(4 << 20, true), 4 << 20);
-        assert_eq!(scratch_block_bytes(4 << 20, false), 4 << 20);
-        assert!(SCRATCH_FIRST_BLOCK < SCRATCH_BLOCK && SCRATCH_FIRST_BLOCK % 256 == 0);
-        // (bytes, device): a 32 MiB record buffer, two blocks, one of another device
-        let free = [(32u64 << 20, 7usize), (1 << 20, 7), (128 << 10, 7), (128 << 10, 9)];
-        assert_eq!(pick_free_block(&free, 7, 128 << 10, 32 << 20), Some(2));
-        assert_eq!(pick_free_block(&free, 7, 512 << 10, 32 << 20), Some(1));
-        assert_eq!(pick_free_block(&free, 7, 2 << 20, 32 << 20), Some(0));
-        // the record buffer is past what the recording may still take
-        assert_eq!(pick_free_block(&free, 7, 2 << 20, 16 << 20), None);
-        assert_eq!(pick_free_block(&free, 8, 256, 32 << 20), None);
-    }
-
     #[test]
     fn inline_guard_batch_defaults_off_and_opts_in() {
         assert!(!parse_inline_guard_batch(None));
@@ -5135,9 +5144,10 @@ mod tests {
     }
 
     /// A dispatch writes an ExecuteIndirect's group count through another buffer over the same
-    /// memory (as translated shaders write through the memory windows), then the ExecuteIndirect
-    /// runs the count just written. The test orders the placed aliases explicitly so the driver
-    /// sees valid D3D12 accesses before `fresh_indirect_arguments` runs.
+    /// memory (as translated shaders write through the memory windows), a UAV barrier (what a
+    /// console barrier becomes), then the ExecuteIndirect: it runs the count just written, not
+    /// the one the memory held before the list (`fresh_indirect_arguments`; without it an RTX
+    /// 5090 ran the old count in nearly every try).
     #[test]
     fn execute_indirect_reads_the_arguments_written_before_it() {
         use crate::gpu::{fence, recomp::runner::skip_test};
@@ -5167,8 +5177,7 @@ void main(uint t : SV_GroupIndex) {
         unsafe {
             let setup = || -> Result<(ID3D12Device, String), String> {
                 let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI factory unavailable: {e}"))?;
-                // The driver-specific probe runs on hardware only when selected explicitly.
-                let sel = crate::gpu::adapter::Selector::from_env_or("warp");
+                let sel = crate::gpu::adapter::Selector::from_env_or("auto");
                 let (adapter, name): (IDXGIAdapter1, String) = if sel == crate::gpu::adapter::Selector::Warp {
                     (factory.EnumWarpAdapter().map_err(|e| format!("WARP unavailable: {e}"))?, "WARP (software renderer)".into())
                 } else {
@@ -5236,13 +5245,6 @@ void main(uint t : SV_GroupIndex) {
                 Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
                 Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: ManuallyDrop::new(None) }) },
             };
-            // D3D12 requires an aliasing barrier for the switch from `written` to `args`
-            // inside one ExecuteCommandLists call, even for buffers that inherit bytes.
-            let alias_barrier = D3D12_RESOURCE_BARRIER {
-                Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
-                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                Anonymous: D3D12_RESOURCE_BARRIER_0 { Aliasing: ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER::default()) },
-            };
             let run = |list: &ID3D12GraphicsCommandList, close: &dyn Fn()| {
                 close();
                 queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
@@ -5269,7 +5271,7 @@ void main(uint t : SV_GroupIndex) {
                 alloc.Reset().unwrap();
                 *count = 0;
                 let list = record(new);
-                list.ResourceBarrier(&[uav_barrier.clone(), alias_barrier.clone()]);
+                list.ResourceBarrier(&[uav_barrier.clone()]);
                 list.SetComputeRoot32BitConstants(0, 2, [1u32, 0].as_ptr() as _, 0);
                 // from here as XCL records a title's ExecuteIndirect: on the adopted list
                 let raw = list.as_raw();
@@ -7114,38 +7116,6 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
         let records = [(u32::MAX, u32::MAX), (3000, 4), (DRAW_VERTS_PER_INST_LIMIT, 1), (1024, 16)];
         let rejected: Vec<bool> = records.iter().map(|&(v, i)| draw_record_rejected(v, i)).collect();
         assert_eq!(rejected, vec![true, false, true, false]);
-    }
-
-    #[test]
-    fn trimming_free_scratch_releases_only_the_requested_devices_idle_buffers() {
-        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
-
-        unsafe {
-            let mut dev: Option<ID3D12Device> = None;
-            let _ = D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev);
-            let Some(dev) = dev else {
-                crate::gpu::recomp::runner::skip_test("no D3D12 device");
-                return;
-            };
-            let buffer = default_uav_buffer(&dev, IO_BLOCK_BYTES, "test scratch").unwrap();
-            let (trimmed, other, allocator) = (0x7500_1030, 0x7500_1031, 0x7500_1032);
-            FREE_RES.lock().unwrap().extend([
-                (buffer.clone(), IO_BLOCK_BYTES, trimmed),
-                (buffer.clone(), IO_BLOCK_BYTES, other),
-            ]);
-            ALLOC_RES.lock().unwrap().get_or_insert_with(HashMap::new).insert(allocator, vec![(buffer, IO_BLOCK_BYTES, trimmed)]);
-
-            trim_free_scratch(trimmed);
-            {
-                let free = FREE_RES.lock().unwrap();
-                assert!(!free.iter().any(|entry| entry.2 == trimmed));
-                assert!(free.iter().any(|entry| entry.2 == other));
-            }
-            assert!(ALLOC_RES.lock().unwrap().as_ref().unwrap().contains_key(&allocator));
-            release_allocator_res(allocator);
-            trim_free_scratch(trimmed);
-            trim_free_scratch(other);
-        }
     }
 
     #[test]
