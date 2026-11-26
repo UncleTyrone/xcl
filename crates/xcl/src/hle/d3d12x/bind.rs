@@ -45,6 +45,13 @@ static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 pub fn activity() -> (u64, u64) {
     (COUNTS[DRAWS].load(Ordering::Relaxed), COUNTS[DISPATCHES].load(Ordering::Relaxed))
 }
+
+pub fn skipped_counts() -> (u64, u64) {
+    (
+        COUNTS[DRAWS_SKIPPED].load(Ordering::Relaxed),
+        COUNTS[DISPATCHES_SKIPPED].load(Ordering::Relaxed),
+    )
+}
 const DRAWS: usize = 0;
 const DRAWS_SKIPPED: usize = 1;
 const DRAWS_PC: usize = 2;
@@ -335,7 +342,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
-    match bind_abi(this, list, pso, gfx) {
+    match bind_abi(this, list, pso, gfx, 0) {
         Ok(()) => {
             if compute {
                 match super::real::dispatch_chain::whole(pso) {
@@ -593,7 +600,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     if super::present::trace_frame() {
         trace_ui_draw(this, pso);
     }
-    match bind_abi(this, &list, pso, true) {
+    match bind_abi(this, &list, pso, true, 0) {
         Ok(()) => {
             count(DRAWS);
             Some(list)
@@ -1007,14 +1014,35 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     if super::present::trace_frame() {
         trace_fullscreen(this, pso, [x, y, z]);
     }
-    bind_abi(this, list, pso, false)?;
+    // more groups in X than D3D12 takes: folded (`recomp::IO_GROUP_LIMIT`)
+    let (limit, [x, y, z]) = fold(x, y, z);
+    bind_abi(this, list, pso, false, limit)?;
     super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z])
+}
+
+/// A dispatch of `x` x `y` x `z` groups as D3D12 takes it: (the count for
+/// `recomp::IO_GROUP_LIMIT` - 0: not folded -, the groups to dispatch). More than 65 535 in X
+/// with 1 in Y is folded into Y; any other count past 65 535 is clamped (logged once).
+pub(super) fn fold(x: u32, y: u32, z: u32) -> (u32, [u32; 3]) {
+    use crate::gpu::recomp::FOLD_X;
+    if x <= FOLD_X && y <= 65_535 && z <= 65_535 {
+        return (0, [x, y, z]);
+    }
+    if y == 1 && z <= 65_535 && x.div_ceil(FOLD_X) <= 65_535 {
+        return (x, [FOLD_X, x.div_ceil(FOLD_X), z]);
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 4 {
+        crate::xlog_warn!("D3D12.X: a dispatch of {x}x{y}x{z} groups cannot be folded – clamped to 65535 a dimension");
+    }
+    (0, [x.min(65_535), y.min(65_535), z.min(65_535)])
 }
 
 /// XCL's ABI for a translated pipeline: its root signature, the user SGPRs (`io`, the kept
 /// arguments the console's way – compute or graphics) and the argument table in unified
-/// memory, u1 res, u2… the memory windows; then the pipeline.
-unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
+/// memory, u1 res, u2… the memory windows; then the pipeline. `group_limit`: a folded
+/// dispatch's group count in X (`recomp::IO_GROUP_LIMIT`), 0 for any other.
+unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool, group_limit: u32) -> Result<(), String> {
     super::list_x::ensure_view_heap(this);
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
@@ -1039,6 +1067,9 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     };
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
     io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
+    if !gfx {
+        io[crate::gpu::recomp::IO_GROUP_LIMIT] = group_limit;
+    }
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let res_at = copy(&[0u8; 256])?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
@@ -1088,6 +1119,22 @@ mod tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn dispatches_past_the_d3d12_limit_are_folded_or_clamped() {
+        assert_eq!(fold(64, 2, 1), (0, [64, 2, 1]));
+        assert_eq!(fold(65_535, 1, 1), (0, [65_535, 1, 1]));
+        assert_eq!(fold(72_512, 1, 1), (72_512, [65_535, 2, 1]));
+        assert_eq!(fold(115_200, 1, 1), (115_200, [65_535, 2, 1]));
+        assert_eq!(fold(131_071, 1, 3), (131_071, [65_535, 3, 3]));
+        assert_eq!(fold(70_000, 2, 1), (0, [65_535, 2, 1]));
+        for n in [100_000u32, 200_000, 1_000_000] {
+            let (limit, [x, y, _]) = fold(n, 1, 1);
+            assert_eq!(limit, n);
+            assert_eq!(x, 65_535);
+            assert_eq!(y, n.div_ceil(65_535));
+        }
+    }
 
     /// A pipeline with the rect list GS draws its rect lists whole: draw_rects leaves them alone.
     #[test]

@@ -313,6 +313,9 @@ pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
             q.push(queue as usize);
         }
     }
+    super::console_heap::recycle_after_submit();
+    let (draws_skipped, _) = super::bind::skipped_counts();
+    super::console_heap::maybe_log_shared_heap(draws_skipped);
     super::late_release::drain_known(false);
     if !enabled() || IN_PRESENT.with(|c| c.get()) || PRESENTX.load(Ordering::Relaxed) {
         return;

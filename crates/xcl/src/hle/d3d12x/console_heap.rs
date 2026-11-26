@@ -95,6 +95,9 @@ static GLOBAL_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 
 /// descriptors of the shared heap at most (the GPU may take more: OPTIONS19)
 pub const GLOBAL_MAX: u32 = 1_000_000;
+/// First PC index for dynamic view ranges in the shared heap (Phase 2 / VItoriaBr). Descriptors
+/// below hold null views and memory-window UAVs (`set_window_views`).
+pub const MIN_DYNAMIC: u32 = 1 << 18;
 // (one million: what every resource binding tier 2+ GPU takes. The translated shaders accept a
 // T# index only below it (`gpu::dxil::lower_image::VIEW_HEAP_MAX_SRV`), so the heap must never be
 // smaller than that bound: an index past the heap's end hangs NVIDIA GPUs, which took 1 000 000
@@ -169,16 +172,17 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             }
         };
         crate::xlog_info!("console descriptor heaps: one shader-visible PC heap of {cap} view descriptors for all of them");
-        null_views(dev, heap.GetCPUDescriptorHandleForHeapStart().ptr as u64, dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+        let cpu = heap.GetCPUDescriptorHandleForHeapStart().ptr as u64;
+        let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        null_views_to(dev, cpu, inc, MIN_DYNAMIC);
         *g = Some(Global {
             dev: dev.clone(),
-            cpu: heap.GetCPUDescriptorHandleForHeapStart().ptr as u64,
+            cpu,
             gpu: heap.GetGPUDescriptorHandleForHeapStart().ptr,
-            inc: dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
+            inc,
             heap,
             cap,
-            // the memory windows' raw UAVs (`set_window_views`) come first
-            next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32,
+            next: MIN_DYNAMIC,
             free: Vec::new(),
         });
     }
@@ -189,7 +193,12 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
 /// console slot: even SRV, odd UAV), where shaders land for a T# of zeros (word 0, the PC index,
 /// is 0): they read zeros there rather than whatever an unwritten descriptor holds.
 unsafe fn null_views(dev: &ID3D12Device, cpu: u64, inc: u32) {
-    for k in 0..crate::gpu::recomp::MEM_HEAP_BASE as u64 {
+    null_views_to(dev, cpu, inc, crate::gpu::recomp::MEM_HEAP_BASE);
+}
+
+/// Even SRV / odd UAV null views at `0..to` (`null_views`, shared-heap band below `MIN_DYNAMIC`).
+unsafe fn null_views_to(dev: &ID3D12Device, cpu: u64, inc: u32, to: u32) {
+    for k in 0..to as u64 {
         let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + k * inc as u64) as usize };
         if k % 2 == 0 {
             let d = D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -208,6 +217,46 @@ unsafe fn null_views(dev: &ID3D12Device, cpu: u64, inc: u32) {
             dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&d), at);
         }
     }
+}
+
+/// Shared heap usage: descriptors handed out, and descriptors in released free ranges.
+pub fn shared_heap_stats() -> Option<(u32, u32)> {
+    GLOBAL.lock().unwrap().as_ref().map(|s| {
+        let used = in_use(s.next, &s.free);
+        let free: u32 = s.free.iter().map(|&(_, n)| n).sum();
+        (used, free)
+    })
+}
+
+static SUBMIT_HOLDS: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+
+pub fn hold_for_submit(first: u32, count: u32) {
+    if count > 0 && first >= MIN_DYNAMIC {
+        SUBMIT_HOLDS.lock().unwrap().push((first, count));
+    }
+}
+
+pub fn recycle_after_submit() {
+    let holds = std::mem::take(&mut *SUBMIT_HOLDS.lock().unwrap());
+    for (first, count) in holds {
+        release_global(first, count);
+    }
+}
+
+pub fn maybe_log_shared_heap(draws_skipped: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let now = ORIGIN.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+    let last = LAST.load(Relaxed);
+    if last != 0 && now.saturating_sub(last) < 1000 {
+        return;
+    }
+    LAST.store(now, Relaxed);
+    let Some((used, free)) = shared_heap_stats() else { return };
+    crate::xlog_info!(
+        "console descriptor heaps: {used} slots in use, {free} free in released ranges, {draws_skipped} draws skipped for bind/heap"
+    );
 }
 
 static WINDOW_VIEWS_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -246,6 +295,11 @@ pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -
         crate::xlog_warn!("memory windows: could not bind {count} window(s) in the shared descriptor heap");
     }
     ok
+}
+
+/// Descriptors of the shared heap handed out: those below the cursor `next` minus released ranges.
+fn in_use(next: u32, free: &[(u32, u32)]) -> u32 {
+    next.saturating_sub(free.iter().map(|&(_, n)| n).sum())
 }
 
 /// `count` descriptors of the shared heap: the index of the first. None: no shared heap, or
@@ -870,7 +924,8 @@ mod tests {
                 dev: dev.clone(),
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
                 cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024,
-                next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32, free: Vec::new(),
+                next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32,
+                free: Vec::new(),
             });
             let window = (&mut resource as *mut _ as usize, 0x10000);
             assert!(set_window_views(&dev, &[window]));
