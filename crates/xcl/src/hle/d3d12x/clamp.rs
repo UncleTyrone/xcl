@@ -1,5 +1,8 @@
 //! Indirect compute dispatches with group counts D3D12 takes (`XCL_CLAMP_INDIRECT=1`: on).
 //!
+//! Phase 14 env (shared with amd `clamp.rs`): `XCL_INDIRECT_BATCH` (`0` / `1` default / `2`);
+//! `XCL_INDIRECT_WINDOW=1` for mesh draw window hoisting on the amd tree (logged here when set).
+//!
 //! The console runs up to 2^32 − 1 groups a dimension; D3D12 takes 65 535, and past that the
 //! dispatch is undefined – on an NVIDIA GPU it ran on until the driver reset the device
 //! (0x887A0006). A retail game's world loading dispatches a compute program indirectly with
@@ -93,6 +96,35 @@ struct Clamp {
 unsafe impl Send for Clamp {}
 unsafe impl Sync for Clamp {}
 
+/// `XCL_INDIRECT_BATCH`: unset → `1`; `2` keeps batch semantics aligned with CGBJ (amd prelude).
+pub(crate) fn indirect_batch() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("XCL_INDIRECT_BATCH").as_deref() {
+        Ok("0") => 0,
+        Ok("2") => 2,
+        _ => 1,
+    })
+}
+
+/// `XCL_INDIRECT_WINDOW=1` (off by default; full window hoisting is amd-dev `clamp` + `bind`).
+pub(crate) fn indirect_window() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+}
+
+fn log_phase14_once() {
+    static DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if DONE.set(()).is_err() {
+        return;
+    }
+    if indirect_batch() == 2 {
+        crate::xlog_info!("D3D12.X: XCL_INDIRECT_BATCH=2 (dispatch clamp batch policy)");
+    }
+    if indirect_window() {
+        crate::xlog_info!("D3D12.X: XCL_INDIRECT_WINDOW=1 set (mesh window clamps: amd-dev tree)");
+    }
+}
+
 /// `XCL_CLAMP_INDIRECT=1`. Off unless asked for: with the pass on, a retail title's first world
 /// frames ended in a device removal on an NVIDIA GPU (0x887A0006 eight seconds after the pass
 /// first ran, the driver's breadcrumbs inside a Dispatch; a run of the same build with the pass
@@ -182,6 +214,7 @@ fn transition(res: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_
 /// the dispatch. None: left as it was (the caller dispatches from `args`). The list's compute
 /// root signature, root arguments and pipeline are changed: the caller sets its own again.
 pub unsafe fn before(list: &ID3D12GraphicsCommandList, args: usize, off: u64, io_limit: u64) -> Option<(usize, u64)> {
+    log_phase14_once();
     if !enabled() {
         return None;
     }
