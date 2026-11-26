@@ -5,7 +5,9 @@
 //! (`SetPipelineState`, console list replay, the two-pass lookups) uses the real one as soon
 //! as it is there. A graphics pipeline draws nothing until then; a compute pipeline is waited
 //! for where it is used, a `Dispatch` at its submit (a skipped dispatch would corrupt what it computes).
-//! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
+//! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before. Graphics draws wait up to
+//! `XCL_PIPELINE_WAIT_MS` per second per thread (default 4 ms, 500 ms on the first wait);
+//! past that they use the stand-in and are counted (`note_pending_draw`), logged each second.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -457,6 +459,7 @@ mod used {
             let earlier = parse(&std::fs::read_to_string(&path).unwrap_or_default());
             if !earlier.is_empty() {
                 crate::xlog_info!("D3D12.X: the pipelines of {} shader sets an earlier run used are built ahead of their first use", earlier.len());
+                let _ = super::preload();
             }
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
@@ -1064,10 +1067,42 @@ pub fn resolve(pso: usize) -> usize {
     }
 }
 
+/// Draws whose pipeline was still being built after the graphics wait budget (`pending_draws`,
+/// logged each second).
+static PENDING_DRAWS: AtomicUsize = AtomicUsize::new(0);
+static PENDING_DRAWS_LOG: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// A graphics draw went on with a pipeline still being built (its stand-in draws nothing).
+pub fn note_pending_draw() {
+    PENDING_DRAWS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Log how many draws ran with a pending pipeline since the last call (about once a second).
+pub fn log_pending_draws() {
+    let now = std::time::Instant::now();
+    let mut last = PENDING_DRAWS_LOG.lock().unwrap();
+    if last.is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_secs(1)) {
+        let n = PENDING_DRAWS.swap(0, Ordering::Relaxed);
+        if n > 0 {
+            crate::xlog_info!("D3D12.X: {n} draws with a pipeline still being built (last second)");
+        }
+        *last = Some(now);
+    }
+}
+
 /// `resolve`, waiting for a pipeline still being built – built here if no worker has started
 /// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
 pub fn resolve_wait(pso: usize) -> usize {
-    resolve_wait_for(pso, wait_budget())
+    let compute = entry(pso).is_some_and(|p| p.compute);
+    match gfx_wait_budget().filter(|_| !compute) {
+        Some(refill) => {
+            let start = std::time::Instant::now();
+            let r = resolve_wait_for(pso, Some(gfx_wait_left(refill, start)));
+            gfx_wait_spent(start.elapsed());
+            r
+        }
+        None => resolve_wait_for(pso, wait_budget()),
+    }
 }
 
 /// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
@@ -1097,13 +1132,80 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     }
 }
 
+/// Default per-second graphics wait refill (`XCL_PIPELINE_WAIT_MS` / Kelvaroq ~4 ms).
+const GFX_WAIT_DEFAULT_MS: u64 = 4;
+/// One longer wait the first time a thread waits for a graphics pipeline (Kelvaroq 500 ms once).
+const GFX_WAIT_ONCE_MS: u64 = 500;
+
+thread_local! {
+    /// Milliseconds left in this thread's per-second graphics wait, and when it was last updated.
+    static GFX_WAIT: std::cell::Cell<(f64, Option<std::time::Instant>)> = const { std::cell::Cell::new((0.0, None)) };
+    /// The first `gfx_wait_left` on this thread starts from [`GFX_WAIT_ONCE_MS`].
+    static GFX_WAIT_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// A budget in milliseconds from the environment (unset, 0, or not a number: none).
+fn budget_of(v: Option<&str>) -> Option<std::time::Duration> {
+    v.and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(std::time::Duration::from_millis)
+}
+
+fn pipeline_wait_var() -> Option<String> {
+    std::env::var("XCL_PIPELINE_WAIT_MS")
+        .ok()
+        .or_else(|| std::env::var("XCL_GFX_PSO_WAIT_MS").ok())
+}
+
+/// How long a thread may wait for graphics pipelines in a second (`XCL_PIPELINE_WAIT_MS` or
+/// `XCL_GFX_PSO_WAIT_MS`; default 4 ms in a run, off in unit tests unless set). `0`: graphics
+/// draws wait until the pipeline is built, as `XCL_PSO_WAIT_MS` for compute.
+fn gfx_wait_budget() -> Option<std::time::Duration> {
+    static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    *B.get_or_init(|| {
+        if let Some(v) = pipeline_wait_var() {
+            return budget_of(Some(&v));
+        }
+        if cfg!(test) {
+            return None;
+        }
+        Some(std::time::Duration::from_millis(GFX_WAIT_DEFAULT_MS))
+    })
+}
+
+/// How long this thread may wait for a graphics pipeline at `now`; the budget refills to
+/// `refill` each second (first wait on the thread: up to [`GFX_WAIT_ONCE_MS`] once).
+fn gfx_wait_left(refill: std::time::Duration, now: std::time::Instant) -> std::time::Duration {
+    GFX_WAIT.with(|w| {
+        let (left, at) = w.get();
+        let full = refill.as_secs_f64() * 1000.0;
+        let left = match at {
+            None => {
+                if GFX_WAIT_ONCE.with(|o| o.replace(false)) {
+                    GFX_WAIT_ONCE_MS as f64
+                } else {
+                    full
+                }
+            }
+            Some(at) => (left + now.saturating_duration_since(at).as_secs_f64() * full).min(full),
+        };
+        w.set((left, Some(now)));
+        std::time::Duration::from_secs_f64(left / 1000.0)
+    })
+}
+
+fn gfx_wait_spent(waited: std::time::Duration) {
+    GFX_WAIT.with(|w| {
+        let (left, at) = w.get();
+        w.set(((left - waited.as_secs_f64() * 1000.0).max(0.0), at));
+    })
+}
+
 /// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: until
 /// it is built). A retail game builds compute programs on its own threads: the driver takes up to
 /// 30 s for the biggest translated ones, and the title's watchdog ends it when its main thread
 /// has been held 30 s.
 fn wait_budget() -> Option<std::time::Duration> {
     static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
-    *B.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(std::time::Duration::from_millis))
+    *B.get_or_init(|| budget_of(std::env::var("XCL_PSO_WAIT_MS").ok().as_deref()))
 }
 
 /// `resolve_wait` for at most `budget`: the build goes to the workers (not this thread), and a

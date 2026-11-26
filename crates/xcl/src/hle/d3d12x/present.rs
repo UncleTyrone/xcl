@@ -444,6 +444,7 @@ unsafe fn show_compiling(hwnd: HWND) {
         .unwrap()
         .get_or_insert_with(|| FrameRate::new(now, presented))
         .sample(now, presented);
+    super::pso_async::log_pending_draws();
     let (_, failed, queued) = super::pso_async::counts();
     let (running, done) = crate::gpu::recomp::dxc::compile_counts();
     let active = running > 0 || queued > 0;
