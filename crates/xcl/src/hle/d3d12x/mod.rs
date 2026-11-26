@@ -17,6 +17,7 @@ pub mod console_heap;
 pub mod console_list;
 pub mod clamp;
 mod depth_uav;
+mod format_alias;
 pub mod device_x;
 pub mod dxgi_device;
 mod cpu_writes;

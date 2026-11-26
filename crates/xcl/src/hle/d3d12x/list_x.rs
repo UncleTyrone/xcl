@@ -132,6 +132,47 @@ pub(super) unsafe fn transition(list: *mut c_void, res: usize, before: D3D12_RES
     pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(list, PC_RESOURCE_BARRIER)(list, 1, &b);
 }
 
+pub(super) unsafe fn pc_copy_resource(list: *mut c_void, dst: usize, src: usize) {
+    pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(list, PC_COPY_RESOURCE)(list, dst, src);
+}
+
+pub(super) unsafe fn pc_copy_texture_region(
+    list: *mut c_void,
+    dst: *const D3D12_TEXTURE_COPY_LOCATION,
+    x: u32,
+    y: u32,
+    z: u32,
+    src: *const D3D12_TEXTURE_COPY_LOCATION,
+    bx: *const D3D12_BOX,
+) {
+    pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(list, PC_COPY_TEXTURE_REGION)(
+        list, dst, x, y, z, src, bx,
+    );
+}
+
+pub(super) unsafe fn device_of_list(list: *mut c_void) -> Option<ID3D12Device> {
+    device_of(list)
+}
+
+pub(super) unsafe fn pc_resource_barriers(list: *mut c_void, barriers: &[D3D12_RESOURCE_BARRIER]) {
+    if !barriers.is_empty() {
+        pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(list, PC_RESOURCE_BARRIER)(list, barriers.len() as u32, barriers.as_ptr());
+    }
+}
+
+/// Restore title bindings and root signatures after an internal depth-uav sync pass.
+pub(super) unsafe fn restore_after_internal_pass(list: *mut c_void, clobbered_gfx: bool, clobbered_cs: bool) {
+    let (bindings, ty) = {
+        let mut g = recording(list as usize).lock().unwrap();
+        match g.as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+            Some(s) => (s.bindings.clone(), s.list_type.unwrap_or(D3D12_COMMAND_LIST_TYPE_DIRECT)),
+            None => return,
+        }
+    };
+    restore_bindings(list, &bindings, ty);
+    let _ = (clobbered_gfx, clobbered_cs);
+}
+
 /// `op` with the window buffer `res` as a copy destination (back to COMMON after it)
 unsafe fn as_copy_dest(list: *mut c_void, res: usize, op: impl FnOnce()) {
     transition(list, res, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -416,9 +457,6 @@ pub(super) fn state_summary(list: *mut c_void) -> String {
         let d = unsafe { x.GetDesc() };
         // flags: the resource's; the view's (1 read-only depth, 2 read-only stencil) when `depth_uav` keeps the DSV
         out += &format!(" names {:#x} {}x{} PC format {} flags {:#x}", x.as_raw() as usize, d.Width, d.Height, d.Format.0, d.Flags.0);
-        if let Some(f) = dsv.and_then(super::depth_uav::dsv_flags) {
-            out += &format!(", view flags {f:#x}");
-        }
     }
     out
 }
@@ -2709,6 +2747,15 @@ unsafe fn copy_scratch(list: *mut c_void, n: u64) -> Option<(usize, u64)> {
     COPY_SCRATCH.lock().unwrap().acquire(list, bytes)
 }
 
+/// Acquire a per-list DEFAULT-heap scratch buffer in `COMMON` state large enough to hold `n` bytes.
+pub(super) unsafe fn acquire_scratch_for_copy(list: *mut c_void, n: u64) -> Option<usize> {
+    if n == 0 || n > MAX_COPY_SCRATCH || list_type(list) == D3D12_COMMAND_LIST_TYPE_BUNDLE {
+        return None;
+    }
+    let bytes = n.next_power_of_two().max(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64).max(n);
+    copy_scratch(list, bytes).map(|(raw, cap)| if cap >= n { Some(raw) } else { None })?
+}
+
 fn reset_copy_scratch(list: *mut c_void) {
     real::dispatch_chain::list_reset(list as usize);
     if let Some(scratch) = COPY_SCRATCH.lock().unwrap().active.get_mut(&(list as usize)) {
@@ -4784,17 +4831,6 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     if uav_transition && !any_uav {
         out.push([2, 0, 0, 0, 0, 0, 0, 0]);
     }
-    // depth buffers whose depth plane can have a twin: in PARK where the title has them in
-    // UNORDERED_ACCESS, the twin copied around the transitions (`depth_uav`)
-    let plane_copies = super::depth_uav::any_kept().then(|| {
-        let direct = list_type(this) == D3D12_COMMAND_LIST_TYPE_DIRECT;
-        let mut in_step = std::mem::take(&mut recording(this as usize).lock().unwrap().get_or_insert_with(HashMap::new).entry(this as usize).or_default().depth_in_step);
-        let plan = super::depth_uav::plan_barriers(&mut out, direct, &mut in_step);
-        if let Some(s) = recording(this as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
-            s.depth_in_step = in_step;
-        }
-        plan
-    });
     // the states uploads into textures kept in step start from once this list has run
     if super::title_textures::any() || super::lut3d::on() {
         let t: Vec<(usize, u32, D3D12_RESOURCE_STATES)> =
@@ -4808,46 +4844,11 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     capture.amend(|op| {
         if let super::capture::Op::Barrier { sent, plane_copies: copies, .. } = op {
             sent.clone_from(&out);
-            *copies = plane_copies.as_ref().map_or(0, |p| p.to_plane.len() + p.to_twin.len());
+            *copies = 0;
         }
     });
-    if let Some(p) = &plane_copies {
-        plane_copies_on(this, &p.to_plane, false);
-    }
     if !out.is_empty() {
         pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(this, PC_RESOURCE_BARRIER)(this, out.len() as u32, out.as_ptr());
-    }
-    if let Some(p) = &plane_copies {
-        plane_copies_on(this, &p.to_twin, true);
-    }
-}
-
-/// The copies between depth planes and their twins around a title's barriers
-/// (`depth_uav::plan_barriers`) on `list`: into the twins (`to_twin`, after the barriers: the
-/// buffer rests in `depth_uav::PARK`, COPY_SOURCE) or into the planes (before them: the buffer
-/// goes PARK → COPY_DEST, where the title's transition out of UNORDERED_ACCESS takes it on). The
-/// twin rests in UNORDERED_ACCESS. Whole subresources, of one format family on both sides (a
-/// D3D12 copy of a depth plane takes the whole of it).
-unsafe fn plane_copies_on(list: *mut c_void, copies: &[super::depth_uav::PlaneCopy], to_twin: bool) {
-    let barriers = |b: &[[u32; 8]]| pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(list, PC_RESOURCE_BARRIER)(list, b.len() as u32, b.as_ptr());
-    let tr = |res: usize, sub: u32, before: u32, after: u32| [0, 0, res as u32, (res as u64 >> 32) as u32, sub, before, after, 0];
-    let all = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    let at = |res: usize, k: u32| D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&res), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k } };
-    let copy = pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(list, PC_COPY_TEXTURE_REGION);
-    let (copy_src, copy_dst) = (D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
-    for c in copies {
-        let twin = c.twin.as_raw() as usize;
-        let twin_in = if to_twin { copy_dst } else { copy_src };
-        if to_twin {
-            barriers(&[tr(twin, all, UNORDERED_ACCESS, twin_in)]);
-        } else {
-            barriers(&[tr(twin, all, UNORDERED_ACCESS, twin_in), tr(c.depth, c.sub, super::depth_uav::PARK, copy_dst)]);
-        }
-        for &k in &c.subs {
-            let (dst, src) = if to_twin { (at(twin, k), at(c.depth, k)) } else { (at(c.depth, k), at(twin, k)) };
-            copy(list, &dst, 0, 0, 0, &src, std::ptr::null());
-        }
-        barriers(&[tr(twin, all, twin_in, UNORDERED_ACCESS)]);
     }
 }
 
@@ -5068,6 +5069,7 @@ pub(super) unsafe extern "system" fn clear_depth_stencil_x(this: *mut c_void, ds
             );
         }
     }
+    super::depth_uav::on_clear_dsv(dsv, flags);
     pc::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const windows::Win32::Foundation::RECT)>(this, PC_CLEAR_DEPTH_STENCIL_VIEW)(this, dsv, flags, depth, stencil, n, rects)
 }
 
@@ -5101,12 +5103,8 @@ pub(super) fn uav_clear_resource(res: usize, gpu: Option<super::console_heap::Sl
     if !super::depth_uav::any() {
         return Some(res);
     }
-    let named = gpu.filter(|s| s.shared_srv != 0).map(|s| super::console_heap::names_of(&s).1);
-    match super::depth_uav::clear_target(res, named) {
-        super::depth_uav::Clear::AsIs => Some(res),
-        super::depth_uav::Clear::Twin(t) => Some(t),
-        super::depth_uav::Clear::NotDone => None,
-    }
+    let cpu = gpu.map(|s| s.pc_uav as usize).unwrap_or(0);
+    Some(super::depth_uav::twin_for_pc_uav(cpu).unwrap_or(res))
 }
 
 /// command list #53 / #54 ClearUnorderedAccessViewUint / Float(GPU handle, CPU handle,
@@ -5218,7 +5216,10 @@ pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usi
     let (dd, sd) = (real::buffer_delta(dst), real::buffer_delta(src));
     if dd == 0 && sd == 0 {
         note_copy_into(this as usize, dst, 0, u64::MAX);
-        return pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);
+        if !super::format_alias::try_copy_resource(this, dst, src) {
+            pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);
+        }
+        return;
     }
     let n = real::console_buffer(dst).or(real::console_buffer(src)).map_or(0, |b| b.1 as u64);
     copy_buffer_region_x(this, dst, 0, src, 0, n);

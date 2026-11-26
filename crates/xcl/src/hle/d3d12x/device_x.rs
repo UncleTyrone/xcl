@@ -1105,6 +1105,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         cost.call = crate::hle::api_cost::Call::PlacedBuffer;
     }
     note_alias(va as usize, &x);
+    let console_state = state;
     // console-only state bits (Unicorn Overlord's 4K display target: 0x100000) are not the
     // PC's: the PC refused the resource (E_INVALIDARG) and the title threw
     let state = pc_initial_state(u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()), state);
@@ -1128,9 +1129,10 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     // render targets, depth buffers, UAV textures: in video memory, aliased by address (`vram`);
     // sampled textures: on the same shared 64 KiB pages when tiled resources allow, else committed
     let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
+    let pc_tex = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
     let mut placed_hr = None;
     if !buffer {
-        let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
+        let pc = pc_tex;
         let console_bytes = crate::hle::xg::Texture::new(&x).ok().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0);
         if super::vram::gpu_owned(flags) {
             if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, console_bytes, riid, ppv) {
@@ -1139,7 +1141,8 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
                         super::title_textures::retire_overlapping(va as usize, bytes as usize);
                     }
                     real::note_title_address(*ppv as usize, va as usize);
-                    super::depth_uav::note_created(*ppv, &x, Some(va as usize), state);
+                    super::depth_uav::register_if_depth_uav(this, *ppv, &x, state, console_state);
+                    super::format_alias::register_title_texture(this as usize, *ppv as usize, va as usize, &pc, flags, state);
                     super::lut3d::created("CreatePlacedResourceX (GPU-owned: on the title's pages / an arena)", *ppv, Some(&x), Some(va as usize), false, state);
                 }
                 return hr;
@@ -1160,7 +1163,8 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {
             Ok(()) => {
                 real::note_title_address(*ppv as usize, va as usize);
-                super::depth_uav::note_created(*ppv, &x, Some(va as usize), state);
+                super::depth_uav::register_if_depth_uav(this, *ppv, &x, state, console_state);
+                super::format_alias::register_title_texture(this as usize, *ppv as usize, va as usize, &pc_tex, flags, state);
                 super::lut3d::created(if placed_hr.is_some() { "CreatePlacedResourceX (sampled: on shared pages)" } else { "CreatePlacedResourceX (sampled: committed)" }, *ppv, Some(&x), Some(va as usize), true, state);
                 return hr;
             }
@@ -1178,7 +1182,8 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     if hr >= 0 && !(*ppv).is_null() {
         real::note_title_address(*ppv as usize, va as usize);
         if !buffer {
-            super::depth_uav::note_created(*ppv, &x, Some(va as usize), state);
+            super::depth_uav::register_if_depth_uav(this, *ppv, &x, state, console_state);
+            super::format_alias::register_title_texture(this as usize, *ppv as usize, va as usize, &pc_tex, flags, state);
             super::lut3d::created("CreatePlacedResourceX (a resource of its own: not kept in step)", *ppv, Some(&x), Some(va as usize), false, state);
         }
     }

@@ -1144,17 +1144,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
             dumps.push(FrameDump { _source: res, buffer, footprint, format: d.Format, tag });
         }
     }
-    // and what each depth UAV twin holds (`depth_uav`; it rests in UNORDERED_ACCESS)
     if dumping_targets {
-        for (tag, twin) in super::depth_uav::twins_to_dump() {
-            let d = twin.GetDesc();
-            p.list.ResourceBarrier(&[transition(&twin, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-            let copied = readback_copy(&p.list, &twin, &d);
-            p.list.ResourceBarrier(&[transition(&twin, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
-            if let Some((buffer, footprint)) = copied {
-                dumps.push(FrameDump { _source: twin, buffer, footprint, format: d.Format, tag });
-            }
-        }
         // and the small 3D textures (`lut3d`), from the state the title's work left them in
         for (tag, tex, d, state) in super::lut3d::to_dump() {
             let moved = super::lut3d::needs_transition(state);
@@ -1298,7 +1288,6 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
             Ok(()) => {
                 for dump in p.dumps.drain(..) {
                     if dump.tag.starts_with("twin") {
-                        super::depth_uav::log_values(&dump.buffer, &dump.footprint, &dump.tag);
                         continue;
                     }
                     if dump.tag.starts_with("lut") {

@@ -12,6 +12,8 @@
 //! `XCL_INDIRECT_GUARD=0` turns it off (`=dispatch`: only dispatches are checked);
 //! `XCL_INDIRECT_MAX_GROUPS` is the most groups one ExecuteIndirect may run (4 Mi: a 4K target
 //! in 8x8 groups has 130 thousand).
+//!
+//! Batch budget rest policy: `XCL_INDIRECT_REST` (`clamp::indirect_rest`, default off).
 
 use std::collections::HashMap;
 use std::ffi::c_void;

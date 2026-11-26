@@ -106,6 +106,13 @@ pub(crate) fn indirect_batch() -> u8 {
     })
 }
 
+/// `XCL_INDIRECT_REST=1`: one oversized ExecuteIndirect record consumes the rest of its batch budget.
+/// Unset / `0` (default): later records in the same batch that fit still run (CGBJ `VICTORY_INDIRECT_REST=0`).
+pub(crate) fn indirect_rest() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_INDIRECT_REST").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// `XCL_INDIRECT_WINDOW=1` (off by default; full window hoisting is amd-dev `clamp` + `bind`).
 pub(crate) fn indirect_window() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -122,6 +129,9 @@ fn log_phase14_once() {
     }
     if indirect_window() {
         crate::xlog_info!("D3D12.X: XCL_INDIRECT_WINDOW=1 set (mesh window clamps: amd-dev tree)");
+    }
+    if indirect_rest() {
+        crate::xlog_info!("D3D12.X: XCL_INDIRECT_REST=1 (oversized indirect record takes batch remainder)");
     }
 }
 

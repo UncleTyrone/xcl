@@ -852,12 +852,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 // (a depth buffer whose depth plane can have a twin rests in `depth_uav::PARK`
                 // where the title has it in UNORDERED_ACCESS, here as on every list; a compute
                 // list copies nothing)
-                let parked = (words.len() == 8 * n && super::depth_uav::any_kept()).then(|| {
-                    let mut v: Vec<[u32; 8]> = words.chunks_exact(8).map(|c| c.try_into().unwrap()).collect();
-                    let _ = super::depth_uav::plan_barriers(&mut v, false, &mut Vec::new());
-                    v
-                });
-                let (sent, m) = parked.as_ref().map_or((words, n), |v| (v.as_flattened(), v.len()));
+                let (sent, m) = (words, n);
                 if words.len() == 8 * n && m > 0 {
                     // 4-byte aligned in the stream: copy out; the resource pointers are
                     // borrowed (ManuallyDrop fields, nothing released)

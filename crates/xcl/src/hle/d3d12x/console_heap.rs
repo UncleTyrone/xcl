@@ -99,6 +99,9 @@ static GLOBAL_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 
 /// descriptors of the shared heap at most (the GPU may take more: OPTIONS19)
 pub const GLOBAL_MAX: u32 = 1_000_000;
+/// First PC index for dynamic view ranges in the shared heap (Phase 2 / VItoriaBr). Descriptors
+/// below hold null views and memory-window UAVs (`set_window_views`, `fill_nulls`).
+pub const MIN_DYNAMIC: u32 = 1 << 18;
 // (one million: what every resource binding tier 2+ GPU takes. The translated shaders accept a
 // T# index only below it (`gpu::dxil::lower_image::VIEW_HEAP_MAX_SRV`), so the heap must never be
 // smaller than that bound: an index past the heap's end hangs NVIDIA GPUs, which took 1 000 000
@@ -346,13 +349,104 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             inc,
             heap,
             cap,
-            // the memory windows' raw UAVs (`set_window_views`) come first
-            next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32,
+            // null views and memory-window UAVs below `MIN_DYNAMIC`; page placement starts there
+            next: MIN_DYNAMIC,
             free: Vec::new(),
             nulls,
         });
     }
     true
+}
+
+/// Shared heap usage: descriptors handed out, and descriptors in released free ranges.
+pub fn shared_heap_stats() -> Option<(u32, u32)> {
+    GLOBAL.lock().unwrap().as_ref().map(|s| {
+        let used = in_use(s.next, &s.free);
+        let free: u32 = s.free.iter().map(|&(_, n)| n).sum();
+        (used, free)
+    })
+}
+
+static SUBMIT_HOLDS: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+
+struct PendingDynamic {
+    fence: ID3D12Fence,
+    value: u64,
+    ranges: Vec<(u32, u32)>,
+}
+
+static PENDING_DYNAMIC: Mutex<Vec<PendingDynamic>> = Mutex::new(Vec::new());
+
+/// Hold a dynamic range until the queue submit that recorded it finishes (`recycle_after_submit`).
+pub fn hold_for_submit(first: u32, count: u32) {
+    if count > 0 && first >= MIN_DYNAMIC {
+        SUBMIT_HOLDS.lock().unwrap().push((first, count));
+    }
+}
+
+/// Return dynamic descriptor ranges after a queue submit (Phase 2 / Phase 12). Call from `present::note_execute`.
+pub fn recycle_after_submit(queue: usize) {
+    let holds = std::mem::take(&mut *SUBMIT_HOLDS.lock().unwrap());
+    if holds.is_empty() {
+        return;
+    }
+    if super::residency::defer_dynamic_slots() {
+        if let Some((fence, value)) = super::alloc_pool::queue_submission_mark(queue) {
+            PENDING_DYNAMIC.lock().unwrap().push(PendingDynamic { fence, value, ranges: holds });
+            return;
+        }
+    }
+    for (first, count) in holds {
+        release_global(first, count);
+    }
+}
+
+/// Ranges held until the submit fence that recorded them has completed.
+pub unsafe fn drain_completed_dynamic_slots() {
+    if !super::residency::defer_dynamic_slots() {
+        return;
+    }
+    let mut pending = PENDING_DYNAMIC.lock().unwrap();
+    let mut released = 0u32;
+    let mut i = 0;
+    while i < pending.len() {
+        let done = pending[i].ranges.is_empty()
+            || super::real::fence_completed(&pending[i].fence) >= pending[i].value;
+        if done {
+            let gone = pending.swap_remove(i);
+            for (first, count) in gone.ranges {
+                release_global(first, count);
+                released = released.saturating_add(count);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    if released > 0 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static RELEASED: AtomicU64 = AtomicU64::new(0);
+        let n = RELEASED.fetch_add(released as u64, Ordering::Relaxed) + released as u64;
+        if n == released as u64 || (n >= 4096 && n.saturating_sub(released as u64) < 4096) {
+            crate::xlog_info!("D3D12.X: released {released} dynamic descriptor slots after GPU fence completion ({n} total)");
+        }
+    }
+}
+
+/// Log heap use and bind skips at most once per second (`XCL_ACTIVITY=1` or always when stats exist).
+pub fn maybe_log_shared_heap(draws_skipped: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let now = ORIGIN.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+    let last = LAST.load(Relaxed);
+    if last != 0 && now.saturating_sub(last) < 1000 {
+        return;
+    }
+    LAST.store(now, Relaxed);
+    let Some((used, free)) = shared_heap_stats() else { return };
+    crate::xlog_info!(
+        "console descriptor heaps: {used} slots in use, {free} free in released ranges, {draws_skipped} draws skipped for bind/heap"
+    );
 }
 
 /// Null views at descriptors `0..MEM_HEAP_BASE` of the shared heap (an SRV / UAV pair per
@@ -1464,14 +1558,13 @@ mod tests {
         vt[2] = retain as usize;
         let mut device = Object { vt: vt.as_ptr() };
         let mut heap = Object { vt: vt.as_ptr() };
-        // room for one page of 256 slots past the null views and the memory windows
-        let base = crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32;
+        // room for one page of 256 slots past the reserved band
         unsafe {
             *GLOBAL.lock().unwrap() = Some(Global {
                 dev: ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void),
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
-                cpu: 0x10_0000, gpu: 0x20_0000, inc: 32, cap: base + 2 * PAGE_SLOTS,
-                next: base, free: Vec::new(), nulls: None,
+                cpu: 0x10_0000, gpu: 0x20_0000, inc: 32, cap: MIN_DYNAMIC + 2 * PAGE_SLOTS,
+                next: MIN_DYNAMIC, free: Vec::new(), nulls: None,
             });
         }
         let rel = |p: u64| (p as usize - u.base()) as u32;
@@ -1479,7 +1572,7 @@ mod tests {
         assert!(register(0xC2, 16, 0x40_0000, 0, 32, false, true, true));
         let (a, b) = (start(0xC1).unwrap(), start(0xC2).unwrap());
         let placed = slot(a + 2 * SLOT as u64).unwrap();
-        assert_eq!(placed.index, base + 4, "page 0 of the first heap takes the room there is");
+        assert_eq!(placed.index, MIN_DYNAMIC + 4, "page 0 of the first heap takes the room there is");
         assert_ne!(placed.shared_srv, 0);
         let k = PAGE_SLOTS + 2;
         let s = slot(a + (k * SLOT) as u64).unwrap();
