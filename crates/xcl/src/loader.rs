@@ -11,6 +11,9 @@ use windows_sys::Win32::System::Memory::{
     PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
 };
 
+pub mod patch_insn;
+pub mod write_sites;
+
 use crate::modules::{self, MappedModule};
 use crate::pe::{self, Layout, OwnedExports, Pe};
 use crate::resolver;
@@ -230,6 +233,11 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
     for s in pe.sections.iter().filter(|s| s.characteristics & 0x2000_0000 != 0) {
         let len = (s.mapped_size() as usize).min(size.saturating_sub(s.va as usize));
         unsafe { crate::eh::hook_gs_failure(base + s.va as usize, len, &name) };
+    }
+    // 9. renderer port 2 — title descriptor-record stores (main image only, before entry)
+    if is_main {
+        crate::hle::d3d12x::descriptor_sites::install_on_main(base, size);
+        unsafe { write_sites::apply_asked(&name, base, size) };
     }
     Ok(module)
 }

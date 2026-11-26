@@ -12,6 +12,7 @@
 mod alloc_pool;
 mod ambient;
 pub mod bind;
+pub(crate) mod clamp;
 pub mod console_heap;
 pub mod console_list;
 mod depth_uav;

@@ -257,6 +257,8 @@ struct State {
     root_va_next: usize,
     /// L1 VRAM `io` (`u0`) slabs populated during this recording and copied in `prelude_list_for`
     io_blocks: Vec<IoBlock>,
+    /// Merged single-record mesh draws when `XCL_INDIRECT_WINDOW=1` (`clamp::WindowOpen`).
+    window_clamp: super::clamp::WindowOpen,
 }
 
 /// Active inline 256-slot indirect-dispatch guard batch recorded directly on a command list.
@@ -733,6 +735,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.prelude_guards.clear();
         s.prelude_scales.clear();
         s.prelude_draws.clear();
+        s.window_clamp.clear();
         let prelude = s.prelude_owned.take();
         s.prelude_built = None;
         let job_bufs = std::mem::take(&mut s.prelude_job_bufs);
@@ -2201,11 +2204,22 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
 }
 "#;
 
-/// `XCL_INDIRECT_PRELUDE=0`: run indirect argument clamp/scale passes inline instead of hoisting
-/// them into a batched prelude command list submitted right before the recording.
-fn indirect_prelude_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XCL_INDIRECT_PRELUDE").map_or(true, |v| v.trim() != "0"))
+fn flush_window_draw(this: *mut c_void) {
+    with(this, |s| {
+        let w = s.window_clamp;
+        if w.is_open() {
+            s.prelude_draws.push(PreludeDrawJob {
+                buf_idx: w.buf_idx,
+                dst_off: w.dst_off,
+                count: w.count,
+                stride: w.stride,
+                draw_offset: w.draw_offset,
+                src_win: w.src_win,
+                src_off: w.src_off,
+            });
+            s.window_clamp.clear();
+        }
+    });
 }
 
 /// Top byte bound of a raw window UAV created by `runner::raw_window_uav`.
@@ -2254,7 +2268,8 @@ fn uma_win_off(u: &crate::gpu::uma::Uma, p: usize, span: usize) -> Option<(u32, 
 }
 
 fn can_hoist_prelude(this: *mut c_void) -> bool {
-    indirect_prelude_on()
+    super::clamp::log_policy_once();
+    super::clamp::prelude_hoist_allowed()
         && super::title_list::wrapper_of(this).is_some()
         && matches!(
             super::list_x::tracked_list_type(this),
@@ -2463,6 +2478,7 @@ unsafe fn alloc_prelude_scratch(this: *mut c_void, dev: &ID3D12Device, bytes: u6
 /// `io` (`u0`) uploads and hoisted indirect-argument clamp/scale jobs for `seg` before `seg`
 /// executes on the queue.
 pub(super) unsafe fn prelude_list_for(seg: *mut c_void) -> Option<*mut c_void> {
+    flush_window_draw(seg);
     let (already, io_copies, bufs, guards, scales, draws) = with(seg, |s| {
         if let Some(ref built) = s.prelude_built {
             return (Some(built.as_raw()), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -3081,8 +3097,29 @@ unsafe fn guard_draw_args(
     let dev = super::real::list_device(this).ok_or("no device")?;
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     super::real::uma_window_buffer(src, commands as usize).ok_or("the indirect draw arguments are not in one memory window")?;
+    if max != 1 {
+        flush_window_draw(this);
+    }
     if can_hoist_prelude(this) {
         if let Some((src_win, src_off)) = uma_win_off(u, src, commands as usize) {
+            if super::clamp::indirect_window() && max == 1 {
+                if with(this, |s| s.window_clamp.continues(src_win, src_off, stride, draw_offset)) {
+                    let (buf_idx, base, idx) = with(this, |s| {
+                        s.window_clamp.extend();
+                        let w = s.window_clamp;
+                        (w.buf_idx, w.dst_off, w.count)
+                    });
+                    let buf = with(this, |s| s.prelude_bufs.get(buf_idx).cloned()).ok_or("prelude scratch missing for window")?;
+                    let slot_off = u64::from(base) + u64::from(idx - 1) * u64::from(stride);
+                    return Ok((buf, slot_off));
+                }
+                flush_window_draw(this);
+                let window_bytes = u64::from(super::clamp::WINDOW_MOST).saturating_mul(u64::from(stride)).max(commands);
+                let (dst, dst_off, buf_idx) = alloc_prelude_scratch(this, &dev, window_bytes)?;
+                let dst_off32 = u32::try_from(dst_off).map_err(|_| "prelude scratch offset out of range")?;
+                with(this, |s| s.window_clamp.open(buf_idx, dst_off32, src_win, src_off, stride, draw_offset));
+                return Ok((dst, dst_off));
+            }
             let (dst, dst_off, buf_idx) = alloc_prelude_scratch(this, &dev, commands)?;
             if let Ok(dst_off32) = u32::try_from(dst_off) {
                 if dst_off32.checked_add(commands as u32).is_some() {
@@ -3633,7 +3670,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             // before the two-pass DispatchMesh burst so all consecutive indirect mesh draws hoist
             // into one batched `PRELUDE_SCALE_*` dispatch instead of inline compute/barrier bubbles.
             let mut this = this;
-            if max > 0 && args != 0 && indirect_prelude_on() && with(this, |s| s.prelude_blocked && s.allocator != 0 && s.prelude_built.is_none()) {
+            if max > 0 && args != 0 && super::clamp::indirect_prelude() && with(this, |s| s.prelude_blocked && s.allocator != 0 && s.prelude_built.is_none()) {
                 if let Some(next) = super::list_x::split_for_prelude(this) {
                     this = next;
                 }
@@ -3846,7 +3883,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 with(this, |s| {
                     s.pc_abi_cs = AbiBound::default();
                     s.arg_order_clean = false;
-                    s.prelude_blocked = true;
+                    if super::clamp::compute_dispatch_blocks_prelude() {
+                        s.prelude_blocked = true;
+                    }
                 });
                 return count(DISPATCHES);
             }
@@ -3931,8 +3970,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 }
                 with(this, |s| {
                     s.arg_order_clean = false;
-                    s.prelude_blocked = true;
-                    s.inline_guard = None;
+                    if super::clamp::compute_dispatch_blocks_prelude() {
+                        s.prelude_blocked = true;
+                    }
+                    if super::clamp::indirect_batch() != 2 {
+                        s.inline_guard = None;
+                    }
                 });
             } else {
                 with(this, |s| s.inline_guard = None);
@@ -4772,7 +4815,9 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     }
     with(this, |s| {
         s.arg_order_clean = false;
-        s.prelude_blocked = true;
+        if super::clamp::compute_dispatch_blocks_prelude() {
+            s.prelude_blocked = true;
+        }
     });
     r
 }
