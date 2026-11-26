@@ -7146,6 +7146,7 @@ unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
 }
 
 unsafe extern "system" fn cl_draw_instanced(this: *mut c_void, vcount: u32, icount: u32, sv: u32, si: u32) {
+    super::list_x::note_shader_pass(this);
     super::list_x::prepare_draw(this);
     type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "DrawInstanced")));
@@ -7153,6 +7154,7 @@ unsafe extern "system" fn cl_draw_instanced(this: *mut c_void, vcount: u32, icou
 }
 
 unsafe extern "system" fn cl_draw_indexed_instanced(this: *mut c_void, icount: u32, inst: u32, si: u32, bv: i32, sinst: u32) {
+    super::list_x::note_shader_pass(this);
     super::list_x::prepare_draw(this);
     type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "DrawIndexedInstanced")));
@@ -7169,6 +7171,7 @@ unsafe extern "system" fn cl_execute_indirect(
     cnt_buf: *mut c_void,
     cnt_off: u64,
 ) {
+    super::list_x::note_shader_pass(this);
     super::list_x::prepare_draw(this);
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, u64, *mut c_void, u64);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteIndirect")));
@@ -7459,6 +7462,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     });
     // the next uploads into textures kept in step start from the states these lists leave
     super::title_textures::submitted(&mapped);
+    super::title_textures::after_execute(this, &mapped);
     super::present::note_execute(this, &mapped);
     stop_if_device_removed();
 }

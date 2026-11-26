@@ -399,6 +399,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     for r in &to_unmap {
         super::vram::unmap_superseded(r);
     }
+    back_replaced(va);
     TEXTURES_GEN.fetch_add(1, Ordering::Release);
     Ok(())
 }
@@ -530,6 +531,10 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
     for r in &to_unmap {
         super::vram::unmap_superseded(r);
     }
+    back_remapped(va, len);
+    if src != va {
+        back_remapped(src, len);
+    }
     if retired > 0 {
         TEXTURES_GEN.fetch_add(1, Ordering::Release);
     }
@@ -537,6 +542,7 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
 
 /// The PC texture was released for good.
 pub fn forget(res: usize) {
+    back_released(res);
     LAST_CONTENT.lock().unwrap().remove(&res);
     STREAM_RECHECK.lock().unwrap().remove(&res);
     let (removed, to_remap) = {
@@ -1532,6 +1538,398 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
         });
     }
     out
+}
+
+// --- Shader-written title textures copied back for the title CPU (XCL_TEXTURE_BACK) ---
+
+/// Default kinds when `XCL_TEXTURE_BACK` is unset or `1` (water / height maps in retail titles).
+const BACK_KINDS_DEFAULT: &str = "256x256f41,256x256f16,64x64f16,128x128f36";
+
+fn back_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_TEXTURE_BACK").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Whether any texture readback work may run (fast path for draw hooks).
+pub(super) fn back_active() -> bool {
+    back_enabled() && !back_kinds().is_empty()
+}
+
+fn back_kinds() -> &'static [(u64, u32, u32)] {
+    static KINDS: std::sync::OnceLock<Vec<(u64, u32, u32)>> = std::sync::OnceLock::new();
+    KINDS.get_or_init(|| {
+        if !back_enabled() {
+            return Vec::new();
+        }
+        let list = match std::env::var("XCL_TEXTURE_BACK") {
+            Ok(v) if v.trim() == "1" => BACK_KINDS_DEFAULT.to_owned(),
+            Err(_) => BACK_KINDS_DEFAULT.to_owned(),
+            Ok(spec) => spec.to_owned(),
+        };
+        let kinds: Vec<(u64, u32, u32)> = list
+            .split(',')
+            .filter_map(|k| {
+                let (size, format) = k.trim().split_once('f')?;
+                let (w, h) = size.split_once('x')?;
+                Some((w.parse().ok()?, h.parse().ok()?, format.parse().ok()?))
+            })
+            .collect();
+        if !kinds.is_empty() {
+            crate::xlog_info!("D3D12.X: XCL_TEXTURE_BACK – title textures of these kinds are copied back after GPU writes {kinds:?}");
+        }
+        kinds
+    })
+}
+
+fn wanted_kind(res: usize) -> bool {
+    let kinds = back_kinds();
+    if kinds.is_empty() {
+        return false;
+    }
+    let p = res as *mut c_void;
+    let Some(r) = (unsafe { ID3D12Resource::from_raw_borrowed(&p) }) else { return false };
+    let d = unsafe { r.GetDesc() };
+    if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        return false;
+    }
+    kinds.contains(&(d.Width, d.Height, d.Format.0 as u32))
+}
+
+struct BackTicket {
+    owner: usize,
+    at: usize,
+    end: usize,
+    valid: std::sync::atomic::AtomicBool,
+}
+
+static BACK_TICKETS: Mutex<Vec<std::sync::Weak<BackTicket>>> = Mutex::new(Vec::new());
+
+fn track_back(owner: usize, at: usize, end: usize) -> Arc<BackTicket> {
+    let ticket = Arc::new(BackTicket { owner, at, end, valid: std::sync::atomic::AtomicBool::new(true) });
+    let mut tickets = BACK_TICKETS.lock().unwrap();
+    tickets.retain(|w| w.strong_count() != 0);
+    tickets.push(Arc::downgrade(&ticket));
+    ticket
+}
+
+fn invalidate_back(matches: impl Fn(&BackTicket) -> bool) {
+    BACK_TICKETS.lock().unwrap().retain(|weak| {
+        let Some(t) = weak.upgrade() else { return false };
+        if matches(&t) {
+            t.valid.store(false, Ordering::Release);
+        }
+        true
+    });
+}
+
+fn back_released(owner: usize) {
+    invalidate_back(|t| t.owner == owner);
+}
+
+fn back_replaced(at: usize) {
+    invalidate_back(|t| t.at == at);
+}
+
+fn back_remapped(at: usize, len: usize) {
+    let end = at.saturating_add(len);
+    invalidate_back(|t| at < t.end && t.at < end);
+}
+
+/// A list recorded a draw or dispatch: remember bound render targets that match readback kinds.
+pub(super) fn note_shader_write(list: usize, res: usize) {
+    if !back_active() || !wanted_kind(res) {
+        return;
+    }
+    let known = {
+        let t = TEXTURES.lock().unwrap();
+        t.by_res.contains_key(&res) || t.shadowed.contains_key(&res)
+    };
+    if !known {
+        return;
+    }
+    super::list_x::note_back_target(list, res);
+}
+
+struct PendingBack {
+    buffer: ID3D12Resource,
+    footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+    rows: Vec<u32>,
+    mips: u32,
+    va: usize,
+    src: usize,
+    tex: Arc<xg::Texture>,
+    ticket: Arc<BackTicket>,
+}
+
+static COPY_QUEUES: Mutex<BTreeMap<usize, (ID3D12CommandQueue, ID3D12Fence, AtomicU64)>> = Mutex::new(BTreeMap::new());
+
+unsafe fn copy_queue_state(dev: &ID3D12Device, device: usize) -> Result<(ID3D12CommandQueue, ID3D12Fence, u64), String> {
+    let mut g = COPY_QUEUES.lock().unwrap();
+    if let Some((q, f, v)) = g.get(&device) {
+        return Ok((q.clone(), f.clone(), v.load(Ordering::Acquire)));
+    }
+    let q: ID3D12CommandQueue = dev
+        .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+            Type: D3D12_COMMAND_LIST_TYPE_COPY,
+            ..Default::default()
+        })
+        .map_err(|e| e.to_string())?;
+    let f: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(|e| e.to_string())?;
+    let seq = AtomicU64::new(0);
+    g.insert(device, (q.clone(), f.clone(), seq));
+    Ok((q, f, 0))
+}
+
+unsafe fn write_committed(at: usize, src: &[u8]) {
+    if src.is_empty() {
+        return;
+    }
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, src.len())) {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), at as *mut u8, src.len());
+        return;
+    }
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+    let mut p = at;
+    let end = at + src.len();
+    let mut off = 0usize;
+    while p < end {
+        let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        if VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.RegionSize == 0 {
+            break;
+        }
+        let reg_end = (m.BaseAddress as usize).saturating_add(m.RegionSize).min(end);
+        if reg_end <= p {
+            break;
+        }
+        let writable = m.State == MEM_COMMIT && m.Protect & 0xC2 != 0 && m.Protect & 0x100 == 0;
+        if writable {
+            let n = reg_end - p;
+            std::ptr::copy_nonoverlapping(src[off..].as_ptr(), p as *mut u8, n);
+            off += n;
+        }
+        p = reg_end;
+    }
+}
+
+unsafe fn land_back(back: &PendingBack) {
+    static COPIED: AtomicU64 = AtomicU64::new(0);
+    let _lock = BACK_TICKETS.lock().unwrap();
+    if !back.ticket.valid.load(Ordering::Acquire) {
+        return;
+    }
+    let size = back.tex.size() as usize;
+    let mut tiled = read_committed(back.src, size);
+    let mut data = std::ptr::null_mut();
+    if back.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+        return;
+    }
+    let Some(texels) = back.tex.texels() else {
+        back.buffer.Unmap(0, None);
+        return;
+    };
+    let chain = &texels.chain;
+    let slices = if texels.depth > 0 {
+        1usize
+    } else {
+        texels.array as usize
+    };
+  let mips = back.mips as usize;
+    for (i, (fp, &nr)) in back.footprints.iter().zip(&back.rows).enumerate() {
+        let (mip, slice) = (i % mips, i / mips);
+        if slice >= slices || mip >= chain.levels.len() {
+            continue;
+        }
+        let pitch = fp.Footprint.RowPitch as usize;
+        let len = pitch * nr as usize * fp.Footprint.Depth as usize;
+        let linear = std::slice::from_raw_parts(data.cast::<u8>().add(fp.Offset as usize), len);
+        let l = &chain.levels[mip];
+        let bpe = texels.bpe as usize;
+        let mut tight = Vec::with_capacity(l.width * l.height * l.depth * bpe);
+        for z in 0..l.depth {
+            for y in 0..l.height {
+                let row = &linear[(z * nr as usize + y) * pitch..][..l.width * bpe];
+                tight.extend_from_slice(row);
+            }
+        }
+        if texels.depth > 0 {
+            chain.tile_volume(&mut tiled, mip, &tight);
+        } else {
+            let base = slice * chain.slice_bytes;
+            chain.tile_level(&mut tiled[base..base + chain.slice_bytes], mip, slice, &tight);
+        }
+    }
+    back.buffer.Unmap(0, None);
+    write_committed(back.src, &tiled);
+    let n = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(128) {
+        crate::xlog_info!("D3D12.X: texture readback landed {n} ({size} bytes at {:#x})", back.va);
+    }
+}
+
+unsafe fn record_texture_back(
+    dev: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+    res: &ID3D12Resource,
+    states: &[D3D12_RESOURCE_STATES],
+) -> Option<PendingBack> {
+    let res_id = res.as_raw() as usize;
+    let (va, src, tex) = {
+        let t = TEXTURES.lock().unwrap();
+        let e = t.by_res.get(&res_id)?;
+        (e.va, e.src, Arc::clone(&e.tex))
+    };
+    let end = va.saturating_add(tex.size() as usize);
+    let ticket = track_back(res_id, va, end);
+    let desc = res.GetDesc();
+    let mips = u32::from(desc.MipLevels.max(1));
+    let subs = mips * u32::from(desc.DepthOrArraySize.max(1));
+    let n = subs as usize;
+    let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n];
+    let mut rows = vec![0u32; n];
+    let mut total = 0u64;
+    dev.GetCopyableFootprints(&desc, 0, subs, 0, Some(footprints.as_mut_ptr()), Some(rows.as_mut_ptr()), None, Some(&mut total));
+    for (fp, &nr) in footprints.iter().zip(&rows) {
+        let f = &fp.Footprint;
+        let pitched = u64::from(f.RowPitch)
+            .checked_mul(u64::from(nr))?
+            .checked_mul(u64::from(f.Depth))?;
+        total = total.max(fp.Offset.checked_add(pitched)?);
+    }
+    let mut buffer = None;
+    dev.CreateCommittedResource(
+        &D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        },
+        D3D12_HEAP_FLAG_NONE,
+        &D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: total,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        },
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        None,
+        &mut buffer,
+    )
+    .ok()?;
+    let buffer = buffer?;
+    let before = states.first().copied().unwrap_or(D3D12_RESOURCE_STATE_COMMON);
+    let barrier = |a: D3D12_RESOURCE_STATES, b: D3D12_RESOURCE_STATES| D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                pResource: std::mem::transmute_copy(res),
+                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                StateBefore: a,
+                StateAfter: b,
+            }),
+        },
+    };
+    list.ResourceBarrier(&[barrier(before, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+    for (i, fp) in footprints.iter().enumerate() {
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(&buffer),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *fp },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(res),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 },
+        };
+        list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+    }
+    list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_COPY_SOURCE, before)]);
+    Some(PendingBack {
+        buffer,
+        footprints,
+        rows,
+        mips,
+        va,
+        src,
+        tex,
+        ticket,
+    })
+}
+
+/// After title queue `title_q` ran `lists`: copy shader-written textures back on the copy queue.
+pub(super) unsafe fn after_execute(title_q: *mut c_void, lists: &[*mut c_void]) {
+    if !back_active() {
+        return;
+    }
+    let targets = super::list_x::back_targets_for(lists);
+  super::list_x::clear_back_targets(lists);
+    if targets.is_empty() {
+        return;
+    }
+    let Some(title_queue) = ID3D12CommandQueue::from_raw_borrowed(&title_q) else { return };
+    let mut jobs: Vec<(usize, usize, usize, Vec<D3D12_RESOURCE_STATES>)> = Vec::new();
+    {
+        let t = TEXTURES.lock().unwrap();
+        for res in targets {
+            if !wanted_kind(res) {
+                continue;
+            }
+            let Some(e) = t.by_res.get(&res) else { continue };
+            jobs.push((res, e.device, e.src, e.states.clone()));
+        }
+    }
+    if jobs.is_empty() {
+        return;
+    }
+    let device = jobs[0].1;
+    let d = device as *mut c_void;
+    let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { return };
+    let (copy_q, fence, _) = match copy_queue_state(dev, device) {
+        Ok(v) => v,
+        Err(e) => {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("title texture readback: {e}");
+            }
+            return;
+        }
+    };
+    let title_val = {
+        let mut g = COPY_QUEUES.lock().unwrap();
+        let (_, _, v) = g.get_mut(&device).unwrap();
+        v.fetch_add(1, Ordering::AcqRel) + 1
+    };
+    if title_queue.Signal(&fence, title_val).is_err() {
+        return;
+    }
+    if copy_q.Wait(&fence, title_val).is_err() {
+        return;
+    }
+    let mut pending = Vec::new();
+    let result = own_work(|| -> Result<(), String> {
+        super::vram::before_execute(&copy_q);
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY).map_err(|e| e.to_string())?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &alloc, None).map_err(|e| e.to_string())?;
+        for &(res, _, _, ref states) in &jobs {
+            let p = res as *mut c_void;
+            let Some(r) = ID3D12Resource::from_raw_borrowed(&p) else { continue };
+            if let Some(back) = record_texture_back(dev, &list, &r, states) {
+                pending.push(back);
+            }
+        }
+        list.Close().map_err(|e| e.to_string())?;
+        copy_q.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(|e| e.to_string())?)]);
+        texture::wait(dev, &copy_q)?;
+        Ok(())
+    });
+    if result.is_err() {
+        return;
+    }
+    for back in &pending {
+        land_back(back);
+    }
 }
 
 

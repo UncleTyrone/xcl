@@ -653,6 +653,8 @@ struct ListState {
     deferred: Option<Deferred>,
     /// on a title list's first segment: the allocator its deferred segments record on (the title's may be recording another list by the submit)
     own_alloc: Option<ID3D12CommandAllocator>,
+    /// Title textures this list may have written (UAV / RT); copied back after execute (`title_textures`).
+    back_targets: Vec<usize>,
 }
 
 /// A `Dispatch` or a dispatching `ExecuteIndirect` put off to the submit, with its arguments.
@@ -882,6 +884,63 @@ pub(super) fn clear_segment_state(list: usize) {
         s.pred_in_state = false;
         s.bindings = Bindings::default();
         s.deferred = None;
+        s.back_targets.clear();
+    }
+}
+
+pub(super) fn note_back_target(list: usize, res: usize) {
+    if list == 0 || res == 0 {
+        return;
+    }
+    let mut g = LISTS.lock().unwrap();
+    if let Some(s) = g.get_or_insert_with(HashMap::new).get_mut(&list) {
+        if !s.back_targets.contains(&res) {
+            s.back_targets.push(res);
+        }
+    }
+}
+
+pub(super) fn back_targets_for(lists: &[*mut c_void]) -> Vec<usize> {
+    let g = LISTS.lock().unwrap();
+    let Some(m) = g.as_ref() else { return Vec::new() };
+    let mut out = Vec::new();
+    for &l in lists {
+        let Some(s) = m.get(&(l as usize)) else { continue };
+        for &r in &s.back_targets {
+            if !out.contains(&r) {
+                out.push(r);
+            }
+        }
+    }
+    out
+}
+
+pub(super) fn clear_back_targets(lists: &[*mut c_void]) {
+    let mut g = LISTS.lock().unwrap();
+    let Some(m) = g.as_mut() else { return };
+    for &l in lists {
+        if let Some(s) = m.get_mut(&(l as usize)) {
+            s.back_targets.clear();
+        }
+    }
+}
+
+/// Render targets bound on this list are candidates for CPU readback after the list runs.
+pub(super) unsafe fn note_shader_pass(list: *mut c_void) {
+    if !super::title_textures::back_active() {
+        return;
+    }
+    let rts = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).and_then(|s| s.bindings.render_targets.clone());
+    let Some(rts) = rts else { return };
+    let iter: Vec<usize> = if rts.single != 0 {
+        rts.handles.first().copied().into_iter().collect()
+    } else {
+        rts.handles.clone()
+    };
+    for h in iter {
+        if let Some(r) = super::present::rtv_resource(h) {
+            super::title_textures::note_shader_write(list as usize, r);
+        }
     }
 }
 
@@ -3339,6 +3398,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
                 cpu_writes_after(q_raw, chunk);
             });
             super::title_textures::submitted(prior);
+            super::title_textures::after_execute(q_raw, prior);
             for &p in prior {
                 super::title_textures::list_reset(p as usize);
             }
@@ -3356,6 +3416,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     signal_write64_pairs(q_raw, &write64_signals);
     // what ran is in the textures' states; the list records anew after its Reset below
     super::title_textures::submitted(&one);
+    super::title_textures::after_execute(q_raw, &one);
     super::title_textures::list_reset(this as usize);
     if !sparse_writes.is_empty() {
         if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&q_raw) {
@@ -4288,6 +4349,7 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
         let r: usize = transmute_copy(&d.pResource);
         super::present::note_use(r, super::present::USE_COPY);
         super::title_textures::note_gpu_write(r);
+        super::title_textures::note_shader_write(this as usize, r);
         if super::present::trace_frame() {
             if let Some(va) = super::title_textures::address(r) {
                 static N: AtomicU64 = AtomicU64::new(0);
@@ -4484,6 +4546,7 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
 pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usize, src: usize) {
     super::present::note_use(dst, super::present::USE_COPY);
     super::title_textures::note_gpu_write(dst);
+    super::title_textures::note_shader_write(this as usize, dst);
     if super::present::trace_frame() {
         trace_watched_copy("CopyResource", dst, src);
     }
