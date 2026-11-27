@@ -1804,7 +1804,10 @@ fn precompile(
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let unused = AtomicUsize::new(0);
     let warm_skipped = AtomicUsize::new(0);
-    let warm_seconds = crate::hle::d3d12x::bench_env::warm_seconds();
+    let warm_limit = crate::hle::d3d12x::bench_env::warm_seconds();
+    let warm_time = warm_limit.is_some_and(|n| n > 0);
+    let warm_timed_out = std::sync::atomic::AtomicBool::new(false);
+    let warm_seen = warm_hashes.is_some().then(|| Mutex::new(std::collections::HashSet::<String>::new()));
     let done_keys = if pipelines.is_some() { warm_done_keys(again) } else { Default::default() };
     let done_keys = Mutex::new(done_keys);
     if let Some(u) = used {
@@ -1815,6 +1818,9 @@ fn precompile(
             None => println!("--warm all: every container found"),
             Some(set) => println!("--warm: {} hashes asked", set.len()),
         }
+    }
+    if let Some(secs) = warm_limit.filter(|&n| n > 0) {
+        println!("--warm time cap: {secs} s (XCL_WARM_SECONDS)");
     }
     if pipelines.is_some() && !again && !done_keys.lock().unwrap().is_empty() {
         println!("warm resume: {} pipelines already in warm-done.txt ({})", done_keys.lock().unwrap().len(), warm_fingerprint());
@@ -1840,6 +1846,10 @@ fn precompile(
         for _ in 0..threads {
             s.spawn(|| loop {
                 if startup.is_some_and(|p| p.cancel.load(Ordering::Relaxed)) { break; }
+                if warm_time && t0.elapsed().as_secs() >= warm_limit.unwrap_or(0) {
+                    warm_timed_out.store(true, Ordering::Relaxed);
+                    break;
+                }
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= n {
                     break;
@@ -1855,6 +1865,22 @@ fn precompile(
                     record_done();
                     continue;
                 };
+                if let Some(w) = warm_hashes {
+                    if let Some(set) = w {
+                        let h = format!("{:016x}", crate::gpu::shader::fnv64(&blob));
+                        if !set.contains(&h) {
+                            warm_skipped.fetch_add(1, Ordering::Relaxed);
+                            record_done();
+                            continue;
+                        }
+                    }
+                    if let Some(seen) = warm_seen.as_ref() {
+                        if !seen.lock().unwrap().insert(format!("{:016x}", crate::gpu::shader::fnv64(&blob))) {
+                            record_done();
+                            continue;
+                        }
+                    }
+                }
                 let Some(sh) = xbox::parse(&blob) else {
                     if startup.is_some() && !matches!(shader::classify(&blob).0, shader::Kind::Dxil | shader::Kind::Dxbc) {
                         failed.fetch_add(1, Ordering::Relaxed);
@@ -1959,6 +1985,18 @@ fn precompile(
     );
     if used.is_some() {
         println!("compute programs passed over (no earlier run used their pipeline): {}", unused.into_inner());
+    }
+    if warm_hashes.is_some() {
+        let skipped = warm_skipped.into_inner();
+        if skipped > 0 {
+            println!("--warm: {skipped} containers skipped (not listed / duplicate hash)");
+        }
+        if warm_timed_out.load(Ordering::Relaxed) {
+            println!(
+                "--warm: stopped at the {} s time cap (XCL_WARM_SECONDS)",
+                warm_limit.unwrap_or(0)
+            );
+        }
     }
     if let Some(p) = pipelines {
         let saved_plib = p.flush();

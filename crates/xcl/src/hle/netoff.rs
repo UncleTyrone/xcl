@@ -14,9 +14,9 @@
 //! of the title's – gets no network. What goes through (loopback, local names) calls the
 //! original through the hook's trampoline.
 //!
-//! Depth vs CGBJ `modules::net` (Wave B): bind-all → loopback, `ConnectEx` via `WSAIoctl`,
-//! `getnameinfo` reverse policy, WinHTTP connect/proxy refusals. Still thinner on
-//! `GetAddrInfoExA`, `WSASendMsg` message-name vetting, and some newer WinHTTP proxy APIs.
+//! Depth vs CGBJ `modules::net` (Wave B): bind-all → loopback, `ConnectEx`/`WSASendMsg` via
+//! `WSAIoctl`, `getnameinfo` reverse policy, WinHTTP connect/proxy refusals, `GetAddrInfoExA/W`.
+//! Thinner on WinINet long-tail; Registered I/O multi-ext query refused (`SIO_GET_MULTIPLE…`, `WSAEINVAL`).
 
 use std::ffi::c_void;
 use std::mem::{size_of, size_of_val};
@@ -40,6 +40,7 @@ const AF_INET6: u16 = 23;
 const NI_NUMERICHOST: i32 = 0x02;
 const NI_NAMEREQD: i32 = 0x04;
 const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = 0xC800_0006;
+const SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER: u32 = 0xC800_0024;
 const WINHTTP_ACCESS_TYPE_NO_PROXY: u32 = 1;
 
 #[repr(C)]
@@ -52,6 +53,22 @@ const WSAID_CONNECTEX: Guid = Guid(
     0x4660,
     [0x8e, 0xe9, 0x76, 0xe5, 0x8c, 0x74, 0x06, 0x3e],
 );
+const WSAID_WSASENDMSG: Guid = Guid(
+    0xa441_e712,
+    0x754f,
+    0x43ca,
+    [0x84, 0xa7, 0x0d, 0xee, 0x44, 0xcf, 0x60, 0x6d],
+);
+
+const SOL_SOCKET: i32 = 0xffff;
+const SO_TYPE: i32 = 0x1008;
+const SOCK_STREAM: i32 = 1;
+
+#[repr(C)]
+struct MessageName {
+    name: *const u8,
+    len: i32,
+}
 
 #[link(name = "ws2_32", kind = "raw-dylib")]
 extern "system" {
@@ -69,6 +86,25 @@ extern "system" {
     #[link_name = "GetAddrInfoExW"]
     #[allow(clippy::too_many_arguments)]
     fn real_getaddrinfo_ex(n: *const u16, s: *const u16, ns: u32, id: *const c_void, hints: *const c_void, out: *mut *mut c_void, t: *const c_void, ov: *mut c_void, cb: *const c_void, h: *mut c_void) -> i32;
+    #[link_name = "GetAddrInfoExA"]
+    #[allow(clippy::too_many_arguments)]
+    fn real_getaddrinfo_ex_a(
+        n: *const u8,
+        s: *const u8,
+        ns: u32,
+        id: *const c_void,
+        hints: *const c_void,
+        out: *mut *mut c_void,
+        t: *const c_void,
+        ov: *mut c_void,
+        cb: *const c_void,
+        h: *mut c_void,
+    ) -> i32;
+    #[link_name = "WSASendMsg"]
+    #[allow(clippy::too_many_arguments)]
+    fn real_wsa_send_msg(s: usize, message: *const c_void, flags: u32, sent: *mut u32, ov: *mut c_void, cb: *const c_void) -> i32;
+    #[link_name = "getsockopt"]
+    fn real_getsockopt(s: usize, level: i32, opt: i32, val: *mut i32, len: *mut i32) -> i32;
     #[link_name = "gethostname"]
     fn real_gethostname(name: *mut u8, len: i32) -> i32;
     #[link_name = "getnameinfo"]
@@ -129,6 +165,8 @@ fn table() -> Vec<(&'static str, usize, u16)> {
         ("getaddrinfo", getaddrinfo as *const () as usize, 0),
         ("GetAddrInfoW", getaddrinfo_w as *const () as usize, 0),
         ("GetAddrInfoExW", getaddrinfo_ex as *const () as usize, 0),
+        ("GetAddrInfoExA", getaddrinfo_ex_a as *const () as usize, 0),
+        ("WSASendMsg", wsa_send_msg as *const () as usize, 0),
         ("getnameinfo", getnameinfo as *const () as usize, 0),
     ]
 }
@@ -189,11 +227,13 @@ static O_SENDTO: AtomicUsize = AtomicUsize::new(0);
 static O_GETADDRINFO: AtomicUsize = AtomicUsize::new(0);
 static O_GETADDRINFO_W: AtomicUsize = AtomicUsize::new(0);
 static O_GETADDRINFO_EX: AtomicUsize = AtomicUsize::new(0);
+static O_GETADDRINFO_EX_A: AtomicUsize = AtomicUsize::new(0);
+static O_WSA_SEND_MSG: AtomicUsize = AtomicUsize::new(0);
 static O_GETNAMEINFO: AtomicUsize = AtomicUsize::new(0);
 static O_WSAIOCTL: AtomicUsize = AtomicUsize::new(0);
 static O_WINHTTP_OPEN: AtomicUsize = AtomicUsize::new(0);
 static O_WINHTTP_CONNECT: AtomicUsize = AtomicUsize::new(0);
-static O_UNUSED: [AtomicUsize; 24] = [const { AtomicUsize::new(0) }; 24];
+static O_UNUSED: [AtomicUsize; 26] = [const { AtomicUsize::new(0) }; 26];
 
 unsafe fn orig_connect(s: usize, name: *const u8, len: i32) -> i32 {
     match O_CONNECT.load(Ordering::Acquire) {
@@ -238,6 +278,21 @@ unsafe fn orig_getaddrinfo_ex(n: *const u16, s: *const u16, ns: u32, id: *const 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+unsafe fn orig_getaddrinfo_ex_a(n: *const u8, s: *const u8, ns: u32, id: *const c_void, hints: *const c_void, out: *mut *mut c_void, t: *const c_void, ov: *mut c_void, cb: *const c_void, h: *mut c_void) -> i32 {
+    match O_GETADDRINFO_EX_A.load(Ordering::Acquire) {
+        0 => real_getaddrinfo_ex_a(n, s, ns, id, hints, out, t, ov, cb, h),
+        f => std::mem::transmute::<usize, unsafe extern "system" fn(*const u8, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut c_void) -> i32>(f)(n, s, ns, id, hints, out, t, ov, cb, h),
+    }
+}
+
+unsafe fn orig_wsa_send_msg(s: usize, message: *const c_void, flags: u32, sent: *mut u32, ov: *mut c_void, cb: *const c_void) -> i32 {
+    match O_WSA_SEND_MSG.load(Ordering::Acquire) {
+        0 => real_wsa_send_msg(s, message, flags, sent, ov, cb),
+        f => std::mem::transmute::<usize, unsafe extern "system" fn(usize, *const c_void, u32, *mut u32, *mut c_void, *const c_void) -> i32>(f)(s, message, flags, sent, ov, cb),
+    }
+}
+
 unsafe fn orig_getnameinfo(sa: *const u8, salen: i32, host: *mut u8, hostlen: u32, serv: *mut u8, servlen: u32, flags: i32) -> i32 {
     match O_GETNAMEINFO.load(Ordering::Acquire) {
         0 => real_getnameinfo(sa, salen, host, hostlen, serv, servlen, flags),
@@ -274,7 +329,7 @@ pub fn install_system_hooks() {
     ONCE.call_once(|| unsafe {
         let mut unused = O_UNUSED.iter();
         let mut spare = || unused.next().expect("enough spare trampolines");
-        let hooks: [(&str, &str, usize, &AtomicUsize); 24] = [
+        let hooks: [(&str, &str, usize, &AtomicUsize); 26] = [
             ("winhttp.dll", "WinHttpSendRequest", send_request as usize, spare()),
             ("winhttp.dll", "WinHttpConnect", winhttp_connect as usize, &O_WINHTTP_CONNECT),
             ("winhttp.dll", "WinHttpOpen", winhttp_open as usize, &O_WINHTTP_OPEN),
@@ -297,6 +352,8 @@ pub fn install_system_hooks() {
             ("ws2_32.dll", "getaddrinfo", getaddrinfo as usize, &O_GETADDRINFO),
             ("ws2_32.dll", "GetAddrInfoW", getaddrinfo_w as usize, &O_GETADDRINFO_W),
             ("ws2_32.dll", "GetAddrInfoExW", getaddrinfo_ex as usize, &O_GETADDRINFO_EX),
+            ("ws2_32.dll", "GetAddrInfoExA", getaddrinfo_ex_a as usize, &O_GETADDRINFO_EX_A),
+            ("ws2_32.dll", "WSASendMsg", wsa_send_msg as usize, &O_WSA_SEND_MSG),
             ("ws2_32.dll", "getnameinfo", getnameinfo as usize, &O_GETNAMEINFO),
             ("ws2_32.dll", "GetNameInfoW", getnameinfo_w as usize, spare()),
         ];
@@ -398,8 +455,13 @@ unsafe extern "system" fn bind(s: usize, name: *const u8, len: i32) -> i32 {
     }
 }
 
+unsafe fn stream_socket(s: usize) -> bool {
+    let (mut kind, mut len) = (0i32, 4i32);
+    real_getsockopt(s, SOL_SOCKET, SO_TYPE, &mut kind, &mut len) == 0 && kind == SOCK_STREAM
+}
+
 unsafe extern "system" fn sendto(s: usize, buf: *const u8, len: i32, flags: i32, to: *const u8, tolen: i32) -> i32 {
-    if to.is_null() || loopback(to, tolen) {
+    if to.is_null() || stream_socket(s) || loopback(to, tolen) {
         return orig_sendto(s, buf, len, flags, to, tolen);
     }
     unreachable_net("sendto")
@@ -410,8 +472,27 @@ unsafe extern "system" fn wsa_connect(s: usize, name: *const u8, len: i32, _a: *
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe extern "system" fn wsa_send_to(_s: usize, _bufs: *const c_void, _n: u32, _sent: *mut u32, _flags: u32, _to: *const u8, _tolen: i32, _ov: *mut c_void, _cb: *const c_void) -> i32 {
+unsafe extern "system" fn wsa_send_to(s: usize, bufs: *const c_void, n: u32, sent: *mut u32, flags: u32, to: *const u8, tolen: i32, ov: *mut c_void, cb: *const c_void) -> i32 {
+    if to.is_null() || stream_socket(s) || loopback(to, tolen) {
+        type Fn = unsafe extern "system" fn(usize, *const c_void, u32, *mut u32, u32, *const u8, i32, *mut c_void, *const c_void) -> i32;
+        let module = windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(c"ws2_32.dll".as_ptr().cast());
+        let Some(addr) = windows_sys::Win32::System::LibraryLoader::GetProcAddress(module, b"WSASendTo\0".as_ptr().cast()) else {
+            WSASetLastError(WSAEINVAL);
+            return -1;
+        };
+        return std::mem::transmute::<usize, Fn>(addr as usize)(s, bufs, n, sent, flags, to, tolen, ov, cb);
+    }
     unreachable_net("WSASendTo")
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn wsa_send_msg(s: usize, message: *const c_void, flags: u32, sent: *mut u32, overlapped: *mut c_void, completion: *const c_void) -> i32 {
+    if let Some(m) = message.cast::<MessageName>().as_ref() {
+        if !m.name.is_null() && !stream_socket(s) && !loopback(m.name, m.len) {
+            return unreachable_net("WSASendMsg");
+        }
+    }
+    orig_wsa_send_msg(s, message, flags, sent, overlapped, completion)
 }
 
 type ConnectExFn = unsafe extern "system" fn(usize, *const u8, i32, *const c_void, u32, *mut u32, *mut c_void) -> i32;
@@ -462,22 +543,30 @@ unsafe extern "system" fn wsa_ioctl(
     ov: *mut c_void,
     cb: *const c_void,
 ) -> i32 {
-    if code == SIO_GET_EXTENSION_FUNCTION_POINTER
+    if code == SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER {
+        WSASetLastError(WSAEINVAL);
+        return -1;
+    }
+    let result = orig_wsa_ioctl(s, code, in_buf, in_len, out_buf, out_len, ret, ov, cb);
+    if result == 0
+        && code == SIO_GET_EXTENSION_FUNCTION_POINTER
         && !in_buf.is_null()
         && in_len as usize >= size_of::<Guid>()
         && !out_buf.is_null()
         && out_len as usize >= size_of::<usize>()
     {
         let guid = *(in_buf as *const Guid);
-        if guid == WSAID_CONNECTEX {
-            *(out_buf as *mut usize) = connect_ex as usize;
-            if !ret.is_null() {
-                *ret = size_of::<usize>() as u32;
-            }
-            return 0;
+        let ours = match guid {
+            WSAID_CONNECTEX => connect_ex as usize,
+            WSAID_WSASENDMSG => wsa_send_msg as usize,
+            _ => return result,
+        };
+        *(out_buf as *mut usize) = ours;
+        if !ret.is_null() {
+            *ret = size_of::<usize>() as u32;
         }
     }
-    orig_wsa_ioctl(s, code, in_buf, in_len, out_buf, out_len, ret, ov, cb)
+    result
 }
 
 unsafe extern "system" fn gethostbyname(_name: *const u8) -> *mut c_void {
@@ -529,6 +618,34 @@ unsafe extern "system" fn getaddrinfo_ex(n: *const u16, s: *const u16, ns: u32, 
         return orig_getaddrinfo_ex(n, s, ns, id, hints, out, t, ov, cb, h);
     }
     note(&format!("GetAddrInfoExW({name})"));
+    if !out.is_null() {
+        *out = std::ptr::null_mut();
+    }
+    WSAHOST_NOT_FOUND
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn getaddrinfo_ex_a(
+    n: *const u8,
+    s: *const u8,
+    ns: u32,
+    id: *const c_void,
+    hints: *const c_void,
+    out: *mut *mut c_void,
+    t: *const c_void,
+    ov: *mut c_void,
+    cb: *const c_void,
+    h: *mut c_void,
+) -> i32 {
+    let name = if n.is_null() {
+        String::new()
+    } else {
+        crate::util::from_ansi_ptr(n).unwrap_or_default()
+    };
+    if local_name(&name) {
+        return orig_getaddrinfo_ex_a(n, s, ns, id, hints, out, t, ov, cb, h);
+    }
+    note(&format!("GetAddrInfoExA({name})"));
     if !out.is_null() {
         *out = std::ptr::null_mut();
     }
