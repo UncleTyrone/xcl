@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 setlocal EnableExtensions DisableDelayedExpansion
 if not defined XCL_GAME_DIR (
   echo Set XCL_GAME_DIR to the folder containing your title executable. 1>&2
@@ -9,13 +9,13 @@ if not exist "%XCL_GAME_DIR%\game_scarlett_master.exe" (
   exit /b 2
 )
 set "runner=%~dp0target\release\xcl.exe"
-if not exist "%runner%" set "runner=%~dp0xcl-3d-rtx-pareto-residency.exe"
+if not exist "%runner%" set "runner=%~dp0xcl-3d-rtx-play.exe"
 if not exist "%runner%" (
   echo Extract the Windows release or run cargo build --release -p xcl. 1>&2
   exit /b 2
 )
 
-set "XCL_CACHE_DIR=%LOCALAPPDATA%\XCL\cache-pareto"
+set "XCL_CACHE_DIR=%LOCALAPPDATA%\XCL\cache-play"
 set "XCL_AMBIENT_AIR=1.5"
 set "XCL_AMBIENT=0.8"
 set "XCL_TEXTURE_NO_WAIT=1"

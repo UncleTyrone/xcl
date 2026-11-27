@@ -1,5 +1,5 @@
 //! Static-import check before the title entry: game-shipped DLLs that are not beside
-//! the executable fail early (GTA VI #930 during System Init at +0x2237178 when e.g.
+//! the executable fail early (retail game #930 during System Init at +0x2237178 when e.g.
 //! XboxBvhBuilder.dll or Bink2Scarlett.dll are missing).
 
 use std::path::Path;
@@ -94,7 +94,7 @@ pub fn check_or_bail(exe: &Path, title_dir: &Path) -> Result<(), String> {
     crate::xlog_error!("missing title DLLs: {message}");
     if lenient() {
         crate::xlog_warn!(
-            "XCL_TITLE_DLL_LENIENT=1: continuing anyway (missing imports may stub; GTA VI often stops at System Init #930 without a clear message)"
+            "XCL_TITLE_DLL_LENIENT=1: continuing anyway (missing imports may stub; retail game often stops at System Init #930 without a clear message)"
         );
         return Ok(());
     }

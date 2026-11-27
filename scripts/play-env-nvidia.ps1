@@ -1,9 +1,9 @@
-﻿# nvidia-dev pareto bundle — Play-XCL.cmd-shaped with safe/full/dev split (play.ps1 knobs covered).
+﻿# nvidia-dev play env — Play-XCL.cmd-shaped with safe/full/dev split (play.ps1 knobs covered).
 #
 # Usage:
-#   . .\scripts\pareto-nvidia.ps1            # safe (rate-friendly; no RESIDENCY/frame-cap)
-#   . .\scripts\pareto-nvidia.ps1 -Full      # denser residency/heap/awake (may lower presents/2s)
-#   . .\scripts\pareto-nvidia.ps1 -Dev       # play.ps1 non-safe: THIN=1 JOIN_PARTS=8
+#   . .\scripts\play-env-nvidia.ps1            # safe (rate-friendly; no RESIDENCY/frame-cap)
+#   . .\scripts\play-env-nvidia.ps1 -Full      # denser residency/heap/awake (may lower presents/2s)
+#   . .\scripts\play-env-nvidia.ps1 -Dev       # play.ps1 non-safe: THIN=1 JOIN_PARTS=8
 #   cargo build --release -p xcl   (from src/nvidia-dev)
 
 param(
@@ -11,7 +11,7 @@ param(
     [switch]$Dev
 )
 
-$pareto = @{
+$xclEnv = @{
     XCL_TEXTURE_NO_WAIT         = '1'
     XCL_RELAY                   = '2'
     XCL_RELAY_COPY              = '1'
@@ -42,25 +42,25 @@ $pareto = @{
 }
 
 if ($Dev) {
-    $pareto['XCL_THIN'] = '1'
-    $pareto['XCL_JOIN_PARTS'] = '8'
-    $pareto['XCL_AMBIENT'] = '0.8'
+    $xclEnv['XCL_THIN'] = '1'
+    $xclEnv['XCL_JOIN_PARTS'] = '8'
+    $xclEnv['XCL_AMBIENT'] = '0.8'
 }
 
 if ($Full) {
-    $pareto['XCL_HEAP_STRIDES'] = '1'
-    $pareto['XCL_RESIDENCY'] = '1'
-    $pareto['XCL_FRAME_INTERVAL_MS'] = '16'
-    $pareto['XCL_GPU_AWAKE'] = '1'
+    $xclEnv['XCL_HEAP_STRIDES'] = '1'
+    $xclEnv['XCL_RESIDENCY'] = '1'
+    $xclEnv['XCL_FRAME_INTERVAL_MS'] = '16'
+    $xclEnv['XCL_GPU_AWAKE'] = '1'
 }
 
-# Opt-in land spine (Play-XCL.cmd does not set LAND; pareto-amd does):
-# $pareto['XCL_LAND'] = '1'
-# $pareto['XCL_LAND_BESIDE'] = '1'
+# Opt-in land spine (Play-XCL.cmd does not set LAND; play-env-amd does):
+# $xclEnv['XCL_LAND'] = '1'
+# $xclEnv['XCL_LAND_BESIDE'] = '1'
 
-foreach ($k in $pareto.Keys) {
-    Set-Item -Path "Env:$k" -Value $pareto[$k]
+foreach ($k in $xclEnv.Keys) {
+    Set-Item -Path "Env:$k" -Value $xclEnv[$k]
 }
 
 $label = if ($Dev) { 'dev' } elseif ($Full) { 'full' } else { 'safe' }
-Write-Host "nvidia-dev $label pareto env set ($($pareto.Count) XCL_* variables)."
+Write-Host "nvidia-dev $label play env set ($($xclEnv.Count) XCL_* variables)."
