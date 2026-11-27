@@ -1,10 +1,11 @@
-﻿# nvidia-dev pareto bundle — mirrors key/efforts/CGBJ/Play-VIctory.cmd (RTX residency path).
-# Build from: src/nvidia-dev  (cargo build --release -p xcl)
-# Usage:
-#   . .\scripts\pareto-nvidia.ps1
-#   # then inject xcl.dll / xcl run with --console series-x on 8 GB cards (per cmd comments)
+﻿# nvidia-dev pareto bundle — Play-VIctory.cmd-shaped with safe/full split.
 #
-# Defaults: THIN/JOIN off, RELAY=2, ports 0; LAND/WIDE_BACK off unless you opt in below.
+# Usage:
+#   . .\scripts\pareto-nvidia.ps1            # safe (rate-friendly; no RESIDENCY/frame-cap)
+#   . .\scripts\pareto-nvidia.ps1 -Full      # denser residency/heap/awake (may lower presents/2s)
+#   cargo build --release -p xcl   (from src/nvidia-dev)
+
+param([switch]$Full)
 
 $pareto = @{
     XCL_TEXTURE_NO_WAIT         = '1'
@@ -31,10 +32,13 @@ $pareto = @{
     XCL_LEVELS_ON_DEMAND        = '1'
     XCL_CARD_BUFFERS_MIN_KB     = '64'
     XCL_D3D12_DRED              = 'light'
-    XCL_HEAP_STRIDES            = '1'
-    XCL_RESIDENCY               = '1'
-    XCL_FRAME_INTERVAL_MS       = '16'
-    XCL_GPU_AWAKE               = '1'
+}
+
+if ($Full) {
+    $pareto['XCL_HEAP_STRIDES'] = '1'
+    $pareto['XCL_RESIDENCY'] = '1'
+    $pareto['XCL_FRAME_INTERVAL_MS'] = '16'
+    $pareto['XCL_GPU_AWAKE'] = '1'
 }
 
 # Opt-in land spine (Play-VIctory.cmd does not set LAND; pareto-amd does):
@@ -45,4 +49,5 @@ foreach ($k in $pareto.Keys) {
     Set-Item -Path "Env:$k" -Value $pareto[$k]
 }
 
-Write-Host "nvidia-dev pareto env set ($($pareto.Count) XCL_* variables)."
+$label = if ($Full) { 'full' } else { 'safe' }
+Write-Host "nvidia-dev $label pareto env set ($($pareto.Count) XCL_* variables)."
