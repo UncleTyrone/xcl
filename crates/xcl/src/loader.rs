@@ -12,6 +12,9 @@ use windows_sys::Win32::System::Memory::{
 };
 
 pub mod frame_rate;
+pub mod patch_insn;
+pub mod resolution;
+pub mod write_sites;
 
 use crate::modules::{self, MappedModule};
 use crate::pe::{self, Layout, OwnedExports, Pe};
@@ -234,7 +237,9 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         unsafe { crate::eh::hook_gs_failure(base + s.va as usize, len, &name) };
     }
     if is_main {
+        unsafe { write_sites::apply_asked(&name, base, size) };
         unsafe { frame_rate::apply_if_asked(base, size) };
+        unsafe { resolution::apply_asked(base, size) };
     }
     Ok(module)
 }
