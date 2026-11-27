@@ -7,10 +7,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use windows::core::Interface;
-use windows::Win32::Graphics::Direct3D12::*;
-
-use crate::gpu::fence;
 
 /// Dedicated VRAM (MiB) of the chosen adapter — set once at device init.
 static DEDICATED_VRAM_MB: OnceLock<u64> = OnceLock::new();
@@ -190,45 +186,12 @@ pub fn removal_summary_line() -> String {
 }
 
 // ---------------------------------------------------------------------------------------
-// Serial submit: one list + GPU fence wait
+// Serial submit: one list + GPU fence wait (impl in `late_wait`)
 // ---------------------------------------------------------------------------------------
-
-struct SerialFence {
-    fence: ID3D12Fence,
-    value: u64,
-}
-
-static SERIAL: Mutex<Option<std::collections::HashMap<usize, SerialFence>>> = Mutex::new(None);
 
 /// After each command list when `XCL_SUBMIT_SERIAL` is on: wait until the queue finishes it.
 pub unsafe fn serial_wait_after_submit(queue: *mut c_void) {
-    if !super::port::submit_serial() || queue.is_null() || super::late_wait::skip_serial_wait() {
-        return;
-    }
-    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
-    let mut dev: Option<ID3D12Device> = None;
-    if q.GetDevice(&mut dev).is_err() {
-        return;
-    }
-    let Some(dev) = dev else { return };
-    let key = queue as usize;
-    let (fence, value) = {
-        let mut g = SERIAL.lock().unwrap();
-        let map = g.get_or_insert_with(std::collections::HashMap::new);
-        let entry = map.entry(key).or_insert_with(|| SerialFence {
-            fence: dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("serial fence"),
-            value: 0,
-        });
-        entry.value += 1;
-        let v = entry.value;
-        if q.Signal(&entry.fence, v).is_err() {
-            return;
-        }
-        (entry.fence.clone(), v)
-    };
-    if let Err(e) = fence::wait(&fence, value, &dev, None, 30_000) {
-        crate::xlog_warn!("D3D12.X: serial submit wait timed out or failed ({e})");
-    }
+    super::late_wait::serial_wait_after_submit(queue);
 }
 
 #[cfg(test)]

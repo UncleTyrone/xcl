@@ -310,6 +310,7 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
         *v += 1;
         (f.clone(), *v)
     };
+    super::late_wait::attach_queue_fence(queue, &fence, value);
     for &l in lists {
         if let Some(&b) = s.of_list.get(&(l as usize)) {
             s.backings.entry(b).or_default().marks.insert(key, (fence.clone(), value));

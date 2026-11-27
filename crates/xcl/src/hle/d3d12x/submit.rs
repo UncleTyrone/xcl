@@ -110,6 +110,10 @@ pub fn present_behind() -> u64 {
     IN_FLIGHT.load(Ordering::Acquire)
 }
 
+pub fn note_present_queued() {
+    IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+}
+
 pub fn note_submit_done() {
     let before = IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
     let v = before.saturating_sub(1);

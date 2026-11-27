@@ -9156,6 +9156,7 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
     if hr >= 0 {
         super::fence_x::note_queue_signal(fence as usize, value);
         super::list_x::note_title_queue_signal(this as usize, fence as usize, value);
+        super::frame_replay::on_queue_signal(this, fence, value);
     }
     hr
 }
@@ -9279,7 +9280,6 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
 
 /// Title `ExecuteCommandLists` after refresh / translate join.
 unsafe fn execute_command_lists_body(this: *mut c_void, lists: &[*mut c_void]) {
-    super::frame_replay::on_title_submit(this, lists);
     super::title_textures::before_title_execute(this);
     super::capture::submit(this, lists);
     let _in_pc = super::pso_async::pc_call();
@@ -9290,6 +9290,7 @@ unsafe fn execute_command_lists_body(this: *mut c_void, lists: &[*mut c_void]) {
     let t_lists = std::time::Instant::now();
     super::submit_cost::call(t_lists - submit_t0);
     let mapped = super::thin::map_lists(lists);
+    super::frame_replay::on_submit(this, lists, &mapped);
     if super::submit::run_async_mapped(this, mapped.clone()) {
         super::submit::end_refresh();
         super::session::note_submit_draw_work(super::watch::recent_work_count() as u64);
@@ -9322,6 +9323,8 @@ pub(super) unsafe fn execute_mapped_lists(this: *mut c_void, mapped: &[*mut c_vo
     let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12CommandQueue", "ExecuteCommandLists")));
     super::list_x::note_queue_for_lists(this as usize, mapped);
     let submit_chunk = |chunk: &[*mut c_void]| {
+        let _fid = super::late_wait::begin_chunk(this as usize, 0);
+        unsafe { super::late_wait::settle_bop_before_submit(this) };
         let t = std::time::Instant::now();
         if super::alloc_pool::note_resubmits(this, chunk) > 0 {
             super::alloc_pool::wait_for_previous_submits(chunk);
@@ -9337,14 +9340,16 @@ pub(super) unsafe fn execute_mapped_lists(this: *mut c_void, mapped: &[*mut c_vo
         super::submit_cost::driver(t1 - t);
         super::list_x::copy_scratch_submitted(this, chunk);
         super::alloc_pool::executed(this, chunk);
+        let w64 = super::list_x::chunk_write64_signals(chunk);
         super::list_x::signal_write64_fences(this, chunk);
         super::list_x::readback_sparse_writes(this, chunk);
         super::list_x::cpu_writes_after(this, chunk);
         super::list_x::note_submitted(this);
-        super::late_wait::note_chunk_sent();
+        super::late_wait::note_chunk_payload(&w64, 0);
+        super::late_wait::end_chunk();
         super::submit_cost::after(t1.elapsed());
         if super::port::submit_serial() {
-            super::session::serial_wait_after_submit(this);
+            super::late_wait::serial_wait_after_submit(this);
         }
     };
     if super::port::submit_serial() {
