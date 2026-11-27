@@ -1315,6 +1315,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
         }
         pg = tile_end;
     }
+    dirty_runs = super::card_rehash::join_runs(dirty_runs);
     if !dirty_runs.is_empty() {
         s.upload_dirty(&dirty_runs);
     }
@@ -1598,6 +1599,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
             x = end;
         }
     }
+    dirty_runs = super::card_rehash::join_runs(dirty_runs);
     let t_scanned = std::time::Instant::now();
     PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Ordering::Relaxed);
     PHASES[3].fetch_add((zero_runs.len() + dirty_runs.len()) as u64, Ordering::Relaxed);
