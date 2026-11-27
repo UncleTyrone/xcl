@@ -39,7 +39,7 @@ extern "system" {
 }
 
 /// (device, address its bytes are read from, layout, states) of an upload
-type Upload = (usize, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>);
+type Upload = (usize, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>, bool);
 
 struct Entry {
     device: usize,
@@ -755,6 +755,18 @@ unsafe impl Send for QueueUploads {}
 static ON_QUEUE: Mutex<BTreeMap<usize, QueueUploads>> = Mutex::new(BTreeMap::new());
 
 const IN_FLIGHT_BYTES: u64 = 512 << 20;
+const IN_FLIGHT_BYTES_LOW_COMMIT: u64 = 64 << 20;
+
+fn in_flight_cap_bytes(low_commit: bool) -> u64 {
+    if super::texture_pool::on() {
+        return super::texture_pool::free_cap_bytes();
+    }
+    if low_commit {
+        IN_FLIGHT_BYTES_LOW_COMMIT
+    } else {
+        IN_FLIGHT_BYTES
+    }
+}
 
 unsafe fn title_queue_for(dev: &ID3D12Device, title: Option<&ID3D12CommandQueue>) -> Option<ID3D12CommandQueue> {
     let q = title?;
@@ -830,7 +842,7 @@ unsafe fn submit_on_title_queue(dev: &ID3D12Device, queue: &ID3D12CommandQueue, 
     q.bytes = q.bytes.saturating_add(f.bytes);
     let v = q.value;
     q.in_flight.push_back((v, f));
-    reclaim(dev, q, IN_FLIGHT_BYTES, 10_000);
+    reclaim(dev, q, in_flight_cap_bytes(super::vram::commit_low()), 10_000);
     super::texture_upload_ahead::record_sent(&super::texture_upload_ahead::Sent {
         fence: q.fence.clone(),
         value: q.value,
@@ -876,7 +888,7 @@ pub(super) unsafe fn upload_if_pending(res: usize) -> Result<Option<super::textu
         let r = ID3D12Resource::from_raw_borrowed(&p).ok_or_else(|| "no resource".to_string())?;
         (
             r.clone(),
-            (e.device, e.src, Arc::clone(&e.tex), e.states.clone()),
+            (e.device, e.src, Arc::clone(&e.tex), e.states.clone(), true),
             e.device,
         )
     };
@@ -1017,12 +1029,14 @@ unsafe fn refresh_once(queue: *mut c_void) {
                     super::texture_policy::NO_WAIT_SKIPPED.fetch_add(1, Ordering::Relaxed);
                     return None;
                 }
+                let first = e.pending;
                 if e.pending {
                     e.pending = false;
                     PENDING.fetch_sub(1, Ordering::Relaxed);
                 }
                 let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
+                ID3D12Resource::from_raw_borrowed(&p)
+                    .map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone(), first)))
             })
             .collect()
     });
@@ -1150,7 +1164,7 @@ unsafe fn seed_stream_recheck(todo: &[(ID3D12Resource, Upload)], watched: &[(usi
         return;
     }
     let mut seeded = Vec::new();
-    for (r, (_, src, tex, _)) in todo {
+    for (r, (_, src, tex, _, _)) in todo {
         let size = tex.size() as usize;
         if size == 0 || range_is_fully_watched(*src, size, watched) {
             continue;
@@ -1281,22 +1295,62 @@ unsafe fn recheck_streamed_unwatched_at(watched: &[(usize, usize)], frame: u64) 
 /// and keeps each GPU copy list short enough to avoid WDDM 2 s TDR when thousands of small
 /// textures stream at once.
 const BATCH_BYTES: usize = 32 << 20;
+/// Tighter batch cap under low Windows commit headroom (`vram::commit_low`) so persistent texture
+/// upload staging buffers stay small instead of growing to 64–144 MiB.
+const BATCH_BYTES_LOW_COMMIT: usize = 8 << 20;
 const BATCH_ITEMS: usize = 256;
 
 /// Whether another upload `(next_dev, next_bytes)` still fits in the current batch of
-/// `picked_count` textures totalling `picked_bytes` on `batch_dev`. An empty batch always takes
-/// its first upload (even if larger than `BATCH_BYTES`) so progress is guaranteed.
-fn batch_fits(picked_count: usize, picked_bytes: usize, batch_dev: usize, next_dev: usize, next_bytes: usize) -> bool {
+/// `picked_count` textures totalling `picked_bytes` on `batch_dev` under byte cap `max_bytes`.
+/// An empty batch always takes its first upload (even if larger than `max_bytes`) so progress is
+/// guaranteed.
+fn batch_fits_limit(picked_count: usize, picked_bytes: usize, batch_dev: usize, next_dev: usize, next_bytes: usize, max_bytes: usize) -> bool {
     picked_count == 0
         || (picked_count < BATCH_ITEMS
             && next_dev == batch_dev
-            && picked_bytes.saturating_add(next_bytes) <= BATCH_BYTES)
+            && picked_bytes.saturating_add(next_bytes) <= max_bytes)
 }
 
-/// The uploads `todo`, in batches of up to `BATCH_BYTES` and `BATCH_ITEMS`. Direct title queues
+fn batch_bytes_cap() -> usize {
+    let base = if super::vram::commit_low() {
+        BATCH_BYTES_LOW_COMMIT
+    } else {
+        BATCH_BYTES
+    };
+    if !super::residency::on() {
+        return base;
+    }
+    super::residency::prefetch_limit(
+        base as u64,
+        super::residency::pressured(),
+        super::residency::critical_commit(),
+        super::residency::limited_host_ram(),
+        super::residency::live_staging_bytes(),
+    ) as usize
+}
+
+/// The uploads `todo`, in batches of up to `BATCH_BYTES` (or `BATCH_BYTES_LOW_COMMIT` when Windows
+/// commit is below reserve) and `BATCH_ITEMS`. Direct title queues
 /// execute uploads inline with a bounded in-flight staging ring (no CPU fence stall); other queues
 /// fall back to the upload queue.
 unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12CommandQueue>) {
+    let baking = super::bake_upload::treat_first_as_bake(todo.iter().any(|(_, u)| u.4));
+    if super::residency::on() {
+        if super::residency::take_staging_deferred() || super::residency::upload_refused() {
+            return;
+        }
+        if !super::residency::admit_texture_pass(baking) {
+            return;
+        }
+    }
+    if baking {
+        super::bake_upload::with_bake(|| unsafe { upload_all_inner(todo, title) });
+    } else {
+        unsafe { upload_all_inner(todo, title) };
+    }
+}
+
+unsafe fn upload_all_inner(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12CommandQueue>) {
     static N: AtomicU64 = AtomicU64::new(0);
     let warn = |e: &str| {
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -1308,11 +1362,12 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12C
         let mut picked = Vec::new();
         let mut bytes = 0usize;
         let mut device = 0usize;
-        while let Some((_, (dev, _, tex, _))) = todo.peek() {
-            if !batch_fits(picked.len(), bytes, device, *dev, tex.size() as usize) {
+        let max_batch_bytes = batch_bytes_cap();
+        while let Some((_, (dev, _, tex, _, _))) = todo.peek() {
+            if !batch_fits_limit(picked.len(), bytes, device, *dev, tex.size() as usize, max_batch_bytes) {
                 break;
             }
-            let (r, (dev, va, tex, states)) = todo.next().unwrap();
+            let (r, (dev, va, tex, states, _)) = todo.next().unwrap();
             // The same bytes as at this texture's last upload: nothing to do. The write watch is
             // per page and a title writes next to its textures (and rewrites what it wrote): a
             // retail title's video planes and UI targets went up again for every submit, ~25 MB
@@ -3305,21 +3360,25 @@ mod tests {
     #[test]
     fn batch_fits_caps_items_bytes_and_device() {
         // Empty batch always accepts its first upload, even when larger than BATCH_BYTES.
-        assert!(batch_fits(0, 0, 0, 1, BATCH_BYTES + 4096));
+        assert!(batch_fits_limit(0, 0, 0, 1, BATCH_BYTES + 4096, BATCH_BYTES));
         // Once an oversized texture is in the batch, the next upload starts a new batch.
-        assert!(!batch_fits(1, BATCH_BYTES + 4096, 1, 1, 4096));
+        assert!(!batch_fits_limit(1, BATCH_BYTES + 4096, 1, 1, 4096, BATCH_BYTES));
 
         // Many tiny textures split at BATCH_ITEMS even when well below BATCH_BYTES.
-        assert!(batch_fits(BATCH_ITEMS - 1, (BATCH_ITEMS - 1) * 4096, 1, 1, 4096));
-        assert!(!batch_fits(BATCH_ITEMS, BATCH_ITEMS * 4096, 1, 1, 4096));
+        assert!(batch_fits_limit(BATCH_ITEMS - 1, (BATCH_ITEMS - 1) * 4096, 1, 1, 4096, BATCH_BYTES));
+        assert!(!batch_fits_limit(BATCH_ITEMS, BATCH_ITEMS * 4096, 1, 1, 4096, BATCH_BYTES));
 
         // Byte cap accepts exact BATCH_BYTES, splits past it, and does not overflow.
-        assert!(batch_fits(1, BATCH_BYTES - 4096, 1, 1, 4096));
-        assert!(!batch_fits(1, BATCH_BYTES - 4096, 1, 1, 4097));
-        assert!(!batch_fits(1, usize::MAX - 10, 1, 1, 100));
+        assert!(batch_fits_limit(1, BATCH_BYTES - 4096, 1, 1, 4096, BATCH_BYTES));
+        assert!(!batch_fits_limit(1, BATCH_BYTES - 4096, 1, 1, 4097, BATCH_BYTES));
+        assert!(!batch_fits_limit(1, usize::MAX - 10, 1, 1, 100, BATCH_BYTES));
 
         // Different device always starts a new batch.
-        assert!(!batch_fits(1, 4096, 1, 2, 4096));
+        assert!(!batch_fits_limit(1, 4096, 1, 2, 4096, BATCH_BYTES));
+
+        assert_eq!(in_flight_cap_bytes(true), IN_FLIGHT_BYTES_LOW_COMMIT);
+        assert!(batch_fits_limit(0, 0, 1, 1, BATCH_BYTES, BATCH_BYTES_LOW_COMMIT), "empty batch always makes progress");
+        assert!(!batch_fits_limit(1, BATCH_BYTES_LOW_COMMIT, 1, 1, 1, BATCH_BYTES_LOW_COMMIT), "low-commit cap bounds batch size");
     }
 
     /// Hashing the title's bytes must not fault with 0xC0000005 when another thread decommits

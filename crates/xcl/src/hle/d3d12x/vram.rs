@@ -584,6 +584,38 @@ fn keep_spare_pools() -> usize {
     })
 }
 
+/// Default Windows virtual commit reserve floor (4 GiB) below which optional VRAM pool spares,
+/// reserved-texture reuse caching, and large upload staging batches shed commit headroom.
+const DEFAULT_COMMIT_RESERVE_MIB: u64 = 4096;
+
+/// `XCL_COMMIT_RESERVE_MB` (default `4096`, `0` disables): free Windows commit floor in bytes.
+fn commit_reserve_bytes() -> u64 {
+    static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        let mib = std::env::var("XCL_COMMIT_RESERVE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_COMMIT_RESERVE_MIB);
+        mib.saturating_mul(1024 * 1024)
+    })
+}
+
+fn avail_commit_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullAvailPageFile)
+}
+
+fn commit_below_floor(avail_bytes: Option<u64>, floor_bytes: u64) -> bool {
+    floor_bytes > 0 && avail_bytes.is_some_and(|avail| avail < floor_bytes)
+}
+
+/// True when Windows available virtual commit (`ullAvailPageFile`) is below the reserve floor.
+pub(super) fn commit_low() -> bool {
+    commit_below_floor(avail_commit_bytes(), commit_reserve_bytes())
+}
+
 /// The title's pages of video memory for tiled textures (see the module's comment).
 struct Pages {
     queue: ID3D12CommandQueue,

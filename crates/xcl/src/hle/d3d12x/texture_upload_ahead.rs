@@ -34,6 +34,12 @@ pub(super) fn offer(res: usize) {
     if !on() {
         return;
     }
+    if super::residency::on()
+        && (super::residency::upload_refused() || !super::residency::allow_staging_growth(false))
+    {
+        STATS[2].fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     ensure_worker();
     let mut q = PENDING.0.lock().unwrap();
     if !q.contains(&res) {

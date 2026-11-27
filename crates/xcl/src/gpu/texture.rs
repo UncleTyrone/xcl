@@ -207,12 +207,15 @@ pub unsafe fn upload(dev: &ID3D12Device, queue: &ID3D12CommandQueue, res: &ID3D1
 /// retail game most of its frame once it streamed textures: each of those D3D12 calls waits for
 /// the video memory manager, 200 – 650 ms apiece then.
 struct Uploader {
+    dev_key: usize,
     alloc: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
     value: u64,
     /// (buffer, its mapped bytes, capacity)
     staging: Option<(ID3D12Resource, *mut u8, u64)>,
+    last_used_ms: u64,
+    last_used_frame: u64,
 }
 
 // D3D12 objects are free-threaded; the mapped pointer is only used by the holder of the uploader
@@ -229,6 +232,10 @@ const PLACEMENT: u64 = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
 const STAGING_POOL_MAX_ITEM: u64 = 8 << 20;
 /// Default total byte cap for the shared upload staging pool (256 MiB, `XCL_STAGING_POOL_MB`).
 const STAGING_POOL_DEFAULT_CAP: u64 = 256 << 20;
+/// Idle staging buffers untouched for at least 2 seconds AND 30 frames are released to reclaim
+/// Windows commit headroom.
+const STAGING_IDLE_MS: u64 = 2_000;
+const STAGING_IDLE_FRAMES: u64 = 30;
 
 static CURRENT_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -259,7 +266,8 @@ struct PooledStaging<T> {
     last_frame: u64,
 }
 
-/// Power-of-2 upload staging buffer pool (`<= 8 MiB` per entry, bounded total capacity).
+/// Power-of-2 upload staging buffer pool (`<= 8 MiB` per entry, bounded total capacity) with
+/// idle reclamation after `STAGING_IDLE_MS` and `STAGING_IDLE_FRAMES`.
 struct StagingPool<T> {
     buckets: std::collections::BTreeMap<u64, Vec<PooledStaging<T>>>,
     total_bytes: u64,
@@ -273,6 +281,10 @@ impl<T> StagingPool<T> {
             total_bytes: 0,
             cap_bytes,
         }
+    }
+
+    fn live_bytes(&self) -> u64 {
+        self.total_bytes
     }
 
     fn acquire(&mut self, bytes: u64) -> Option<(u64, T)> {
@@ -320,6 +332,38 @@ impl<T> StagingPool<T> {
         }
         false
     }
+
+    fn trim_idle(&mut self, now_ms: u64, frame: u64, force_all: bool) -> (usize, u64) {
+        let mut freed_count = 0usize;
+        let mut freed_bytes = 0u64;
+        let mut empty_buckets = Vec::new();
+        for (&cap, list) in &mut self.buckets {
+            let before = list.len();
+            if force_all {
+                list.clear();
+            } else {
+                list.retain(|e| {
+                    let ms_idle = now_ms.saturating_sub(e.last_ms) >= STAGING_IDLE_MS;
+                    let fr_idle = frame.saturating_sub(e.last_frame) >= STAGING_IDLE_FRAMES;
+                    !(ms_idle && fr_idle)
+                });
+            }
+            let dropped = before - list.len();
+            if dropped > 0 {
+                freed_count += dropped;
+                let bytes = cap.saturating_mul(dropped as u64);
+                freed_bytes = freed_bytes.saturating_add(bytes);
+                self.total_bytes = self.total_bytes.saturating_sub(bytes);
+            }
+            if list.is_empty() {
+                empty_buckets.push(cap);
+            }
+        }
+        for cap in empty_buckets {
+            self.buckets.remove(&cap);
+        }
+        (freed_count, freed_bytes)
+    }
 }
 
 struct MappedStaging(ID3D12Resource, *mut u8);
@@ -344,25 +388,137 @@ impl Uploader {
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
         list.Close().map_err(err)?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
-        Ok(Uploader { alloc, list, fence, value: 0, staging: None })
+        Ok(Uploader {
+            dev_key: windows::core::Interface::as_raw(dev) as usize,
+            alloc,
+            list,
+            fence,
+            value: 0,
+            staging: None,
+            last_used_ms: monotonic_ms(),
+            last_used_frame: CURRENT_FRAME.load(std::sync::atomic::Ordering::Relaxed),
+        })
     }
 
-    /// An upload buffer of at least `bytes`, mapped: the one kept, or a bigger one.
-    unsafe fn staging(&mut self, dev: &ID3D12Device, bytes: u64) -> Result<(ID3D12Resource, *mut u8), String> {
+    /// An upload buffer of at least `bytes`, mapped: the one kept, a pooled power-of-2 buffer,
+    /// or a freshly allocated one.
+    unsafe fn staging(&mut self, dev: &ID3D12Device, bytes: u64, now_ms: u64, frame: u64) -> Result<(ID3D12Resource, *mut u8), String> {
+        self.last_used_ms = now_ms;
+        self.last_used_frame = frame;
         if let Some((b, p, cap)) = &self.staging {
             if *cap >= bytes {
                 return Ok((b.clone(), *p));
             }
         }
         let cap = staging_capacity(bytes).ok_or("texture upload buffer size overflow")?;
-        // A cached uploader has passed its last copy fence. Return this reference before
-        // acquiring the replacement so the growth path does not keep two buffers itself.
-        drop(self.staging.take());
-        let b = buffer(dev, cap)?;
+        let bake = crate::host_bake_upload::active();
+        if !crate::host_residency::allow_staging_growth(bake) {
+            crate::host_residency::note_staging_deferred();
+            return Err("texture upload: staging growth deferred (commit headroom)".into());
+        }
+        // A cached uploader has passed its last copy fence. Return its old `<= 8 MiB` buffer to
+        // the shared power-of-2 pool (or drop an oversized one) before acquiring the replacement
+        // so the growth path does not keep two oversized buffers alive simultaneously.
+        if let Some((old_b, old_p, old_cap)) = self.staging.take() {
+            if old_cap <= STAGING_POOL_MAX_ITEM && staging_pool_cap_bytes() > 0 {
+                let mut pools = STAGING_POOLS.lock().unwrap();
+                let pool = pools
+                    .get_or_insert_with(Default::default)
+                    .entry(self.dev_key)
+                    .or_insert_with(|| StagingPool::new(staging_pool_cap_bytes()));
+                let _ = pool.release(old_cap, MappedStaging(old_b, old_p), now_ms, frame);
+            }
+        }
+        if cap <= STAGING_POOL_MAX_ITEM && staging_pool_cap_bytes() > 0 {
+            let mut pools = STAGING_POOLS.lock().unwrap();
+            if let Some((pooled_cap, MappedStaging(b, p))) = pools
+                .as_mut()
+                .and_then(|m| m.get_mut(&self.dev_key))
+                .and_then(|pool| pool.acquire(cap))
+            {
+                self.staging = Some((b.clone(), p, pooled_cap));
+                return Ok((b, p));
+            }
+        }
+        let b = match buffer(dev, cap) {
+            Ok(b) => b,
+            Err(e) => {
+                crate::host_residency::note_staging_growth_failed();
+                return Err(e);
+            }
+        };
         let mut p = std::ptr::null_mut();
         b.Map(0, None, Some(&mut p)).map_err(err)?;
         self.staging = Some((b.clone(), p as *mut u8, cap));
         Ok((b, p as *mut u8))
+    }
+}
+
+/// Bytes held in shared staging pools and per-queue upload buffers (for `XCL_RESIDENCY` telemetry).
+pub fn staging_live_bytes() -> u64 {
+    let mut bytes = 0u64;
+    if let Some(map) = STAGING_POOLS.lock().unwrap().as_ref() {
+        for pool in map.values() {
+            bytes = bytes.saturating_add(pool.live_bytes());
+        }
+    }
+    if let Some(map) = UPLOADERS.lock().unwrap().as_ref() {
+        for up in map.values() {
+            if let Some((_, _, cap)) = up.staging {
+                bytes = bytes.saturating_add(cap);
+            }
+        }
+    }
+    bytes
+}
+
+/// Reclaim idle upload staging buffers (unused for `>= 2 s` and `>= 30` frames, or immediately
+/// under low Windows commit headroom) to prevent post-streaming upload buffers from pinning
+/// commit memory indefinitely.
+pub fn trim_idle_staging(frame: u64, low_commit: bool) {
+    CURRENT_FRAME.store(frame, std::sync::atomic::Ordering::Relaxed);
+    if !low_commit && !frame.is_multiple_of(15) {
+        return;
+    }
+    let now_ms = monotonic_ms();
+    let mut freed_bytes = 0u64;
+    let mut freed_count = 0usize;
+    {
+        let mut pools = STAGING_POOLS.lock().unwrap();
+        if let Some(map) = pools.as_mut() {
+            for pool in map.values_mut() {
+                let (n, b) = pool.trim_idle(now_ms, frame, low_commit);
+                freed_count += n;
+                freed_bytes = freed_bytes.saturating_add(b);
+            }
+        }
+    }
+    {
+        let mut ups = UPLOADERS.lock().unwrap();
+        if let Some(map) = ups.as_mut() {
+            for up in map.values_mut() {
+                let Some((_, _, cap)) = up.staging else { continue };
+                let idle = now_ms.saturating_sub(up.last_used_ms) >= STAGING_IDLE_MS
+                    && frame.saturating_sub(up.last_used_frame) >= STAGING_IDLE_FRAMES;
+                let shrink_low = low_commit && cap > STAGING_MIN;
+                if idle || shrink_low {
+                    up.staging = None;
+                    freed_count += 1;
+                    freed_bytes = freed_bytes.saturating_add(cap);
+                }
+            }
+        }
+    }
+    if freed_bytes > 0 {
+        static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 4 || n.is_power_of_two() {
+            crate::xlog_info!(
+                "D3D12.X: released {freed_count} idle texture upload staging buffer(s) ({:.1} MiB{})",
+                freed_bytes as f64 / (1024.0 * 1024.0),
+                if low_commit { ", low commit" } else { "" }
+            );
+        }
     }
 }
 
@@ -398,7 +554,9 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
         put_back(key, up);
         return Ok(failed);
     }
-    let (staging, mapped) = up.staging(dev, total)?;
+    let now_ms = monotonic_ms();
+    let frame = CURRENT_FRAME.load(std::sync::atomic::Ordering::Relaxed);
+    let (staging, mapped) = up.staging(dev, total, now_ms, frame)?;
     up.alloc.Reset().map_err(err)?;
     up.list.Reset(&up.alloc, None).map_err(err)?;
     for (k, l, base) in &planned {
@@ -416,6 +574,8 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
         std::mem::forget(up);
         return Err(copy_error(e));
     }
+    up.last_used_ms = monotonic_ms();
+    up.last_used_frame = CURRENT_FRAME.load(std::sync::atomic::Ordering::Relaxed);
     put_back(key, up);
     Ok(failed)
 }
@@ -654,9 +814,23 @@ unsafe fn buffer(dev: &ID3D12Device, size: u64) -> Result<ID3D12Resource, String
         ..Default::default()
     };
     let mut r: Option<ID3D12Resource> = None;
-    dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut r)
-        .map_err(|x| format!("texture upload buffer: {x}"))?;
-    r.ok_or_else(|| "texture upload buffer".into())
+    match dev.CreateCommittedResource(
+        &D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_UPLOAD,
+            ..Default::default()
+        },
+        D3D12_HEAP_FLAG_NONE,
+        &rd,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        None,
+        &mut r,
+    ) {
+        Ok(()) => r.ok_or_else(|| "texture upload buffer".into()),
+        Err(x) => {
+            crate::host_residency::allocation_error_hresult(x.code().0);
+            Err(format!("texture upload buffer: {x}"))
+        }
+    }
 }
 
 fn transition(r: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
