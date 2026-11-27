@@ -1,4 +1,4 @@
-//! LanePhi-inspired join handling for constant SGPR descriptor tracking (GPL-2).
+﻿//! LanePhi-inspired join handling for constant SGPR descriptor tracking (GPL-2).
 //!
 //! CGBJ `victory-shader` `Source::LanePhi`, Tracer [`only_edge`], and emit `lane_heap_index`
 //! lowering are study-only (GPL-3); XCL implements the constant-SGPR subset behind
@@ -116,7 +116,7 @@ pub(crate) fn join_sole_live_predecessor_polarity(
             live.push(p);
         }
     }
-    (live.len() == 1).then_some(live[0])
+    (live.len() == 1).then(|| live[0])
 }
 
 /// Merge predecessor `known` into join block `have`, using LanePhi sole-live-arm replacement

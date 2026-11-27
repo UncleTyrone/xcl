@@ -1,4 +1,4 @@
-﻿# Starts the title with the developer pareto settings (mirrors CGBJ scripts/play.ps1 knobs as XCL_*).
+﻿# Starts the title with the developer play-env settings (mirrors CGBJ scripts/play.ps1 knobs as XCL_*).
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Safe         without the newer, faster ways (first thing to try when something is wrong)
 # -RayTracing   title ray-traced indirect light (BVH builder)

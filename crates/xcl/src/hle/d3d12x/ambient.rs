@@ -5,7 +5,7 @@
 //! module raises diffuse to a frame-derived estimate: 64x36 cell means from visible radiance,
 //! harmonics at 160x90, blended after resolve. R9G9B9E5 targets use packed `R32_UINT`.
 //!
-//! Off by default (`XCL_AMBIENT` unset / `0` / `off`). Pareto bundle: `XCL_AMBIENT=0.8`,
+//! Off by default (`XCL_AMBIENT` unset / `0` / `off`). Play env: `XCL_AMBIENT=0.8`,
 //! `XCL_AMBIENT_AIR=1.5`. Also accepts `VICTORY_AMBIENT` for the same scale / `constant:<level>`.
 //! `XCL_AMBIENT_SETTLE` (default `250,3`), `XCL_AMBIENT_SHADE=strength,radius_m`.
 //! Inactive while BVH traversal is allowed (`XCL_RT_GATE` / builder ready).

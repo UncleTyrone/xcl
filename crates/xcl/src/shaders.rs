@@ -1,4 +1,4 @@
-//! `xcl shaders <file|folder> [--top N] [--json] [--recomp] [--compile N]` – statistics over
+﻿//! `xcl shaders <file|folder> [--top N] [--json] [--recomp] [--compile N]` – statistics over
 //! a shader corpus: formats, stages, FSSM variants and the RDNA2 instruction histogram that
 //! sets the recompiler's priorities. Inputs: a single blob, a folder (e.g. `<data>\shaders\`)
 //! or an RPF9 shader pack (records found by scanning, see `gpu::pack`). `--recomp`
