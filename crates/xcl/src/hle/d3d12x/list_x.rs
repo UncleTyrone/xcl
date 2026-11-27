@@ -527,6 +527,31 @@ fn with_bindings(list: *mut c_void, f: impl FnOnce(&mut Bindings)) {
     f(&mut g.get_or_insert_with(HashMap::new).entry(list as usize).or_default().bindings);
 }
 
+/// Title GPU addresses touched by IA bindings on `list` (frame record metadata).
+pub(super) fn frame_touch_vas(list: *mut c_void) -> Vec<u64> {
+    let mut vas = Vec::new();
+    with_bindings(list, |b| {
+        for (_, (va, _, _)) in &b.vertex_titles {
+            if *va != 0 {
+                vas.push(*va);
+            }
+        }
+        if let Some((va, ..)) = b.index_title {
+            if va != 0 {
+                vas.push(va);
+            }
+        }
+    });
+    vas
+}
+
+/// Descriptor heap pointers last bound on `list` (frame record metadata).
+pub(super) fn frame_bound_heaps(list: *mut c_void) -> Vec<usize> {
+    let mut heaps = Vec::new();
+    with_bindings(list, |b| heaps = b.heaps.clone());
+    heaps
+}
+
 const PC_IA_SET_PRIMITIVE_TOPOLOGY: usize = 20;
 const PC_RS_SET_VIEWPORTS: usize = 21;
 const PC_RS_SET_SCISSOR_RECTS: usize = 22;
@@ -815,6 +840,9 @@ pub(super) fn on_queue_release(queue: usize) {
         }
     }
 }
+
+/// What the queues wait for on the GPU when a queue stops (`flight`). Full diagnostics on amd-dev.
+pub(super) fn log_pending_waits(_why: &str) {}
 
 #[cfg(test)]
 thread_local! {

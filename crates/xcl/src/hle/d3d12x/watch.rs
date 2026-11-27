@@ -390,6 +390,42 @@ impl Port7Counts {
     }
 }
 
+/// `XCL_GUARD_ASK=1` re-asks the kernel on every guard fault (default off).
+pub fn guard_ask_always() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_GUARD_ASK").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Hot-block rest cap in ms (`XCL_GUARD_HOT`, default 0 = off).
+pub fn guard_hot_ms() -> u32 {
+    static MS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("XCL_GUARD_HOT")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+            .min(1000)
+    })
+}
+
+/// Rest between hot-block probes in µs (`XCL_GUARD_REST`, default 3000).
+pub fn guard_rest_us() -> u32 {
+    static US: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *US.get_or_init(|| {
+        std::env::var("XCL_GUARD_REST")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|&us| us > 1)
+            .unwrap_or(3000)
+    })
+}
+
+/// `XCL_GUARD_HOLES=0` only probes the first address of a hole (default on).
+pub fn guard_holes_extended() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_GUARD_HOLES").is_none_or(|v| v != "0"))
+}
+
 pub(crate) fn port7_line(frames: f64) {
     if !port::journal() {
         return;

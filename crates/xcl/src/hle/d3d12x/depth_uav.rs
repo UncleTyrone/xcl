@@ -297,10 +297,36 @@ static DSV_TO_RES: Mutex<Option<HashMap<usize, (usize, u32)>>> = Mutex::new(None
 static UAV_PC_TO_TWIN: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 static UAV_TWIN_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// Whether Depth+UAV color twins are enabled (`XCL_DEPTH_UAV_TWIN=0` turns them off).
+/// `XCL_DEPTH_TWINS` mode: unset/`1` on, `0` off, `stencil` / `nodepth` filters (CGBJ parity).
+fn depth_twins_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let mode = std::env::var("XCL_DEPTH_TWINS").ok();
+        let on = mode.as_deref().map(|v| v.trim()) != Some("0");
+        if mode.is_some() {
+            crate::xlog_info!(
+                "D3D12.X: XCL_DEPTH_TWINS={}",
+                mode.as_deref().unwrap_or("1")
+            );
+        }
+        on
+    })
+}
+
+pub fn depth_twins_stencil_only() -> bool {
+    std::env::var_os("XCL_DEPTH_TWINS").is_some_and(|v| v == "stencil")
+}
+
+pub fn depth_twins_no_depth_plane() -> bool {
+    std::env::var_os("XCL_DEPTH_TWINS").is_some_and(|v| v == "nodepth")
+}
+
+/// Whether Depth+UAV color twins are enabled (`XCL_DEPTH_UAV_TWIN=0` / `XCL_DEPTH_TWINS=0` turns them off).
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| !std::env::var("XCL_DEPTH_UAV_TWIN").is_ok_and(|v| v.trim() == "0"))
+    *ON.get_or_init(|| {
+        depth_twins_on() && !std::env::var("XCL_DEPTH_UAV_TWIN").is_ok_and(|v| v.trim() == "0")
+    })
 }
 
 pub fn any() -> bool {

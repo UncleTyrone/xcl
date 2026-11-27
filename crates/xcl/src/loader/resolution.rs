@@ -7,6 +7,25 @@ use super::frame_rate::Patched;
 /// Sizes the title has a display mode for (its own list, +0x615c0c0).
 pub const MODES: [(u32, u32); 5] = [(1280, 720), (1664, 936), (1920, 1080), (2560, 1440), (3840, 2160)];
 
+/// Console-reported display size (`XCL_DISPLAY_MODE=WxH`, else 3840×2160).
+pub fn display_mode_size() -> (u32, u32) {
+    static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let asked = std::env::var("XCL_DISPLAY_MODE").ok().and_then(|v| {
+            let (w, h) = v.trim().split_once(['x', 'X'])?;
+            Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+        });
+        let size = match asked {
+            Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
+            _ => (3840, 2160),
+        };
+        if std::env::var_os("XCL_DISPLAY_MODE").is_some() {
+            crate::xlog_info!("loader: XCL_DISPLAY_MODE → {}×{}", size.0, size.1);
+        }
+        size
+    })
+}
+
 pub fn asked_output() -> Option<(u32, u32)> {
     let spec = std::env::var("XCL_OUTPUT").ok()?;
     let size = parse_output(&spec);

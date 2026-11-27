@@ -98,6 +98,24 @@ pub const GLOBAL_MAX: u32 = 1_000_000;
 /// First PC index for dynamic view ranges in the shared heap (Phase 2 / VItoriaBr). Descriptors
 /// below hold null views and memory-window UAVs (`set_window_views`).
 pub const MIN_DYNAMIC: u32 = 1 << 18;
+
+/// Dynamic slot cap for large heaps (`XCL_DYNAMIC_SLOTS`, default `MIN_DYNAMIC << 2`).
+pub fn dynamic_slots_cap(null: u32, count: u32) -> u32 {
+    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let most = *MOST.get_or_init(|| {
+        let cap = std::env::var("XCL_DYNAMIC_SLOTS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(MIN_DYNAMIC << 2);
+        crate::xlog_info!("D3D12.X: dynamic descriptor slots cap {cap} (XCL_DYNAMIC_SLOTS)");
+        cap
+    });
+    const PORTABLE: u32 = 1 << 17;
+    if null < PORTABLE {
+        return MIN_DYNAMIC;
+    }
+    null.saturating_sub(count).min(most).max(MIN_DYNAMIC)
+}
 // (one million: what every resource binding tier 2+ GPU takes. The translated shaders accept a
 // T# index only below it (`gpu::dxil::lower_image::VIEW_HEAP_MAX_SRV`), so the heap must never be
 // smaller than that bound: an index past the heap's end hangs NVIDIA GPUs, which took 1 000 000

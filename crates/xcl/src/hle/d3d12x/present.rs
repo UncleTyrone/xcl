@@ -128,6 +128,7 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
     super::real::stop_if_device_removed();
     super::port_constants::tick_log();
     super::port_cbv::tick_log();
+    crate::gpu::texture::trim_idle_staging(frames, super::vram::commit_low());
     if !PRESENTX.swap(true, Ordering::Relaxed) {
         crate::xlog_info!("D3D12.X: PresentX – the title presents its own frames ({plane_count} plane(s))");
     }
@@ -316,6 +317,13 @@ pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
             add_ref(queue as usize);
             q.push(queue as usize);
         }
+    }
+    static LAST_MAINT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = super::residency::coarse_ms();
+    if now.saturating_sub(LAST_MAINT_MS.load(Ordering::Relaxed)) >= 1000 {
+        LAST_MAINT_MS.store(now, Ordering::Relaxed);
+        super::residency::refresh();
+        super::texture_pool::tick(None);
     }
     super::console_heap::recycle_after_submit(queue as usize);
     let (draws_skipped, _) = super::bind::skipped_counts();

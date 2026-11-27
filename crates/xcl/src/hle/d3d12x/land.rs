@@ -28,6 +28,24 @@ pub fn enabled() -> bool {
     *ON.get_or_init(|| super::port::land())
 }
 
+/// `XCL_EXACT_BACK=0` merges gaps on land-back (default on = exact pieces).
+pub fn exact_back() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_EXACT_BACK").is_none_or(|v| v != "0"))
+}
+
+/// `XCL_DIRECT_WRITES=0` uses legacy shader-write path (default on).
+pub fn direct_writes() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_DIRECT_WRITES").is_none_or(|v| v != "0"))
+}
+
+/// `XCL_FILL_TITLE=1` fills title memory from the submitting thread (default off).
+pub fn fill_title() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_FILL_TITLE").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// `XCL_LAND_BESIDE=1`: note landed blocks for the next refresh (no extra mapping yet).
 pub fn beside() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();

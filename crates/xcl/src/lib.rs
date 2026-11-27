@@ -13,6 +13,8 @@ pub mod boot_diag;
 pub mod config;
 pub mod disasm;
 pub mod eh;
+pub(crate) mod host_bake_upload;
+pub(crate) mod host_residency;
 pub mod gpu;
 pub mod hle;
 pub mod hooks;

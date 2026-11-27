@@ -113,6 +113,18 @@ pub fn settle_bottom_writes() -> bool {
     *ON.get_or_init(|| std::env::var_os("XCL_LATE_WAIT_WRITES").is_none_or(|v| v != "0"))
 }
 
+/// `XCL_CUT_WAITS=0` keeps whole-list serial GPU waits when lists are split (default on).
+pub fn cut_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_CUT_WAITS").is_none_or(|v| v != "0"))
+}
+
+/// `XCL_CUT_WRITES=1` trims writes listed only for diagnostics before queries.
+pub fn cut_writes() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_CUT_WRITES").is_ok_and(|v| v.trim() == "1"))
+}
+
 // ---- in-flight chunk / flight tracking -------------------------------------------------------
 
 #[derive(Clone)]

@@ -1275,6 +1275,11 @@ pub(super) fn counts_snapshot() -> [u64; 5] {
     std::array::from_fn(|k| COUNTS[k].load(Ordering::Relaxed))
 }
 
+/// Bound pipeline and graphics root signature on a PC command list (for frame record metadata).
+pub(super) fn frame_bind_ids(list: *mut c_void) -> (usize, usize) {
+    with(list, |s| (s.pso, s.rs_gfx))
+}
+
 #[cfg(test)]
 pub(super) fn tracked_pso(list: *mut c_void) -> usize {
     STATES
