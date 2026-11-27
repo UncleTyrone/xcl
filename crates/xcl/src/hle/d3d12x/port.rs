@@ -120,6 +120,12 @@ pub fn thin() -> bool {
     latch(&ON, "XCL_THIN")
 }
 
+/// Worker-thread submit prep / GPU execute (`XCL_ASYNC_SUBMIT=1`, mapped lists only).
+pub fn async_submit() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    latch(&ON, "XCL_ASYNC_SUBMIT")
+}
+
 /// Async present frames-ahead cap (`XCL_FRAMES_AHEAD`, default 1 on main).
 pub fn frames_ahead() -> u32 {
     static N: OnceLock<u32> = OnceLock::new();

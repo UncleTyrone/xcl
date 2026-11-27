@@ -7426,45 +7426,52 @@ unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT
 unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lists: *const *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
-    if n == 0 || lists.is_null() {
+    // Internal XCL submits (`sparse` uploads/readbacks, `title_textures` uploads) re-enter here.
+    if n == 0 || lists.is_null() || super::title_textures::is_own_work() {
         f(this, n, lists);
         stop_if_device_removed();
         return;
     }
-    // from here to the end: XCL's uploads and tile mappings before the lists, then the driver's
-    // own work in the submission. Where that takes long, it is not the title's time
-    // (`pso_async::title_held`)
+    let slice = std::slice::from_raw_parts(lists, n as usize);
+    execute_command_lists_body(this, slice);
+}
+
+/// Title `ExecuteCommandLists` after refresh / translate join.
+unsafe fn execute_command_lists_body(this: *mut c_void, lists: &[*mut c_void]) {
     let _in_pc = super::pso_async::pc_call();
-    // textures in title memory the CPU wrote since: uploaded again first
+    super::submit::begin_refresh();
     super::title_textures::refresh(this);
-    // console-shaped lists run as the PC lists they were translated into (split title lists expand
-    // into all of their recorded PC segments in exact chronological order)
-    let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
-    for &l in std::slice::from_raw_parts(lists, n as usize) {
-        if let Some(pc) = super::console_list::pc_list(l) {
-            mapped.push(pc);
-        } else {
-            super::list_x::record_deferred(l);
-            if !super::title_list::push_segments(l, &mut mapped) {
-                mapped.push(l);
-            }
-        }
+    let mapped = super::thin::map_lists(lists);
+    if super::submit::run_async_mapped(this, mapped.clone()) {
+        super::submit::end_refresh();
+        super::title_textures::submitted(&mapped);
+        super::title_textures::after_execute(this, &mapped);
+        super::present::note_execute(this, &mapped);
+        stop_if_device_removed();
+        return;
     }
-    super::list_x::note_queue_for_lists(this as usize, &mapped);
-    super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
+    execute_mapped_lists(this, &mapped);
+    super::submit::end_refresh();
+    super::title_textures::submitted(&mapped);
+    super::title_textures::after_execute(this, &mapped);
+    super::present::note_execute(this, &mapped);
+    stop_if_device_removed();
+}
+
+/// Run already-translated PC command lists (join complete; safe for async worker).
+pub(super) unsafe fn execute_mapped_lists(this: *mut c_void, mapped: &[*mut c_void]) {
+    type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
+    super::list_x::note_queue_for_lists(this as usize, mapped);
+    super::list_x::execute_with_waits_on(this, mapped, |chunk| {
         let _ = super::alloc_pool::note_resubmits(this, chunk);
-        f(this, chunk.len() as u32, chunk.as_ptr());
+        super::submit::driver_execute(|| f(this, chunk.len() as u32, chunk.as_ptr()));
         super::list_x::copy_scratch_submitted(this, chunk);
         super::alloc_pool::executed(this, chunk);
         super::list_x::signal_write64_fences(this, chunk);
         super::list_x::readback_sparse_writes(this, chunk);
         super::list_x::cpu_writes_after(this, chunk);
     });
-    // the next uploads into textures kept in step start from the states these lists leave
-    super::title_textures::submitted(&mapped);
-    super::title_textures::after_execute(this, &mapped);
-    super::present::note_execute(this, &mapped);
-    stop_if_device_removed();
 }
 
 /// Wait (up to 10 s) until the GPU has finished the work submitted to the queues console code

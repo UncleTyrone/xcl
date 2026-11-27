@@ -11,6 +11,8 @@ use windows_sys::Win32::System::Memory::{
     PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
 };
 
+pub mod frame_rate;
+
 use crate::modules::{self, MappedModule};
 use crate::pe::{self, Layout, OwnedExports, Pe};
 use crate::resolver;
@@ -230,6 +232,9 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
     for s in pe.sections.iter().filter(|s| s.characteristics & 0x2000_0000 != 0) {
         let len = (s.mapped_size() as usize).min(size.saturating_sub(s.va as usize));
         unsafe { crate::eh::hook_gs_failure(base + s.va as usize, len, &name) };
+    }
+    if is_main {
+        unsafe { frame_rate::apply_if_asked(base, size) };
     }
     Ok(module)
 }

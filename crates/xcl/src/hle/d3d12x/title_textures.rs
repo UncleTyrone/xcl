@@ -710,7 +710,13 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
     if BUSY.with(|b| b.get()) {
         return;
     }
-    let _refresh = REFRESH.lock().unwrap();
+  // Nested under `execute_command_lists_body` / async worker: refresh lock already held.
+    if !super::submit::refresh_held_on_this_thread() {
+        super::submit::begin_refresh();
+        own_work(|| refresh_once(queue));
+        super::submit::end_refresh();
+        return;
+    }
     own_work(|| refresh_once(queue));
 }
 

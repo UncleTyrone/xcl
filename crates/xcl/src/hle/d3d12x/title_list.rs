@@ -324,6 +324,9 @@ pub(super) unsafe fn reclaim_for_kickoff(active_pc: *mut c_void) -> Option<(*mut
     let book = sg.as_mut().and_then(|m| m.get_mut(&(wrapper as usize)))?;
     let primary = book.first.map_or_else(|| *((wrapper as usize + F_PRIMARY) as *const *mut c_void), |f| f as *mut c_void);
     if primary == active_pc {
+        if super::thin::defer_kickoff_prelude() {
+            return None;
+        }
         return None;
     }
     let (prior, reclaimed) = {
