@@ -1,4 +1,7 @@
 //! `xcl census` – aggregate PE imports under paths and score HLE / host / stub coverage.
+//!
+//! Walks files/dirs with an `MZ` pre-filter (CGBJ census role; console packages often lack
+//! `.exe`/`.dll` extensions). `--strict` and `--list-missing` match the operator surface.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

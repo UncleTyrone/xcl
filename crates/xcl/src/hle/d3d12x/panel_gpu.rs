@@ -1,12 +1,10 @@
 //! GPU diagnostics overlay for the host panel (`XCL_PANEL=1` + `XCL_PANEL_GPU=1`).
 //!
 //! Copies a CPU-rasterised status box onto the swap-chain back buffer before present.
-//! CGBJ keeps the painted box in a **card-local DEFAULT** buffer and rotates uploads; this GPL-2
-//! path mirrors that (upload ring → DEFAULT resident buffer → blit to back buffer).
-//!
-//! **Atlas gap (honest PARTIAL):** CGBJ-style per-glyph texture tiles on the title heap are **not**
-//! replicated. Glyphs are CPU-rasterised into the box each refresh; only the completed box lives
-//! on the card. Multi-line + height scale + common swap formats are supported.
+//! CGBJ `host/panel.rs` likewise CPU-rasters glyphs into one painted box, keeps it in a
+//! **card-local DEFAULT** buffer, and rotates uploads — there is **no** per-glyph atlas in CGBJ.
+//! This GPL-2 path matches that role (upload ring → DEFAULT resident → blit). Multi-line (up to
+//! [`LINES`]), height scale, and common swap formats are supported.
 
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,7 +16,8 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 const GLYPH: (u32, u32) = (5, 7);
 const CELL: (u32, u32) = (6, 9);
 const COLUMNS: u32 = 40;
-const LINES: u32 = 4;
+/// CGBJ `host/panel.rs` `LINES` (nine status rows in the box).
+const LINES: u32 = 9;
 const RIM: u32 = 3;
 const UPLOADS: usize = 4;
 
@@ -65,7 +64,7 @@ fn glyph_rows(c: u8) -> [u8; 7] {
         b'4' => [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
         b'5' => [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
         b'6' => [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
-        b'7' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b10000],
+        b'7' => [0b11111, 0b00001, 0b00010, 0b00010, 0b00100, 0b00100, 0b00100],
         b'8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
         b'9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
         b'A' => [0b00100, 0b01010, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001],
@@ -333,7 +332,7 @@ pub(crate) unsafe fn draw(
     if colours(fmt).is_none() {
         if !WARNED_FMT.swap(true, Ordering::Relaxed) {
             crate::xlog_info!(
-                "D3D12.X: XCL_PANEL_GPU skipped — swap format {:?} unsupported (need 8-bit RGBA / 10:10:10:2 / half RGBA; log/title panel still on). Card-local per-glyph atlas not implemented.",
+                "D3D12.X: XCL_PANEL_GPU skipped — swap format {:?} unsupported (need 8-bit RGBA / 10:10:10:2 / half RGBA; log/title panel still on).",
                 fmt.0
             );
         }

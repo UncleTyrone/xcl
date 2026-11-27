@@ -1,8 +1,10 @@
 //! Memory-mapped `ID3D12PipelineLibrary` persistence (`XCL_PSO_LIBRARY=0`: off).
 //!
 //! Offline `xcl warm` stores into the same adapter-scoped `gen-*.plib` tree the title opens at
-//! runtime (mmap read pool + generation rotate). **PARTIAL vs CGBJ:** warm runs in-process on the
-//! tool's D3D12 device — not per-pipeline isolated child processes (`victory warm --these`).
+//! runtime (mmap read pool + generation rotate). **MATCH** for the mmap / generation / in-process
+//! warm product path. Per-pipeline child isolation (`victory warm --these`) is already
+//! **IMPOSSIBLE** (§3.5) — not a `pso_library` gap. Warm hash lists use FNV-64 `{:016x}`
+//! (blake3-16 digression: **IMPOSSIBLE** without breaking existing cache keys / operator lists).
 //!
 //! Backing a driver pipeline library with a read-only Windows file mapping kept open for the
 //! lifetime of `ID3D12PipelineLibrary` avoids duplicating hundreds of megabytes to >1 GiB of

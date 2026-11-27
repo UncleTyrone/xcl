@@ -3,6 +3,10 @@
 //! A 2048-byte packet starts with a 32-bit big-endian header: frame count (6),
 //! first-frame bit offset (15), 3 reserved bits, skip count (8). Frames hold a
 //! 15-bit length field then payload bits MSB-first.
+//!
+//! [`read_frame`] / [`next_frame`] / packet-edge [`Cursor`] match CGBJ `victory-formats`
+//! `xma.rs` packet walk (study only). Mid-packet [`seek_bit`] + [`frame_covering`] serve
+//! ACPHAL word-2/3 loop seeks; decoder bit-exact path is [`super::Decoder::decode_frame_exact`].
 
 use super::PACKET_SIZE;
 
@@ -220,5 +224,48 @@ mod tests {
         let inside = first.start + (first.bits / 2).max(1);
         let covered = frame_covering(&data, start, inside).expect("inside first");
         assert_eq!(covered.start, first.start);
+    }
+
+    /// Multi-packet: frame ends in a zero-frame packet; next starts at a later packet's first frame
+    /// (CGBJ `xma.rs` `the_frame_after_continuation_packets_starts_in_the_next_packet_with_frames`).
+    #[test]
+    fn cross_packet_frame_skips_empty_packets() {
+        let mut data = vec![0u8; 4 * PACKET_BYTES];
+        let header = |frames: u32, first: u32| (frames << 26) | (first << 11);
+        put_bits(&mut data, 0, 32, header(2, 0));
+        put_bits(&mut data, PACKET_BITS, 32, header(0, 0x7fff));
+        put_bits(&mut data, 2 * PACKET_BITS, 32, header(0, 64));
+        put_bits(&mut data, 3 * PACKET_BITS, 32, header(1, 0));
+        let second = HEADER_BITS + 16000;
+        put_bits(&mut data, HEADER_BITS, LENGTH_BITS, 16000);
+        let tail = PACKET_BITS - second;
+        let bits = tail + (PACKET_BITS - HEADER_BITS) + 64;
+        put_bits(&mut data, second, LENGTH_BITS, bits as u32);
+        put_bits(&mut data, 3 * PACKET_BITS + HEADER_BITS, LENGTH_BITS, 100);
+        let first = read_frame(&data, HEADER_BITS).unwrap();
+        assert_eq!(first.next, Some(second));
+        let frame = read_frame(&data, second).unwrap();
+        assert_eq!(frame.bits, bits);
+        assert_eq!(frame.next, Some(3 * PACKET_BITS + HEADER_BITS));
+        assert_eq!(
+            read_frame(&data, 3 * PACKET_BITS + HEADER_BITS)
+                .unwrap()
+                .next,
+            None
+        );
+    }
+
+    fn put_bits(data: &mut [u8], at: usize, n: u32, value: u32) {
+        for i in 0..n as usize {
+            let bit = (value >> (n as usize - 1 - i)) & 1;
+            let pos = at + i;
+            let byte = pos / 8;
+            let shift = 7 - (pos % 8);
+            if bit != 0 {
+                data[byte] |= 1 << shift;
+            } else {
+                data[byte] &= !(1 << shift);
+            }
+        }
     }
 }

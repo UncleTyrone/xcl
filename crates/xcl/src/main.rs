@@ -54,6 +54,7 @@ Usage:
                [--warm <hashes.txt|all>]
       Offline translator pass (forwards to `shaders --recomp`; --validate → --direct --validate).
       --warm hashes.txt|all: DXIL-cache-only warm (CGBJ translate --warm; XCL_WARM_SECONDS caps time).
+      Hash lines are FNV-64 {:016x} (blake3-16 digression IMPOSSIBLE — would break warm lists).
   xcl warm <file | folder | package.rpf> [--jobs N] [--used-only] [--limit N] [--again] [--no-book]
       Precompile + build pipelines into DXIL / driver / .plib caches (`shaders --precompile --pipelines`).
       --limit caps how many; --again rebuilds even when warm-done.txt already lists them.
