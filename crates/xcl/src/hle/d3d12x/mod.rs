@@ -32,6 +32,7 @@ pub(crate) mod gfx_records;
 pub(crate) mod gpu_awake;
 pub mod guard;
 mod frame_replay;
+mod frame_wire;
 mod late_release;
 mod late_wait;
 pub mod layout;
