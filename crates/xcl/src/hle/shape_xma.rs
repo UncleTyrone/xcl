@@ -1,16 +1,14 @@
 //! ACPHAL SHAPE ↔ XMA path (CGBJ `audio.rs` XMA contexts).
 //!
-//! XCL's `AcpHalAllocateShapeContexts` keeps a **5-kind** layout (observed ABI),
-//! not CGBJ's packed 6-kind `{counts, arrays, apu}`. XMA contexts live at
-//! **kind index 4** (same index as CGBJ's XMA slot among its six). Commands
+//! Six SHAPE kinds are allocated in [`crate::hle::acphal`]; XMA contexts live at
+//! **kind index 4**. Commands
 //! `ENABLE_XMA` / `DISABLE_XMA` / `ENABLE_XMAS` / `DISABLE_XMAS` /
 //! `ADVANCE_XMA_READ` on the AcpHal channel drive a decoder thread that fills
 //! each enabled context's 256-byte PCM output ring from its input packets via
 //! [`crate::hle::xma2::Decoder`].
 //!
-//! Still thinner than CGBJ:
-//! - bit-accurate mid-packet frame seek and overlap-buffer handoff
-//! - full per-kind context layout (6th PCM kind lives in `acphal.rs`)
+//! Still thinner than CGBJ: bit-accurate mid-packet frame seek (`read_frame` /
+//! overlap-buffer handoff). Loop boundaries reset the bit cursor from context word 3.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -278,15 +276,22 @@ fn decode_packets(context: Context, voice: &mut Voice) -> bool {
             }
         }
     };
+    let mut at_bits = context.field(2, 0, 26) as usize;
+    let data = if at_bits >= 32 {
+        &data[at_bits / 8..]
+    } else {
+        data
+    };
     let loops = context.field(0, 12, 8);
+    let loop_end = context.field(4, 0, 26);
     match decoder.decode_buffer_i16(data, false) {
         Ok(mut pcm) => {
             let channels = context.channels().max(1);
             let skip = (voice.skip * channels).min(pcm.len());
             voice.skip -= skip / channels;
             pcm = pcm.split_off(skip);
-            let loop_end = context.field(4, 0, 26);
-            if loops > 0 && loop_end != 0 {
+            let looping = loops > 0 && loop_end != 0;
+            if looping {
                 let keep = (context.field(1, 12, 2) as usize + 1) * SUBFRAME_SAMPLES * channels;
                 if pcm.len() > keep {
                     pcm.truncate(keep);
@@ -295,13 +300,20 @@ fn decode_packets(context: Context, voice: &mut Voice) -> bool {
                 if loops != 255 {
                     context.set_field(0, 12, 8, loops - 1);
                 }
+                context.set_field(2, 0, 26, context.field(3, 0, 26));
+            } else if data.is_empty() {
+                context.set_field(0, 20 + current, 1, 0);
+            } else {
+                let next = at_bits.saturating_add(data.len() * 8).min(1 << 26);
+                context.set_field(2, 0, 26, next as u32);
+                if next >= packets as usize * xma2::PACKET_SIZE * 8 {
+                    context.set_field(0, 20 + current, 1, 0);
+                }
             }
             voice.pcm.extend(pcm);
         }
         Err(e) => crate::xlog_warn!("SHAPE XMA: decode failed: {e}"),
     }
-    context.set_field(0, 20 + current, 1, 0);
-    context.set_field(2, 0, 26, packets * xma2::PACKET_SIZE as u32 * 8);
     true
 }
 
