@@ -2,14 +2,27 @@
 //!
 //! Opt-in via `XCL_RECORD_WIRE=1` while `XCL_RECORD` is set: each recorded present also writes
 //! `frames/frame_NNNN.bin` (magic + version + little-endian event stream). Not a byte-compatible
-//! CGBJ `VICFRAME` file (no heap/PSO/resource snap); same operator role for submit/signal/present.
+//! CGBJ `VICFRAME` file; same operator role for submit/signal/present with a practical metadata
+//! subset for validation (heaps, bind ids, title GPU addresses).
+//!
+//! ## `XCLFRAME` version 2 (current [`VERSION`])
+//!
+//! Same event stream as version 1, plus:
+//! - **`Submit` (tag 2)** — after the v1 `backing` list: `psos`, `rs_gfx`, `gpu_vas` (u64),
+//!   `bound_heaps` (usize), each a length-prefixed list (little-endian).
+//! - **`HeapSnap` (tag 5)** — per present: length-prefixed `HeapEntry` records
+//!   `(ptr u64, type u32, count u32, flags u32)` for descriptor heaps known this frame.
+//!
+//! Version 1 blobs omit the `Submit` tail and have no `HeapSnap` events. [`decode_frame`] accepts
+//! both versions.
 
 use std::path::Path;
 
 /// First eight bytes of `frame_*.bin`.
 pub const MAGIC: [u8; 8] = *b"XCLFRAME";
-/// Layout version for this event stream.
-pub const VERSION: u32 = 1;
+/// Layout version for newly written blobs (see module docs for field differences vs 1).
+pub const VERSION: u32 = 2;
+pub const VERSION_MIN: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bad(pub &'static str);
@@ -78,12 +91,56 @@ fn get_usize_list(from: &mut Dec<'_>) -> Result<Vec<usize>, Bad> {
     Ok(out)
 }
 
+fn put_u64_list(out: &mut Vec<u8>, xs: &[u64]) {
+    put_u32(out, xs.len() as u32);
+    for &x in xs {
+        put_u64(out, x);
+    }
+}
+
+fn get_u64_list(from: &mut Dec<'_>) -> Result<Vec<u64>, Bad> {
+    let n = get_u32(from)? as usize;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(get_u64(from)?);
+    }
+    Ok(out)
+}
+
 /// Wire tags for [`super::frame_replay`] events (stable).
 pub mod tag {
     pub const SESSION: u8 = 1;
     pub const SUBMIT: u8 = 2;
     pub const SIGNAL: u8 = 3;
     pub const PRESENT: u8 = 4;
+    pub const HEAP_SNAP: u8 = 5;
+}
+
+/// Descriptor heap metadata (pointer id + creation sizes; no descriptor bytes).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeapEntry {
+    pub ptr: usize,
+    pub ty: u32,
+    pub count: u32,
+    pub flags: u32,
+}
+
+impl HeapEntry {
+    fn put(&self, out: &mut Vec<u8>) {
+        put_u64(out, self.ptr as u64);
+        put_u32(out, self.ty);
+        put_u32(out, self.count);
+        put_u32(out, self.flags);
+    }
+
+    fn get(from: &mut Dec<'_>) -> Result<Self, Bad> {
+        Ok(Self {
+            ptr: get_u64(from)? as usize,
+            ty: get_u32(from)?,
+            count: get_u32(from)?,
+            flags: get_u32(from)?,
+        })
+    }
 }
 
 /// One recorded event in binary form (mirrors JSONL kinds).
@@ -97,6 +154,11 @@ pub enum WireEvent {
         addrs: Vec<usize>,
         pc_addrs: Vec<usize>,
         backing: Vec<usize>,
+        /// v2: parallel to `pc_addrs` (or empty in v1).
+        psos: Vec<usize>,
+        rs_gfx: Vec<usize>,
+        gpu_vas: Vec<u64>,
+        bound_heaps: Vec<usize>,
     },
     Signal {
         queue: usize,
@@ -108,10 +170,11 @@ pub enum WireEvent {
         token: u64,
         submits: u64,
     },
+    HeapSnap { heaps: Vec<HeapEntry> },
 }
 
 impl WireEvent {
-    pub fn put(&self, out: &mut Vec<u8>) {
+    pub fn put(&self, out: &mut Vec<u8>, wire_version: u32) {
         match self {
             Self::Session { format } => {
                 out.push(tag::SESSION);
@@ -124,6 +187,10 @@ impl WireEvent {
                 addrs,
                 pc_addrs,
                 backing,
+                psos,
+                rs_gfx,
+                gpu_vas,
+                bound_heaps,
             } => {
                 out.push(tag::SUBMIT);
                 put_u64(out, *n);
@@ -132,6 +199,12 @@ impl WireEvent {
                 put_usize_list(out, addrs);
                 put_usize_list(out, pc_addrs);
                 put_usize_list(out, backing);
+                if wire_version >= 2 {
+                    put_usize_list(out, psos);
+                    put_usize_list(out, rs_gfx);
+                    put_u64_list(out, gpu_vas);
+                    put_usize_list(out, bound_heaps);
+                }
             }
             Self::Signal { queue, fence, value } => {
                 out.push(tag::SIGNAL);
@@ -145,22 +218,51 @@ impl WireEvent {
                 put_u64(out, *token);
                 put_u64(out, *submits);
             }
+            Self::HeapSnap { heaps } => {
+                out.push(tag::HEAP_SNAP);
+                put_u32(out, heaps.len() as u32);
+                for h in heaps {
+                    h.put(out);
+                }
+            }
         }
     }
 
-    pub fn get(from: &mut Dec<'_>) -> Result<Self, Bad> {
+    pub fn get(from: &mut Dec<'_>, wire_version: u32) -> Result<Self, Bad> {
         Ok(match *from.take(1)?.first().ok_or(Bad("tag"))? {
             tag::SESSION => Self::Session {
                 format: get_u32(from)?,
             },
-            tag::SUBMIT => Self::Submit {
-                n: get_u64(from)?,
-                queue: get_u64(from)? as usize,
-                lists: get_u32(from)? as usize,
-                addrs: get_usize_list(from)?,
-                pc_addrs: get_usize_list(from)?,
-                backing: get_usize_list(from)?,
-            },
+            tag::SUBMIT => {
+                let mut ev = Self::Submit {
+                    n: get_u64(from)?,
+                    queue: get_u64(from)? as usize,
+                    lists: get_u32(from)? as usize,
+                    addrs: get_usize_list(from)?,
+                    pc_addrs: get_usize_list(from)?,
+                    backing: get_usize_list(from)?,
+                    psos: Vec::new(),
+                    rs_gfx: Vec::new(),
+                    gpu_vas: Vec::new(),
+                    bound_heaps: Vec::new(),
+                };
+                if wire_version >= 2 {
+                    if let Self::Submit {
+                        ref mut psos,
+                        ref mut rs_gfx,
+                        ref mut gpu_vas,
+                        ref mut bound_heaps,
+                        ..
+                    } = ev
+                    {
+                        *psos = get_usize_list(from)?;
+                        *rs_gfx = get_usize_list(from)?;
+                        *gpu_vas = get_u64_list(from)?;
+                        *bound_heaps = get_usize_list(from)?;
+                    }
+                }
+                ev
+            }
             tag::SIGNAL => Self::Signal {
                 queue: get_u64(from)? as usize,
                 fence: get_u64(from)? as usize,
@@ -171,6 +273,14 @@ impl WireEvent {
                 token: get_u64(from)?,
                 submits: get_u64(from)?,
             },
+            tag::HEAP_SNAP => {
+                let n = get_u32(from)? as usize;
+                let mut heaps = Vec::with_capacity(n);
+                for _ in 0..n {
+                    heaps.push(HeapEntry::get(from)?);
+                }
+                Self::HeapSnap { heaps }
+            }
             _ => return Err(Bad("unknown event kind")),
         })
     }
@@ -178,11 +288,16 @@ impl WireEvent {
 
 /// Encode a frame blob: magic + version + events.
 pub fn encode_frame(events: &[WireEvent]) -> Vec<u8> {
+    encode_frame_version(events, VERSION)
+}
+
+/// Encode with an explicit wire version (tests).
+pub fn encode_frame_version(events: &[WireEvent], wire_version: u32) -> Vec<u8> {
     let mut out = MAGIC.to_vec();
-    put_u32(&mut out, VERSION);
+    put_u32(&mut out, wire_version);
     put_u32(&mut out, events.len() as u32);
     for ev in events {
-        ev.put(&mut out);
+        ev.put(&mut out, wire_version);
     }
     out
 }
@@ -193,7 +308,8 @@ pub fn decode_frame(bytes: &[u8]) -> Result<Vec<WireEvent>, Bad> {
     if from.take(8)? != MAGIC {
         return Err(Bad("not an XCLFRAME"));
     }
-    if get_u32(&mut from)? != VERSION {
+    let ver = get_u32(&mut from)?;
+    if ver < VERSION_MIN || ver > VERSION {
         return Err(Bad("unsupported version"));
     }
     let n = get_u32(&mut from)? as usize;
@@ -202,7 +318,7 @@ pub fn decode_frame(bytes: &[u8]) -> Result<Vec<WireEvent>, Bad> {
     }
     let mut events = Vec::with_capacity(n);
     for _ in 0..n {
-        events.push(WireEvent::get(&mut from)?);
+        events.push(WireEvent::get(&mut from, ver)?);
     }
     if !from.bytes.is_empty() {
         return Err(Bad("trailing bytes"));
@@ -226,9 +342,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roundtrip_submit_present() {
+    fn roundtrip_submit_present_v2() {
         let events = vec![
-            WireEvent::Session { format: 1 },
+            WireEvent::Session { format: 2 },
             WireEvent::Submit {
                 n: 3,
                 queue: 0x1000,
@@ -236,6 +352,18 @@ mod tests {
                 addrs: vec![1, 2],
                 pc_addrs: vec![3],
                 backing: vec![0],
+                psos: vec![0xA],
+                rs_gfx: vec![0xB],
+                gpu_vas: vec![0x10_00, 0x20_00],
+                bound_heaps: vec![0xC],
+            },
+            WireEvent::HeapSnap {
+                heaps: vec![HeapEntry {
+                    ptr: 0xC,
+                    ty: 0,
+                    count: 64,
+                    flags: 1,
+                }],
             },
             WireEvent::Signal {
                 queue: 0x1000,
@@ -250,8 +378,54 @@ mod tests {
         ];
         let bytes = encode_frame(&events);
         assert_eq!(&bytes[..8], &MAGIC);
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), VERSION);
         let back = decode_frame(&bytes).unwrap();
         assert_eq!(back, events);
+    }
+
+    #[test]
+    fn decodes_v1_submit_without_tail() {
+        let events_v1 = vec![
+            WireEvent::Session { format: 1 },
+            WireEvent::Submit {
+                n: 1,
+                queue: 9,
+                lists: 1,
+                addrs: vec![1],
+                pc_addrs: vec![2],
+                backing: vec![2],
+                psos: vec![],
+                rs_gfx: vec![],
+                gpu_vas: vec![],
+                bound_heaps: vec![],
+            },
+        ];
+        let bytes = encode_frame_version(&events_v1, 1);
+        let back = decode_frame(&bytes).unwrap();
+        assert_eq!(back, events_v1);
+    }
+
+    #[test]
+    fn heap_snap_roundtrip() {
+        let ev = WireEvent::HeapSnap {
+            heaps: vec![
+                HeapEntry {
+                    ptr: 0x100,
+                    ty: 1,
+                    count: 8,
+                    flags: 0,
+                },
+                HeapEntry {
+                    ptr: 0x200,
+                    ty: 0,
+                    count: 2048,
+                    flags: 2,
+                },
+            ],
+        };
+        let bytes = encode_frame(&[ev.clone()]);
+        let back = decode_frame(&bytes).unwrap();
+        assert_eq!(back, vec![ev]);
     }
 
     #[test]
