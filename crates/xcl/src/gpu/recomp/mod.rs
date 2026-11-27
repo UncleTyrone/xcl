@@ -1433,6 +1433,29 @@ fn scalar_constant(d: &Decoded, code: u64) -> Option<u32> {
     })
 }
 
+/// `XCL_STRICT_JOINS` (default **on**): join merge keeps live-arm SGPR constants when a
+/// predecessor is a conditional branch straight to the merge with an empty EXEC/VCC/SCC
+/// guard (transmission / alpha-prefilter). `XCL_STRICT_JOINS=0` uses intersection-only merge.
+pub(crate) fn strict_joins() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("XCL_STRICT_JOINS").is_ok_and(|v| v.trim() == "0"))
+}
+
+fn join_skip_pred(from: &[Decoded], join_pc: u64) -> bool {
+    if !strict_joins() {
+        return false;
+    }
+    let Some(last) = from.last() else { return false };
+    let Some(t) = rdna2::branch_target(last) else { return false };
+    if t != join_pc {
+        return false;
+    }
+    matches!(
+        last.inst.name,
+        "S_CBRANCH_EXECZ" | "S_CBRANCH_VCCZ" | "S_CBRANCH_VCCNZ" | "S_CBRANCH_SCC0" | "S_CBRANCH_SCC1"
+    )
+}
+
 /// S# built from constants in the code – how the console compiler places the static
 /// samplers of a root signature: for each MIMG instruction whose four sampler SGPRs hold
 /// constants set by s_mov / s_movk / s_brev on every path that reaches it, those words.
@@ -1448,10 +1471,6 @@ fn scalar_constant(d: &Decoded, code: u64) -> Option<u32> {
 /// need the fuller structured lane-guard join from CGBJ `resource.rs` (`only_edge` / `live`) for
 /// per-lane phis and nested joins; [`constant_srsrc`] covers the common execz-to-join case.
 pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, follow: bool) -> BTreeMap<u64, [u32; 4]> {
-    fn execz_skip_target(block: &[Decoded]) -> Option<u64> {
-        let last = block.last()?;
-        (last.inst.name == "S_CBRANCH_EXECZ").then(|| rdna2::branch_target(last)).flatten()
-    }
     type Known = std::collections::HashMap<u64, u32>;
     fn run(block: &[Decoded], known: &mut Known, mut out: Option<&mut BTreeMap<u64, [u32; 4]>>) {
         for d in block {
@@ -1528,8 +1547,8 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, foll
         let mut known = start[k].clone().unwrap_or_default();
         run(blocks[k], &mut known, None);
         for &n in &next[k] {
-            let skip =
-                execz_skip_target(blocks[k]).is_some_and(|t| t == blocks[n].first().map(|d| d.pc).unwrap_or(0));
+            let join_pc = blocks[n].first().map(|d| d.pc).unwrap_or(0);
+            let skip = join_skip_pred(blocks[k], join_pc);
             let changed = match &mut start[n] {
                 slot @ None => {
                     *slot = Some(known.clone());
@@ -1566,10 +1585,6 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, foll
 /// rules as [`constant_samplers`]: dead `s_cbranch_execz` edges at a merge do not clear the live
 /// arm's descriptor – transmission / alpha-prefilter CS patterns).
 pub(crate) fn constant_srsrc(insts: &[Decoded], leaders: &BTreeSet<u64>, follow: bool) -> BTreeMap<u64, [u32; 4]> {
-    fn execz_skip_target(block: &[Decoded]) -> Option<u64> {
-        let last = block.last()?;
-        (last.inst.name == "S_CBRANCH_EXECZ").then(|| rdna2::branch_target(last)).flatten()
-    }
     type Known = std::collections::HashMap<u64, u32>;
     fn run(block: &[Decoded], known: &mut Known, mut out: Option<&mut BTreeMap<u64, [u32; 4]>>) {
         for d in block {
@@ -1676,8 +1691,8 @@ pub(crate) fn constant_srsrc(insts: &[Decoded], leaders: &BTreeSet<u64>, follow:
         let mut known = start[k].clone().unwrap_or_default();
         run(blocks[k], &mut known, None);
         for &n in &next[k] {
-            let skip =
-                execz_skip_target(blocks[k]).is_some_and(|t| t == blocks[n].first().map(|d| d.pc).unwrap_or(0));
+            let join_pc = blocks[n].first().map(|d| d.pc).unwrap_or(0);
+            let skip = join_skip_pred(blocks[k], join_pc);
             let changed = match &mut start[n] {
                 slot @ None => {
                     *slot = Some(known.clone());

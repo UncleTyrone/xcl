@@ -587,6 +587,7 @@ impl Lw {
                 slot = slot.max(w);
             }
         }
+        // Join guard merge for static S#/SRSRC uses [`recomp::strict_joins`] (`XCL_STRICT_JOINS`, default on).
         lw.static_samplers = crate::gpu::recomp::constant_samplers(
             insts,
             leaders,
