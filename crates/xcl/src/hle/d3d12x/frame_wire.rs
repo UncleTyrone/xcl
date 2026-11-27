@@ -3,26 +3,38 @@
 //! Opt-in via `XCL_RECORD_WIRE=1` while `XCL_RECORD` is set: each recorded present also writes
 //! `frames/frame_NNNN.bin` (magic + version + little-endian event stream). Not a byte-compatible
 //! CGBJ `VICFRAME` file; same operator role for submit/signal/present with a practical metadata
-//! subset for validation (heaps, bind ids, title GPU addresses).
+//! subset for validation (heaps, bind ids, title GPU addresses, list meta, title-memory samples).
 //!
-//! ## `XCLFRAME` version 2 (current [`VERSION`])
+//! ## `XCLFRAME` version 3 (current [`VERSION`])
 //!
-//! Same event stream as version 1, plus:
+//! Same stream as version 2, plus:
+//! - **`ListMeta` (tag 6)** — per mapped PC list: pointer, `D3D12_COMMAND_LIST_TYPE`, PSO/RS ids,
+//!   bound heap ptrs, and title GPU VAs touched on that list (VICFRAME `List` role without
+//!   recording host command bytes).
+//! - **`ContentSample` (tag 7)** — title-memory sample at a GPU VA: length hashed, FNV-1a-32,
+//!   and up to 256 leading bytes (VICFRAME `Content` / `contents.bin` role for same-state boot
+//!   debugging; not a full resource dump).
+//!
+//! ## Version 2
+//!
 //! - **`Submit` (tag 2)** — after the v1 `backing` list: `psos`, `rs_gfx`, `gpu_vas` (u64),
 //!   `bound_heaps` (usize), each a length-prefixed list (little-endian).
 //! - **`HeapSnap` (tag 5)** — per present: length-prefixed `HeapEntry` records
 //!   `(ptr u64, type u32, count u32, flags u32)` for descriptor heaps known this frame.
 //!
 //! Version 1 blobs omit the `Submit` tail and have no `HeapSnap` events. [`decode_frame`] accepts
-//! both versions.
+//! versions 1..=3.
 
 use std::path::Path;
 
 /// First eight bytes of `frame_*.bin`.
 pub const MAGIC: [u8; 8] = *b"XCLFRAME";
-/// Layout version for newly written blobs (see module docs for field differences vs 1).
-pub const VERSION: u32 = 2;
+/// Layout version for newly written blobs (see module docs for field differences vs 1/2).
+pub const VERSION: u32 = 3;
 pub const VERSION_MIN: u32 = 1;
+
+/// Max leading bytes stored in a [`WireEvent::ContentSample`].
+pub const CONTENT_SAMPLE_CAP: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bad(pub &'static str);
@@ -107,6 +119,29 @@ fn get_u64_list(from: &mut Dec<'_>) -> Result<Vec<u64>, Bad> {
     Ok(out)
 }
 
+fn put_bytes(out: &mut Vec<u8>, xs: &[u8]) {
+    put_u32(out, xs.len() as u32);
+    out.extend_from_slice(xs);
+}
+
+fn get_bytes(from: &mut Dec<'_>) -> Result<Vec<u8>, Bad> {
+    let n = get_u32(from)? as usize;
+    if n > from.bytes.len() {
+        return Err(Bad("bytes longer than remaining"));
+    }
+    Ok(from.take(n)?.to_vec())
+}
+
+/// FNV-1a 32-bit (stable, GPL-2, no extra crate) for content digests.
+pub fn fnv1a32(data: &[u8]) -> u32 {
+    let mut h = 0x811c_9dc5_u32;
+    for &b in data {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
 /// Wire tags for [`super::frame_replay`] events (stable).
 pub mod tag {
     pub const SESSION: u8 = 1;
@@ -114,6 +149,8 @@ pub mod tag {
     pub const SIGNAL: u8 = 3;
     pub const PRESENT: u8 = 4;
     pub const HEAP_SNAP: u8 = 5;
+    pub const LIST_META: u8 = 6;
+    pub const CONTENT_SAMPLE: u8 = 7;
 }
 
 /// Descriptor heap metadata (pointer id + creation sizes; no descriptor bytes).
@@ -171,6 +208,22 @@ pub enum WireEvent {
         submits: u64,
     },
     HeapSnap { heaps: Vec<HeapEntry> },
+    /// v3: one mapped PC list's bind/VA snapshot (no command-byte blob).
+    ListMeta {
+        list: usize,
+        kind: u32,
+        pso: usize,
+        rs_gfx: usize,
+        heaps: Vec<usize>,
+        vas: Vec<u64>,
+    },
+    /// v3: title-memory sample at a GPU VA (hash over `len` bytes; `sample` is a prefix).
+    ContentSample {
+        va: u64,
+        len: u32,
+        hash: u32,
+        sample: Vec<u8>,
+    },
 }
 
 impl WireEvent {
@@ -224,6 +277,29 @@ impl WireEvent {
                 for h in heaps {
                     h.put(out);
                 }
+            }
+            Self::ListMeta {
+                list,
+                kind,
+                pso,
+                rs_gfx,
+                heaps,
+                vas,
+            } => {
+                out.push(tag::LIST_META);
+                put_u64(out, *list as u64);
+                put_u32(out, *kind);
+                put_u64(out, *pso as u64);
+                put_u64(out, *rs_gfx as u64);
+                put_usize_list(out, heaps);
+                put_u64_list(out, vas);
+            }
+            Self::ContentSample { va, len, hash, sample } => {
+                out.push(tag::CONTENT_SAMPLE);
+                put_u64(out, *va);
+                put_u32(out, *len);
+                put_u32(out, *hash);
+                put_bytes(out, sample);
             }
         }
     }
@@ -280,6 +356,30 @@ impl WireEvent {
                     heaps.push(HeapEntry::get(from)?);
                 }
                 Self::HeapSnap { heaps }
+            }
+            tag::LIST_META => {
+                if wire_version < 3 {
+                    return Err(Bad("ListMeta requires wire version >= 3"));
+                }
+                Self::ListMeta {
+                    list: get_u64(from)? as usize,
+                    kind: get_u32(from)?,
+                    pso: get_u64(from)? as usize,
+                    rs_gfx: get_u64(from)? as usize,
+                    heaps: get_usize_list(from)?,
+                    vas: get_u64_list(from)?,
+                }
+            }
+            tag::CONTENT_SAMPLE => {
+                if wire_version < 3 {
+                    return Err(Bad("ContentSample requires wire version >= 3"));
+                }
+                Self::ContentSample {
+                    va: get_u64(from)?,
+                    len: get_u32(from)?,
+                    hash: get_u32(from)?,
+                    sample: get_bytes(from)?,
+                }
             }
             _ => return Err(Bad("unknown event kind")),
         })
@@ -342,9 +442,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roundtrip_submit_present_v2() {
+    fn roundtrip_submit_present_v3() {
         let events = vec![
-            WireEvent::Session { format: 2 },
+            WireEvent::Session { format: 3 },
             WireEvent::Submit {
                 n: 3,
                 queue: 0x1000,
@@ -356,6 +456,20 @@ mod tests {
                 rs_gfx: vec![0xB],
                 gpu_vas: vec![0x10_00, 0x20_00],
                 bound_heaps: vec![0xC],
+            },
+            WireEvent::ListMeta {
+                list: 3,
+                kind: 0,
+                pso: 0xA,
+                rs_gfx: 0xB,
+                heaps: vec![0xC],
+                vas: vec![0x10_00],
+            },
+            WireEvent::ContentSample {
+                va: 0x10_00,
+                len: 4,
+                hash: fnv1a32(&[1, 2, 3, 4]),
+                sample: vec![1, 2, 3, 4],
             },
             WireEvent::HeapSnap {
                 heaps: vec![HeapEntry {
@@ -406,6 +520,35 @@ mod tests {
     }
 
     #[test]
+    fn decodes_v2_without_list_meta() {
+        let events = vec![
+            WireEvent::Submit {
+                n: 1,
+                queue: 1,
+                lists: 1,
+                addrs: vec![1],
+                pc_addrs: vec![2],
+                backing: vec![2],
+                psos: vec![3],
+                rs_gfx: vec![4],
+                gpu_vas: vec![5],
+                bound_heaps: vec![6],
+            },
+            WireEvent::HeapSnap {
+                heaps: vec![HeapEntry {
+                    ptr: 6,
+                    ty: 0,
+                    count: 8,
+                    flags: 0,
+                }],
+            },
+        ];
+        let bytes = encode_frame_version(&events, 2);
+        let back = decode_frame(&bytes).unwrap();
+        assert_eq!(back, events);
+    }
+
+    #[test]
     fn heap_snap_roundtrip() {
         let ev = WireEvent::HeapSnap {
             heaps: vec![
@@ -434,5 +577,11 @@ mod tests {
         bad.extend_from_slice(&1u32.to_le_bytes());
         bad.extend_from_slice(&0u32.to_le_bytes());
         assert!(decode_frame(&bad).is_err());
+    }
+
+    #[test]
+    fn fnv_stable() {
+        assert_eq!(fnv1a32(b""), 0x811c_9dc5);
+        assert_eq!(fnv1a32(b"a"), 0xe40c_292c);
     }
 }

@@ -1,13 +1,9 @@
 //! Staging upload commit gates and idle buffer reclaim (CGBJ `pool.rs` staging track).
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 const SPARE: usize = 2;
 const STAGING_KEPT: usize = 8;
-
-static LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
-static GROW_BACKOFF_UNTIL: AtomicU64 = AtomicU64::new(0);
 
 /// `XCL_TEXTURE_POOL=1` or unset while `XCL_RESIDENCY=1`; `XCL_TEXTURE_POOL=0` always off.
 pub fn on() -> bool {
@@ -27,7 +23,6 @@ pub fn now_ms() -> u64 {
 }
 
 pub fn note_live_bytes(bytes: u64) {
-    LIVE_BYTES.store(bytes, Ordering::Relaxed);
     super::residency::set_live_staging_bytes(bytes);
 }
 
@@ -36,19 +31,19 @@ pub fn growth_allowed(bake: bool) -> bool {
     if !on() {
         return true;
     }
-    if now_ms() < GROW_BACKOFF_UNTIL.load(Ordering::Relaxed) {
-        return false;
-    }
-  super::residency::allow_staging_growth(bake)
+    super::residency::allow_staging_growth(bake)
 }
 
 pub fn note_growth_failed() {
     if on() {
-        GROW_BACKOFF_UNTIL.store(now_ms().saturating_add(500), Ordering::Relaxed);
+        super::residency::note_staging_growth_failed();
     }
 }
 
-/// Once per second with residency refresh: trim the upload job cache under pressure.
+/// Once per second with residency refresh: reclaim free upload jobs under pressure.
+///
+/// Nvidia tree keeps jobs in `texture_upload::FREE` rather than `gpu::texture` staging pools;
+/// caps match main/amd `texture_pool::free_cap_bytes`.
 pub fn tick(memory: Option<(u64, u64)>) {
     if !on() {
         return;
