@@ -1832,13 +1832,20 @@ void main(uint tid : SV_DispatchThreadID) {
 }
 "#;
 
+/// HLSL prefix for indirect clamp shaders (`REST`, CGBJ batch budget policy).
+fn indirect_clamp_shader_source(body: &str) -> String {
+    super::clamp::log_policy_once();
+    format!("#define REST {}\n{body}", super::clamp::indirect_rest_hlsl())
+}
+
 unsafe fn scale_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
     static CACHE: Mutex<Option<HashMap<usize, (ID3D12RootSignature, ID3D12PipelineState)>>> = Mutex::new(None);
     let key = dev.as_raw() as usize;
     if let Some(pair) = CACHE.lock().unwrap().as_ref().and_then(|m| m.get(&key).cloned()) {
         return Ok(pair);
     }
-    let dxil = crate::gpu::recomp::dxc::compile_cached(SCALE_ARGS_HLSL, "main", "cs_6_6")?.0;
+    let src = indirect_clamp_shader_source(SCALE_ARGS_HLSL);
+    let dxil = crate::gpu::recomp::dxc::compile_cached(&src, "main", "cs_6_6")?.0;
     let rs = crate::gpu::recomp::pso::abi_root_signature(dev, false)?;
     let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
         pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
@@ -2130,6 +2137,63 @@ unsafe fn mesh_work(this: *mut c_void, outcome: usize) {
     }
 }
 
+fn indirect_command_span(sig: usize, max: u32) -> usize {
+    if signature_dispatches(sig) {
+        return (max as usize).saturating_mul(12);
+    }
+    match super::indirect_guard::argument_stride(sig) {
+        Some(stride) => (max as usize).saturating_mul(stride as usize),
+        None => 0,
+    }
+}
+
+fn console_indirect_region(args: usize, args_off: u64) -> Option<(usize, usize)> {
+    super::real::console_buffer(args).and_then(|(p, n)| {
+        let off = usize::try_from(args_off).ok()?;
+        (off <= n).then(|| p.checked_add(off).map(|addr| (addr, n - off))).flatten()
+    })
+}
+
+fn console_indirect_count(count_buf: usize, count_off: u64) -> Option<usize> {
+    super::real::console_buffer(count_buf).and_then(|(p, n)| {
+        let off = usize::try_from(count_off).ok()?;
+        (off.checked_add(4)? <= n).then(|| p.checked_add(off)).flatten()
+    })
+}
+
+fn constants_order_active(commands_at: Option<(usize, usize)>, count_at: Option<usize>, span: usize) -> bool {
+    if !super::port::constants_order() {
+        return false;
+    }
+    commands_at.is_some_and(|(_, n)| {
+        let need = if span > 0 { span } else { 1 };
+        n >= need
+    }) || count_at.is_some()
+}
+
+/// Execute-time indirect refresh when constants-order is on (no amd prelude batch state on this tree).
+fn prepare_constants_order_indirect(_this: *mut c_void) {
+    let _ = (_this, super::port::constants_order_alone(), super::clamp::indirect_batch());
+}
+
+pub(super) unsafe fn prepare_deferred_indirect_execute(
+    list: *mut c_void,
+    sig: usize,
+    max: u32,
+    args: usize,
+    args_off: u64,
+    count_buf: usize,
+    count_off: u64,
+) {
+    if !super::port::constants_order() {
+        return;
+    }
+    let span = indirect_command_span(sig, max);
+    if constants_order_active(console_indirect_region(args, args_off), console_indirect_count(count_buf, count_off), span) {
+        prepare_constants_order_indirect(list);
+    }
+}
+
 /// #59 ExecuteIndirect(signature, max count, arguments, offset, count buffer, offset): with a
 /// translated pipeline, on XCL's ABI with the kept root arguments (signatures that change root
 /// arguments themselves cannot be – skipped, logged)
@@ -2155,6 +2219,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let count_at = super::real::console_buffer(count_buf).filter(|&(_, n)| count_off as usize + 4 <= n).map(|(p, _)| p + count_off as usize);
     if super::targets::enabled() && signature_dispatches(sig) {
         super::targets::note_indirect_compute(raw_pso, commands_at, count_at, count_buf != 0, max, super::indirect_guard::plain_dispatch(sig));
+    }
+    let constants_ordered = constants_order_active(commands_at, count_at, indirect_command_span(sig, max));
+    if constants_ordered {
+        prepare_constants_order_indirect(this);
     }
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     let tp = match draw_pipeline(raw_pso, pso) {
@@ -2387,6 +2455,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             ei_work(this, sig, super::targets::RAN);
             count(if gfx { DRAWS } else { DISPATCHES });
             let t = super::gpu_profile::begin(this, pso, if gfx { super::gpu_profile::Kind::IndirectDraw } else { super::gpu_profile::Kind::IndirectDispatch }, [max, 0, 0]);
+            let ei = || pc(this, sig, max, args, args_off, count_buf, count_off);
             match (&checked, clamped) {
                 (_, Some((from, at))) => {
                     if let Some(c) = &checked {
@@ -2399,9 +2468,14 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 }
                 (Some(c), None) => {
                     super::gpu_profile::note_counts(&t, c.slot);
-                    c.run(this, |buffer, off| pc(this, sig, 1, buffer, off, 0, 0));
+                    let run = || c.run(this, |buffer, off| pc(this, sig, 1, buffer, off, 0, 0));
+                    if count_buf == 0 && constants_ordered {
+                        fresh_indirect_arguments(this, run);
+                    } else {
+                        run();
+                    }
                 }
-                (None, None) => fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off)),
+                (None, None) => fresh_indirect_arguments(this, ei),
             }
             super::gpu_profile::end(this, t);
         }
@@ -4776,7 +4850,8 @@ void main(uint t : SV_GroupIndex) {
             runner::skip_test("no GPU");
             return None;
         }
-        let dxil = crate::gpu::recomp::dxc::compile(SCALE_ARGS_HLSL, "main", "cs_6_6", &[]).unwrap();
+        let src = super::indirect_clamp_shader_source(SCALE_ARGS_HLSL);
+        let dxil = crate::gpu::recomp::dxc::compile(&src, "main", "cs_6_6", &[]).unwrap();
         let n = commands.len();
         let (src, dst) = (0u32, 256u32);
         let mut mem: Vec<u32> = commands.iter().flatten().copied().collect();

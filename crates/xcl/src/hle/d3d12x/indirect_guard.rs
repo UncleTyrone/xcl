@@ -111,6 +111,15 @@ pub(super) fn plain_dispatch(sig: usize) -> bool {
     PLAIN.lock().unwrap().as_ref().and_then(|g| g.get(&sig).copied()) == Some(Counts::Dispatch)
 }
 
+/// Indirect argument record size in bytes for a plain single-action signature (`sig`).
+pub(super) fn argument_stride(sig: usize) -> Option<u32> {
+    Some(match *PLAIN.lock().unwrap().as_ref()?.get(&sig)? {
+        Counts::Dispatch => 12,
+        Counts::Draw => 16,
+        Counts::DrawIndexed => 20,
+    })
+}
+
 fn program() -> String {
     format!(
         r#"

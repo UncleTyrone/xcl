@@ -3228,7 +3228,10 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
         }
         match what {
             Deferred::Dispatch(x, y, z, flags) => super::bind::dispatch_flags(seg, x, y, z, flags),
-            Deferred::Indirect(sig, max, args, args_off, count_buf, count_off) => super::bind::execute_indirect(seg, sig, max, args, args_off, count_buf, count_off),
+            Deferred::Indirect(sig, max, args, args_off, count_buf, count_off) => {
+                super::bind::prepare_deferred_indirect_execute(seg, sig, max, args, args_off, count_buf, count_off);
+                super::bind::execute_indirect(seg, sig, max, args, args_off, count_buf, count_off);
+            }
         }
         let built = super::pso_async::has_real(super::bind::bound_pso(seg));
         super::pso_async::note_put_off(if built { super::pso_async::PutOff::Recorded } else { super::pso_async::PutOff::Skipped });

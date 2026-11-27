@@ -113,13 +113,18 @@ pub(crate) fn indirect_rest() -> bool {
     *ON.get_or_init(|| std::env::var("XCL_INDIRECT_REST").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// HLSL `REST` define for indirect clamp shaders (amd prelude; documented on nvidia for parity).
+pub(crate) fn indirect_rest_hlsl() -> &'static str {
+    if indirect_rest() { "true" } else { "false" }
+}
+
 /// `XCL_INDIRECT_WINDOW=1` (off by default; full window hoisting is amd-dev `clamp` + `bind`).
 pub(crate) fn indirect_window() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("XCL_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
 }
 
-fn log_phase14_once() {
+pub(crate) fn log_policy_once() {
     static DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     if DONE.set(()).is_err() {
         return;
@@ -224,7 +229,7 @@ fn transition(res: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_
 /// the dispatch. None: left as it was (the caller dispatches from `args`). The list's compute
 /// root signature, root arguments and pipeline are changed: the caller sets its own again.
 pub unsafe fn before(list: &ID3D12GraphicsCommandList, args: usize, off: u64, io_limit: u64) -> Option<(usize, u64)> {
-    log_phase14_once();
+    log_policy_once();
     if !enabled() {
         return None;
     }
