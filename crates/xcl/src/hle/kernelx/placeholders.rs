@@ -99,6 +99,9 @@ pub(super) unsafe fn free(addr: *mut c_void, size: usize, flags: u32) -> Option<
         if end < r.end {
             regions.insert(end, r);
         }
+        if crate::hle::d3d12x::port_constants::on() {
+            crate::hle::d3d12x::port_constants::note_placeholder_split();
+        }
         return Some(1);
     }
     if flags == COALESCE {

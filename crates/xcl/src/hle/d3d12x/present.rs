@@ -146,6 +146,8 @@ fn source_uv_rect(rect: Option<[i32; 4]>, w: u32, h: u32) -> [f32; 4] {
 
 unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) {
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
+    super::faultbook::on_frame(frames);
+    super::panel::on_frame(frames);
     super::targets::frame_end();
     super::gpu_times::present(frames);
     super::bvh_want::frame();
@@ -157,9 +159,11 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
             crate::xlog_info!("D3D12.X: {frames} frames presented, {:.1} fps over the last 300", 300.0 / (now - t).as_secs_f64());
             super::late_wait::log_frame_stats(300.0);
             super::relay::note_frame(300.0);
+            super::land::log_stats(300.0);
         }
     }
     super::real::stop_if_device_removed();
+    super::port_constants::tick_log();
     if !PRESENTX.swap(true, Ordering::Relaxed) {
         crate::xlog_info!("D3D12.X: PresentX – the title presents its own frames ({plane_count} plane(s))");
     }

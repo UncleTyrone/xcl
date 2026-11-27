@@ -1479,7 +1479,17 @@ pub unsafe extern "system" fn XMemVirtualAlloc(addr: *const c_void, size: usize,
     if a.memory_type != 0 && a.page_size == 2 {
         t |= 0x8000_0000;
     }
-    VirtualAlloc(addr, size, t, p)
+    let q = VirtualAlloc(addr, size, t, p);
+    if !q.is_null()
+        && addr.is_null()
+        && t & mem::MEM_COMMIT == 0
+        && t & mem::MEM_RESERVE != 0
+        && crate::hle::d3d12x::port_constants::on()
+        && crate::hle::d3d12x::port_constants::attrs_below_4g(attrs)
+    {
+        crate::hle::d3d12x::port_constants::note_low_reservation(q as usize, size);
+    }
+    q
 }
 
 /// Fast-path `VirtualQuery` / `VirtualQueryEx` / `XMemVirtualQuery` for a committed coherent

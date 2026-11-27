@@ -2199,6 +2199,14 @@ fn constants_order_active(commands_at: Option<(usize, usize)>, count_at: Option<
     if !super::port::constants_order() {
         return false;
     }
+    // When port 1 is on, only refresh if the args/count land in a placed constants region
+    // (main/amd). With the latch off, keep the nvidia prelude substitute from aa1870cf.
+    if super::port_constants::on() {
+        return commands_at.is_some_and(|(p, n)| {
+            let len = span.min(n);
+            len > 0 && super::port_constants::touches_range(p, len)
+        }) || count_at.is_some_and(|p| super::port_constants::touches_range(p, 4));
+    }
     commands_at.is_some_and(|(_, n)| {
         let need = if span > 0 { span } else { 1 };
         n >= need

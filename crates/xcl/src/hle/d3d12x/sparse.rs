@@ -4186,6 +4186,11 @@ unsafe fn run_copies(jobs: &mut Vec<(usize, usize, usize)>, staging: *mut u8) {
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
     let t0 = std::time::Instant::now();
+    let dirty: Vec<usize> = if super::port_constants::on() {
+        dirty.iter().copied().filter(|&p| !super::port_constants::touches_page(p)).collect()
+    } else {
+        dirty.to_vec()
+    };
     // (who had the lock when this began to wait for it: `XCL_LOOK_STATS=2`)
     let behind = (HOLDER.load(Ordering::Relaxed) as usize).min(HOLDERS - 1);
     FLUSHERS_WAITING.fetch_add(1, Ordering::AcqRel);
@@ -4213,7 +4218,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
         LOCK_SPLIT.add(LS_ALL, waited);
         HELD.add(HOLDERS + behind, (t_got - t0).as_micros() as u64);
     }
-    s.before_execute_on(queue, dirty, page);
+    s.before_execute_on(queue, &dirty, page);
 }
 
 /// What the title's lists being recorded will write on the GPU in the sparse windows (address,

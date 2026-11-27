@@ -1770,6 +1770,18 @@ pub(super) unsafe fn place_at_title_address(this: *mut c_void, va: usize, desc: 
     let u = crate::gpu::uma::get()?;
     let mut d: D3D12_RESOURCE_DESC = std::ptr::read_unaligned(desc.as_ptr() as *const D3D12_RESOURCE_DESC);
     let bytes = d.Width as usize;
+    if bytes == 0 {
+        return None;
+    }
+    if super::port_constants::on() && (va as u64) < (1u64 << 32) {
+        d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+        d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        d.Alignment = 0;
+        if let Some(hr) = super::port_constants::place_console_buffer(va, bytes, riid, ppv) {
+            UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (va, bytes, false));
+            return Some(hr);
+        }
+    }
     let (k, tiles) = title_buffer_window(u, va, bytes)?;
     let base = u.window(k).0;
     // a placed PC buffer starts at 64 KiB: one at another address starts below it and XCL adds
