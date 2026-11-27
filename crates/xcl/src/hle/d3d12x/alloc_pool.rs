@@ -313,6 +313,7 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
         *v += 1;
         (f.clone(), *v)
     };
+    super::late_wait::attach_queue_fence(queue, &fence, value);
     super::flight::signaled("title", key, &fence, value);
     // (how many PC lists that value stands for: 0 is a signal alone)
     super::flight::event("title lists", key as u64, value, lists.len() as u64);

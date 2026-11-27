@@ -358,6 +358,9 @@ impl PendingWait {
     }
 
     unsafe fn is_satisfied(&self) -> bool {
+        if super::late_wait::memory_wait_late_met(self.va, self.comparison, self.value, self.mask) {
+            return true;
+        }
         let Some(cur) = self.read_value() else {
             return true;
         };
@@ -2359,23 +2362,32 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
     }
 }
 
+/// Collect pending `Write64` signals for `lists` (before signaling).
+pub(super) fn chunk_write64_signals(lists: &[*mut c_void]) -> Vec<(u64, u64)> {
+    if WRITE64_SIGNAL_LISTS.load(Ordering::Acquire) == 0 || lists.is_empty() {
+        return Vec::new();
+    }
+    let g = LISTS.lock().unwrap();
+    let Some(m) = g.as_ref() else { return Vec::new() };
+    let mut out = Vec::new();
+    for &l in lists {
+        if let Some(s) = m.get(&(l as usize)) {
+            out.extend_from_slice(&s.write64_signals);
+        }
+    }
+    out
+}
+
 /// After `queue.ExecuteCommandLists(lists)`: signal per-address GPU fences for any
 /// `Write64BitValue{Bottom,Top}OfPipeX` commands recorded on `lists`.
 pub(super) unsafe fn signal_write64_fences(queue: *mut c_void, lists: &[*mut c_void]) {
     if WRITE64_SIGNAL_LISTS.load(Ordering::Acquire) == 0 || queue.is_null() || lists.is_empty() {
         return;
     }
-    let pairs: Vec<(u64, u64)> = {
-        let g = LISTS.lock().unwrap();
-        let Some(m) = g.as_ref() else { return };
-        let mut out = Vec::new();
-        for &l in lists {
-            if let Some(s) = m.get(&(l as usize)) {
-                out.extend_from_slice(&s.write64_signals);
-            }
-        }
-        out
-    };
+    let pairs = chunk_write64_signals(lists);
+    if pairs.is_empty() {
+        return;
+    }
     signal_write64_pairs(queue, &pairs);
 }
 

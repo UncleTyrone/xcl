@@ -668,7 +668,7 @@ unsafe fn prepare_pipelined_slot(p: &mut Presenter, is_present_x: bool) -> Resul
             std::mem::swap(&mut p.alloc, spare);
         }
     }
-    if wait_val > 0 {
+    if wait_val > 0 && !super::late_wait::present_may_skip_pipe_wait() {
         let timeout_ms = if is_present_x { 2000 } else { 100 };
         fence::wait(&p.fence, wait_val, &p.dev, Some(p.event), timeout_ms)?;
         p.ring.mark_slot_reusable(slot);
@@ -1061,6 +1061,10 @@ fn needs_compositor(planes: &[(ID3D12Resource, D3D12_RESOURCE_DESC, [f32; 4])]) 
 }
 
 unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, Option<[i32; 4]>)>)>) {
+    let is_frame = frame.is_some();
+    if is_frame {
+        super::late_wait::present_flight_begin();
+    }
     if IN_PRESENT.with(|c| c.replace(true)) {
         return;
     }
@@ -1071,7 +1075,6 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
         }
     }
     let _reset = Reset;
-    let is_frame = frame.is_some();
     let (queue, raw_planes, mut guard) = if let Some((queue, planes)) = frame {
         (queue, planes, PRESENTER.lock().unwrap())
     } else {
@@ -1261,6 +1264,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
         crate::xlog_error!("present: {e}");
         return;
     }
+    super::late_wait::present_flight_end();
     p.last = Instant::now();
     if !p.dumps.is_empty() {
         match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 2000) {
