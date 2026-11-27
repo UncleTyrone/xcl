@@ -533,6 +533,11 @@ pub(crate) struct BlockClaims {
 }
 
 pub(crate) fn claim_blocks(blocks: &[usize]) -> BlockClaims {
+    if super::faultbook::recording() {
+        for &b in blocks {
+            super::faultbook::note(super::faultbook::What::Fault, b, 1, 0);
+        }
+    }
     BlockClaims {
         _blocks: blocks.to_vec(),
     }

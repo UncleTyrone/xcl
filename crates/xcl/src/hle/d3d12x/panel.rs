@@ -72,17 +72,14 @@ pub(crate) fn on_frame(frame: u64) {
     let d_draws = draws.saturating_sub(p.1) as f64 / frames;
     let d_disp = dispatches.saturating_sub(p.2) as f64 / frames;
     *p = (presents, draws, dispatches, Instant::now());
-    let mem = match (super::real::video_memory(), super::real::video_budget()) {
-        (Some((local, non_local)), Some((loc, _))) => format!(
+    let mem = match super::real::video_memory() {
+        Some((local, non_local, budget)) => format!(
             "vram local={}MB non-local={}MB budget={}MB",
             local >> 20,
             non_local >> 20,
-            loc.Budget >> 20
+            budget >> 20
         ),
-        (Some((local, non_local)), None) => {
-            format!("vram local={}MB non-local={}MB", local >> 20, non_local >> 20)
-        }
-        _ => "vram unknown".into(),
+        None => "vram unknown".into(),
     };
     let line = format!(
         "FPS {fps:.1}  DRAWS {d_draws:.0}  DISPATCH {d_disp:.0}  frame={frame}  {mem}"

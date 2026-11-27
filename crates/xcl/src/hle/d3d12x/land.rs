@@ -175,6 +175,18 @@ pub unsafe fn merge_range(dst: usize, src: &[u8], held: &mut [u8], len: usize) -
     }
     // Longer-lived card view: keep registered shadows' held bytes in sync with this land.
     super::shadow::capture_after_land(dst, src, len);
+    if new_bytes > 0 {
+        super::host::traffic::moved(
+            super::host::traffic::FETCHED,
+            (dst as u64, len as u64),
+            std::iter::once((0, len)),
+        );
+        if super::host::torn::on() {
+            let piece = (dst as u64, (dst / BLOCK) as u32);
+            let h = super::host::torn::hash_bytes(&src[..len.min(src.len())]);
+            super::host::torn::fetched(piece, h != 0);
+        }
+    }
     if skip() && new_bytes == 0 {
         return (0, 0);
     }

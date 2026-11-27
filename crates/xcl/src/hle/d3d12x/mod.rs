@@ -100,6 +100,7 @@ pub mod present;
 mod submit;
 pub(crate) mod thin;
 pub mod pso_async;
+pub mod pso_library;
 pub mod real;
 mod scatter;
 mod shader_cache_session;

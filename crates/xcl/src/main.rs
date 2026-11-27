@@ -51,9 +51,12 @@ Usage:
       coverage over a seeded sample (default 200 programs, 0 = all); also
       --timeout, --max-bytes, --threads, --json, --hash H, --dump DIR.
   xcl translate <file | folder | package.rpf> [--validate] [--pipelines] [--list] [--jobs N]
+               [--warm <hashes.txt|all>]
       Offline translator pass (forwards to `shaders --recomp`; --validate → --direct --validate).
-  xcl warm <file | folder | package.rpf> [--jobs N] [--used-only]
-      Precompile + build pipelines into the DXIL / driver caches (`shaders --precompile --pipelines`).
+      --warm hashes.txt|all: DXIL-cache-only warm (CGBJ translate --warm; XCL_WARM_SECONDS caps time).
+  xcl warm <file | folder | package.rpf> [--jobs N] [--used-only] [--limit N] [--again]
+      Precompile + build pipelines into DXIL / driver / .plib caches (`shaders --precompile --pipelines`).
+      --limit caps how many; --again rebuilds even when warm-done.txt already lists them.
   xcl replay <capture-dir> [--json] [--frame N] [--listing] [--wire] [--fences] [--present]
            [--no-execute] [--at N] [--run <game>] [-- args]
            [--edit] [--skip-draws] [--skip-dispatches] [--meta-only] [--lists A..B] [--out DIR]
@@ -138,17 +141,28 @@ fn main() {
     std::process::exit(code);
 }
 
-/// `xcl translate`: forward to `shaders --recomp` (and optional validate / pipelines).
+/// `xcl translate`: forward to `shaders --recomp` (and optional validate / pipelines / --warm).
 fn translate_cmd(path: &std::path::Path, args: &[String]) -> i32 {
     let mut validate = false;
     let mut pipelines = false;
     let mut list = false;
+    let mut warm: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--validate" => validate = true,
             "--pipelines" => pipelines = true,
             "--list" | "--json" => list = true,
+            "--warm" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => warm = Some(v.clone()),
+                    None => {
+                        eprintln!("xcl translate: --warm needs hashes.txt or all");
+                        return 2;
+                    }
+                }
+            }
             "--jobs" => {
                 i += 1;
                 if let Some(v) = args.get(i) {
@@ -170,6 +184,21 @@ fn translate_cmd(path: &std::path::Path, args: &[String]) -> i32 {
         }
         i += 1;
     }
+    if let Some(spec) = warm {
+        if pipelines {
+            eprintln!("xcl translate: --warm cannot combine with --pipelines (use `xcl warm`)");
+            return 2;
+        }
+        let mut fwd = vec!["--precompile".into(), "--warm".into(), spec];
+        if validate {
+            fwd.push("--direct".into());
+            fwd.push("--validate".into());
+        }
+        if list {
+            fwd.push("--json".into());
+        }
+        return xcl::shaders::run(path, &fwd);
+    }
     // Pipeline warming is the precompile path; otherwise survey via --recomp.
     let mut fwd = if pipelines {
         vec!["--precompile".into(), "--pipelines".into()]
@@ -186,13 +215,27 @@ fn translate_cmd(path: &std::path::Path, args: &[String]) -> i32 {
     xcl::shaders::run(path, &fwd)
 }
 
-/// `xcl warm`: precompile shaders and host pipelines into caches.
+/// `xcl warm`: precompile shaders and host pipelines into caches (.pso + .plib).
 fn warm_cmd(path: &std::path::Path, args: &[String]) -> i32 {
     let mut fwd = vec!["--precompile".to_string(), "--pipelines".to_string()];
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--used-only" | "--used" => fwd.push("--used-only".into()),
+            "--again" => fwd.push("--again".into()),
+            "--limit" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => {
+                        fwd.push("--limit".into());
+                        fwd.push(v.clone());
+                    }
+                    None => {
+                        eprintln!("xcl warm: --limit needs a value");
+                        return 2;
+                    }
+                }
+            }
             "--jobs" => {
                 i += 1;
                 if let Some(v) = args.get(i) {

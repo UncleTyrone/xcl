@@ -2341,6 +2341,14 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
     seed_stream_recheck(&todo, &ranges, recheck_frame);
     if super::render_env::heap_textures() || super::render_env::heap_pass_aside() {
         let _ = super::render_env::memory_card_bytes();
+        if super::host::aside::on() && !todo.is_empty() {
+            let keys: Vec<(usize, u64, u64)> = todo
+                .iter()
+                .map(|d| (d.src, d.src as u64, d.tex.size()))
+                .collect();
+            let coming = super::host::aside::begin(move || keys);
+            let _ = coming.wait();
+        }
     }
     let t_tex = std::time::Instant::now();
     DIRTY_BUF.with(|dcell| upload_all(todo, &dcell.borrow(), page as usize, ID3D12CommandQueue::from_raw_borrowed(&queue)));

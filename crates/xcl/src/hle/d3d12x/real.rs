@@ -5199,6 +5199,27 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         Some(hit) => hit,
         None => {
             let Some(rs) = abi_rs_for(this, &compiled.samplers) else { return Some(Err(())) };
+            let lib_key = compute_library_key(&dxil, &compiled.samplers, d.Flags.0, false);
+            let mut lib_copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(d);
+            lib_copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
+            lib_copy.CS = bytecode(&dxil);
+            lib_copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+            if pso_lib::try_load_compute(this, &lib_key, &lib_copy, ppv) {
+                LAST_COMPUTE_RS.with(|c| c.set(rs as usize));
+                TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
+                note_pso_rs(*ppv, rs);
+                super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
+                if let Some(i) = crate::gpu::recomp::pso::compute_interface(cs) {
+                    PSO_USER_SGPRS.insert(*ppv as usize, (i.user_sgprs, i.threads));
+                }
+                super::ambient::note_compute_pso(*ppv as usize, cs);
+                note_translated_compute(S_OK, ppv);
+                crate::xlog_info!(
+                    "D3D12.X: compute PSO with the translated console CS ({} B DXIL, memory-mapped pipeline library)",
+                    dxil.len()
+                );
+                return Some(Ok(S_OK));
+            }
             (rs, compute_container(this, f, d, rs, &dxil, record, riid, ppv, ComputeBuild::Whole))
         }
     };
@@ -5222,6 +5243,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         return Some(Err(()));
     }
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
+    pso_lib::store_pipeline(this, &compute_library_key(&dxil, &compiled.samplers, d.Flags.0, false), *ppv);
     note_pso_rs(*ppv, rs);
     super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
     if let Some(i) = crate::gpu::recomp::pso::compute_interface(cs) {
@@ -5419,6 +5441,14 @@ pub(crate) mod driver_cache {
 
     pub(super) fn stats() -> (u64, u64, u64) {
         (HITS.load(Ordering::Relaxed), STALE.load(Ordering::Relaxed), STORED.load(Ordering::Relaxed))
+    }
+
+    /// Whether a create that failed with `hr` refused the blob it was given. A removed or hung
+    /// device and a driver out of memory fail every create, with a blob or without one, and
+    /// say nothing about the blob: it is kept.
+    pub fn refused(hr: crate::util::HRESULT) -> bool {
+        use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET};
+        hr < 0 && ![DXGI_ERROR_DEVICE_REMOVED.0, DXGI_ERROR_DEVICE_HUNG.0, DXGI_ERROR_DEVICE_RESET.0, crate::util::E_OUTOFMEMORY].contains(&hr)
     }
 
     /// A pipeline was made from a kept blob (`ok`), or the driver refused the blob: dropped.
@@ -9379,10 +9409,12 @@ pub(super) unsafe fn execute_mapped_lists(this: *mut c_void, mapped: &[*mut c_vo
         }
         super::submit_cost::previous(t.elapsed());
         let t = std::time::Instant::now();
+        let span = super::host::before_submit();
         super::submit::driver_execute(|| {
             let _in_driver = super::watch::in_driver(super::watch::Call::Execute);
             f(this, chunk.len() as u32, chunk.as_ptr());
         });
+        super::host::after_submit(span);
         super::gpu_times::executed(this, chunk);
         let t1 = std::time::Instant::now();
         super::submit_cost::driver(t1 - t);
@@ -11928,6 +11960,189 @@ mod depth_uav_twin_tests {
             let rows: Vec<Vec<u8>> = (0..16).map(|y| std::slice::from_raw_parts((p as *const u8).add(fp.Offset as usize + y * pitch), 16).to_vec()).collect();
             rb.Unmap(0, None);
             assert!(rows.iter().all(|r| r.iter().all(|&v| v == 0x5A)), "the twin was not cleared: {:x?}", &rows[0]);
+        }
+    }
+}
+
+/// Flush newly stored pipelines in the memory-mapped `ID3D12PipelineLibrary1` to a fresh
+/// generational `.plib` (clean shutdown / `XCL_RUN_SECONDS`; never truncates an open mapping).
+pub fn flush_pipeline_library() {
+    pso_lib::flush_now();
+}
+
+/// Deterministic cross-run `.plib` key for a translated compute pipeline (`c-...` standard ABI,
+/// `sc-...` when `chained` for dispatch-chain root signatures). Shared by runtime PSO creation
+/// and offline `xcl shaders --precompile --pipelines` / `xcl warm`.
+pub(crate) fn compute_library_key(
+    dxil: &[u8],
+    samplers: &[crate::gpu::recomp::pso::StaticSampler],
+    flags: i32,
+    chained: bool,
+) -> String {
+    let key = pso_lib::compute_key(dxil, samplers, flags);
+    if chained { format!("s{key}") } else { key }
+}
+
+/// Runtime wiring for `pso_library::MmapPipelineLibrary` (compute path): open / load / store /
+/// flush. Graphics/stream keys remain an amd-dev depth gap on this tree.
+mod pso_lib {
+    use super::*;
+    use crate::hle::d3d12x::pso_library::MmapPipelineLibrary;
+    use std::sync::Arc;
+
+    struct LibState {
+        device: usize,
+        lib: Option<Arc<MmapPipelineLibrary>>,
+        stored_keys: HashSet<String>,
+        hits: u64,
+        stores: u64,
+    }
+
+    static LIB_STATE: Mutex<Option<LibState>> = Mutex::new(None);
+
+    unsafe fn library_for(device: *mut c_void) -> Option<Arc<MmapPipelineLibrary>> {
+        if cfg!(test) || device.is_null() || !super::super::pso_library::enabled() {
+            return None;
+        }
+        let dev_key = device as usize;
+        {
+            let g = LIB_STATE.lock().unwrap();
+            if let Some(s) = g.as_ref().filter(|s| s.device == dev_key) {
+                return s.lib.clone();
+            }
+        }
+        let adapter = {
+            let s = ADAPTER.lock().unwrap().clone();
+            if s.is_empty() { "default".to_string() } else { s }
+        };
+        let opened = ID3D12Device::from_raw_borrowed(&device)
+            .and_then(|dev| MmapPipelineLibrary::open_or_create(dev, &adapter))
+            .map(Arc::new);
+        let mut g = LIB_STATE.lock().unwrap();
+        if let Some(s) = g.as_ref().filter(|s| s.device == dev_key) {
+            return s.lib.clone();
+        }
+        let ret = opened.clone();
+        *g = Some(LibState {
+            device: dev_key,
+            lib: opened,
+            stored_keys: HashSet::new(),
+            hits: 0,
+            stores: 0,
+        });
+        ret
+    }
+
+    pub(super) fn flush_now() {
+        let lib = LIB_STATE.lock().unwrap().as_ref().and_then(|s| s.lib.clone());
+        if let Some(lib) = lib {
+            unsafe {
+                let _ = lib.flush();
+            }
+        }
+    }
+
+    fn fnv_feed(h: &mut u64, bytes: &[u8]) {
+        for &b in bytes {
+            *h ^= b as u64;
+            *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn samplers_digest(samplers: &[crate::gpu::recomp::pso::StaticSampler]) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        fnv_feed(&mut h, &(samplers.len() as u64).to_le_bytes());
+        for (w, cmp) in samplers {
+            for &x in w {
+                fnv_feed(&mut h, &x.to_le_bytes());
+            }
+            fnv_feed(&mut h, &[*cmp as u8]);
+        }
+        h
+    }
+
+    pub(super) fn compute_key(dxil: &[u8], samplers: &[crate::gpu::recomp::pso::StaticSampler], flags: i32) -> String {
+        format!(
+            "c-{:016x}-{:x}-{:016x}-{:x}",
+            crate::gpu::shader::fnv64(dxil),
+            dxil.len(),
+            samplers_digest(samplers),
+            flags as u32
+        )
+    }
+
+    unsafe fn deliver_adopted(pso: ID3D12PipelineState, ppv: *mut *mut c_void) -> bool {
+        if ppv.is_null() {
+            return false;
+        }
+        let out = pso.into_raw();
+        adopt(out, Kind::PipelineState);
+        *ppv = out;
+        true
+    }
+
+    fn note_hit() {
+        if let Some(s) = LIB_STATE.lock().unwrap().as_mut() {
+            s.hits += 1;
+            if s.hits == 1 || s.hits % 500 == 0 {
+                crate::xlog_info!("D3D12.X: memory-mapped pipeline library hits: {}", s.hits);
+            }
+        }
+    }
+
+    pub(super) unsafe fn try_load_compute(
+        device: *mut c_void,
+        key: &str,
+        desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC,
+        ppv: *mut *mut c_void,
+    ) -> bool {
+        if ppv.is_null() {
+            return false;
+        }
+        let Some(lib) = library_for(device) else { return false };
+        let Some(pso) = lib.load_compute(key, desc) else { return false };
+        if deliver_adopted(pso, ppv) {
+            note_hit();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) unsafe fn store_pipeline(device: *mut c_void, key: &str, pso_raw: *mut c_void) {
+        if pso_raw.is_null() {
+            return;
+        }
+        let Some(lib) = library_for(device) else { return };
+        {
+            let mut g = LIB_STATE.lock().unwrap();
+            let Some(s) = g.as_mut() else { return };
+            if !s.stored_keys.insert(key.to_string()) {
+                return;
+            }
+        }
+        let Some(pso) = ID3D12PipelineState::from_raw_borrowed(&pso_raw) else { return };
+        if lib.store(key, pso) {
+            if let Some(s) = LIB_STATE.lock().unwrap().as_mut() {
+                s.stores += 1;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn compute_library_keys_are_deterministic() {
+            let s1 = [([1u32, 2, 3, 4], false)];
+            let s2 = [([1u32, 2, 3, 4], true)];
+            let ck1 = compute_key(b"dxil-cs", &s1, 0);
+            assert_eq!(ck1, compute_key(b"dxil-cs", &s1, 0));
+            assert_ne!(ck1, compute_key(b"dxil-cs", &s2, 0));
+            assert_ne!(ck1, compute_key(b"dxil-cs", &s1, 1));
+            assert_ne!(ck1, compute_key(b"dxil-c2", &s1, 0));
+            assert_eq!(super::super::compute_library_key(b"dxil-cs", &s1, 0, true), format!("s{ck1}"));
         }
     }
 }
