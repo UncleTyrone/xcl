@@ -311,8 +311,13 @@ mod translated {
                 identity_for(&id.to_string(), "xcl-rt-all-miss")
             } else { id };
             // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
-            if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
+            let id = if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
                 identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
+            } else {
+                id
+            };
+            if let Some(tag) = crate::gpu::recomp::shader_opt::cache_tag() {
+                identity_for(&id.to_string(), tag)
             } else {
                 id
             }
