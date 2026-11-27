@@ -1859,9 +1859,17 @@ impl State {
     /// CPU view since, or with a page decommitted (and maybe committed again), is left out: what
     /// the GPU had there before is not that memory's. (A tile of the window's own lands as before.)
     unsafe fn copy_back(&mut self, p: *mut u8, dst: usize, off: usize, len: usize, gen: u32) {
+        if super::shadow::enabled() && super::land::enabled() && len > 0 {
+            let card = std::slice::from_raw_parts(p.add(off), len);
+            if super::shadow::merge_if_covered(dst, card, len).is_some() {
+                self.sync_sent_range(dst, len);
+                return;
+            }
+        }
         let mut at = dst;
         let mut src_off = off;
         let end = dst + len;
+        let mut any = false;
         while at < end {
             let pg = at & !(PAGE - 1);
             let t = pg & !(TILE - 1);
@@ -1872,6 +1880,7 @@ impl State {
                 let here = entry.cpu(t);
                 if entry.holes & (1u16 << idx) == 0 && entry.gen == gen {
                     let wrote = land_page(&mut entry.sent[idx], here + (pg - t), at - pg, p.add(src_off), step);
+                    any |= wrote;
                     if wrote && self.own_pages.len() < OWN_PAGES_MAX && super::look_stats::deep() {
                         self.own_pages.push(here + (pg - t));
                     }
@@ -1879,6 +1888,10 @@ impl State {
             }
             at += step;
             src_off += step;
+        }
+        if any && super::shadow::enabled() && len > 0 {
+            let card = std::slice::from_raw_parts(p.add(off), len);
+            super::shadow::capture_after_land(dst, card, len);
         }
     }
 
@@ -2505,6 +2518,7 @@ pub(super) unsafe fn readback_after_execute_sync(queue: &ID3D12CommandQueue, ran
         let _ = s.queue.Wait(&s.rb_fence, v);
         super::list_x::note_internal_wait(s.queue.as_raw() as usize, "sparse readback behind a title queue (relay)", &s.rb_fence, v);
     }
+    super::shadow::declare_gpu_writes(&merged);
     s.readback_ranges(&merged);
     super::land::note_sparse_landed(&merged);
 }
@@ -2673,6 +2687,7 @@ impl State {
             let _ = s.queue.Wait(&s.rb_fence, v);
             super::list_x::note_internal_wait(s.queue.as_raw() as usize, "sparse readback behind a title queue", &s.rb_fence, v);
         }
+        super::shadow::declare_gpu_writes(&merged);
         s.readback_ranges(&merged);
         super::land::note_sparse_landed(&merged);
     }

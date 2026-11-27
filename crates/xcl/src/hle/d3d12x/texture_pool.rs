@@ -60,14 +60,6 @@ pub fn tick(memory: Option<(u64, u64)>) {
     let frames = p.max(b);
     let low = super::residency::critical_commit() || pressure || super::vram::commit_low();
     crate::gpu::texture::trim_idle_staging(frames, low);
-    let cap = if super::residency::critical_commit() {
-        16 << 20
-    } else if pressure {
-        64 << 20
-    } else {
-        512 << 20
-    };
-    super::texture_upload::reclaim_under_cap(cap);
     note_live_bytes(crate::gpu::texture::staging_live_bytes());
 }
 

@@ -36,6 +36,7 @@ pub fn console_pipes() -> PipeConfig {
 
 /// Live bytes retained in nvidia `hle::d3d12x::texture_upload` FREE jobs (updated from HLE).
 static LIVE_STAGING: AtomicU64 = AtomicU64::new(0);
+static CURRENT_FRAME: AtomicU64 = AtomicU64::new(0);
 static RECLAIM: OnceLock<Mutex<Option<Box<dyn Fn(bool) + Send>>>> = OnceLock::new();
 
 fn reclaim_slot() -> &'static Mutex<Option<Box<dyn Fn(bool) + Send>>> {
@@ -58,7 +59,11 @@ pub fn staging_live_bytes() -> u64 {
 }
 
 /// Reclaim idle upload staging buffers under pressure (FREE-job pool on nvidia).
-pub fn trim_idle_staging(_frame: u64, low_commit: bool) {
+pub fn trim_idle_staging(frame: u64, low_commit: bool) {
+    CURRENT_FRAME.store(frame, Ordering::Relaxed);
+    if !low_commit && !frame.is_multiple_of(15) {
+        return;
+    }
     if let Some(f) = reclaim_slot().lock().unwrap().as_ref() {
         f(low_commit);
     }

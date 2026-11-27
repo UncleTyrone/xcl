@@ -154,10 +154,19 @@ pub unsafe fn merge_range(dst: usize, src: &[u8], held: &mut [u8], len: usize) -
         }
     };
 
-    // Parallel wide_back needs a Sync closure; keep the merge sequential on this tree so the
-    // raw title/held pointers stay on the calling thread (main/amd use the same usize-address
-    // pattern under a Sync-checked toolchain path).
-    let (new_bytes, dwords) = apply_piece(0, len);
+    let (new_bytes, dwords) = if super::wide_back::enabled() && len > 256 << 10 {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let nb = AtomicUsize::new(0);
+        let dw = AtomicUsize::new(0);
+        super::wide_back::parallel_byte_jobs(len, 256 << 10, &|_, lo, n| {
+            let (a, b) = apply_piece(lo, lo + n);
+            nb.fetch_add(a, Ordering::Relaxed);
+            dw.fetch_add(b, Ordering::Relaxed);
+        });
+        (nb.load(Ordering::Relaxed), dw.load(Ordering::Relaxed))
+    } else {
+        apply_piece(0, len)
+    };
 
     if beside() || anytime() {
         for &b in &blocks {
@@ -184,6 +193,7 @@ pub unsafe fn merge_range(dst: usize, src: &[u8], held: &mut [u8], len: usize) -
         if super::host::torn::on() {
             let piece = (dst as u64, (dst / BLOCK) as u32);
             let h = super::host::torn::hash_bytes(&src[..len.min(src.len())]);
+            // Without a flight-end hash yet, treat a non-zero land as matching (clears suspect).
             super::host::torn::fetched(piece, h != 0);
         }
     }
@@ -216,6 +226,7 @@ pub fn note_sparse_landed(ranges: &[(usize, usize)]) {
         }
     }
     super::shadow::note_landed_ranges(ranges);
+    super::shadow::finish_gpu_writes(ranges);
 }
 
 /// Per-frame stats for the activity line.

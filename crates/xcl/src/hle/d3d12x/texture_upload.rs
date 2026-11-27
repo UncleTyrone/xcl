@@ -800,7 +800,11 @@ const FREE_BYTES: u64 = 512 << 20;
 pub(super) fn reclaim_under_cap(cap: u64) {
     ensure_gpu_texture_bridge();
     let mut g = FREE.lock().unwrap();
-    while g.iter().map(|j| j.bytes).sum::<u64>() > cap {
+    loop {
+        let live: u64 = g.iter().map(|j| j.bytes).sum();
+        if live <= cap {
+            break;
+        }
         let Some(i) = g.iter().enumerate().max_by_key(|(_, j)| j.bytes).map(|(i, _)| i) else { break };
         g.swap_remove(i);
     }

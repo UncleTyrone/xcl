@@ -52,8 +52,6 @@ static PRESENTX_LOCK: Mutex<()> = Mutex::new(());
 /// command queue #30 PresentX(planeCount, planes, parameters): plane 0's first resource is
 /// the frame; S_OK always (a console present does not fail for the title).
 pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes: *const u8, _params: *const u8) -> i32 {
-    // (`XCL_LOOK_STATS=2`: a frame's time on the thread that submits, added up)
-    let _cost = super::look_stats::deep().then(|| crate::hle::api_cost::time(crate::hle::api_cost::Call::Present));
     if plane_count == 0 || planes.is_null() || !crate::gpu::shader::readable(planes as usize, 0x18) {
         return 0;
     }
@@ -152,9 +150,6 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         let (draws, _) = super::bind::activity();
         super::host::on_present(frames, draws);
     }
-    super::targets::frame_end();
-    super::gpu_times::present(frames);
-    super::bvh_want::frame();
     if frames % 300 == 0 {
         // the title's frame rate, for comparing runs (every 300 frames)
         static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
@@ -169,6 +164,7 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
     }
     super::real::stop_if_device_removed();
     super::port_constants::tick_log();
+    crate::gpu::texture::trim_idle_staging(frames, super::vram::commit_low());
     if !PRESENTX.swap(true, Ordering::Relaxed) {
         crate::xlog_info!("D3D12.X: PresentX – the title presents its own frames ({plane_count} plane(s))");
     }
@@ -183,9 +179,6 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         }
     }
     let extracted = extract_planes(plane_count, planes);
-    if super::capture::enabled() {
-        super::capture::present(queue as usize, &extracted.iter().map(|e| e.0).collect::<Vec<_>>(), frames);
-    }
     if extracted.is_empty() || !enabled() {
         return;
     }
@@ -380,9 +373,9 @@ pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
     if now.saturating_sub(LAST_MAINT_MS.load(Ordering::Relaxed)) >= 1000 {
         LAST_MAINT_MS.store(now, Ordering::Relaxed);
         super::residency::refresh();
-        let vram = super::session::texture_budget_bytes();
         let (used, _) = super::vram::page_bytes();
-        super::texture_pool::tick(Some((vram, used as u64)));
+        let budget = super::partial_fill::texture_budget_mb().saturating_mul(1 << 20);
+        super::texture_pool::tick(Some((budget, used as u64)));
     }
     super::console_heap::settle_for_fence();
     super::console_heap::recycle_after_submit(queue as usize);
@@ -425,7 +418,6 @@ pub fn on_queue_console_method(_info: &StubInfo, _caller: usize) {
     }
     BOUNDARIES.fetch_add(1, Ordering::Relaxed);
     LAST_BOUNDARY_MS.store(now_ms(), Ordering::Relaxed);
-    let _cost = super::look_stats::deep().then(|| crate::hle::api_cost::time(crate::hle::api_cost::Call::Present));
     unsafe { present_now(Duration::from_millis(4), None) };
 }
 
@@ -1168,11 +1160,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
         return; // swap chain is bound to the first queue we presented from
     }
     // rotate to the oldest in-flight allocator slot and wait only for its fence (frame N-2)
-    let waited = {
-        let _cost = super::look_stats::deep().then(|| crate::hle::api_cost::time(crate::hle::api_cost::Call::PresentCopyWait));
-        prepare_pipelined_slot(p, is_frame)
-    };
-    if let Err(e) = waited {
+    if let Err(e) = prepare_pipelined_slot(p, is_frame) {
         p.disabled = matches!(&e, FenceError::Removed(_));
         if !matches!(&e, FenceError::Timeout(_)) {
             crate::xlog_error!("present: previous copy: {e}");
@@ -1189,34 +1177,8 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
     if p.alloc.Reset().is_err() || p.list.Reset(&p.alloc, None).is_err() {
         return;
     }
-    // `XCL_DUMP_TARGETS`: a busy frame's render targets go with its picture (copied in the
-    // state the title left them, as `XCL_TRACE_FRAME`'s; its frame dump is also the
-    // `last_frame_dump` of the report)
-    let targets = super::targets::take_pending();
-    let dumping_targets = targets.is_some();
-    let due = frame_dump_due() || dumping_targets;
+    let due = frame_dump_due();
     let mut dumps = Vec::new();
-    for (tag, res, d) in targets.map_or(Vec::new(), |f| super::targets::to_dump(PRESENTS.load(Ordering::Relaxed), &f)) {
-        if let Some((buffer, footprint)) = readback_copy(&p.list, &res, &d) {
-            dumps.push(FrameDump { _source: res, buffer, footprint, format: d.Format, tag });
-        }
-    }
-    if dumping_targets {
-        // and the small 3D textures (`lut3d`), from the state the title's work left them in
-        for (tag, tex, d, state) in super::lut3d::to_dump() {
-            let moved = super::lut3d::needs_transition(state);
-            if moved {
-                p.list.ResourceBarrier(&[transition_sub(&tex, 0, state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-            }
-            let copied = readback_copy(&p.list, &tex, &d);
-            if moved {
-                p.list.ResourceBarrier(&[transition_sub(&tex, 0, D3D12_RESOURCE_STATE_COPY_SOURCE, state)]);
-            }
-            if let Some((buffer, footprint)) = copied {
-                dumps.push(FrameDump { _source: tex, buffer, footprint, format: d.Format, tag });
-            }
-        }
-    }
     let mut composited = false;
     if resolved.len() > 1 {
         if p.compositor.is_none() {
@@ -1292,7 +1254,6 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
     if due && trace_frame() {
         let busiest = busiest_rt();
         let followed = FOLLOWED.lock().unwrap();
-        // (a followed target is an address too: taken only while an RTV still holds it)
         let targets = busiest
             .into_iter()
             .chain(followed.iter().filter_map(|&r| view_resource(r)))
@@ -1326,14 +1287,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
         crate::xlog_error!("present: submit copy: {e}");
         return;
     }
-    if dumping_targets {
-        super::targets::submitted();
-    }
-    let presented = {
-        let _in_driver = super::watch::in_driver(super::watch::Call::Present);
-        sc.Present(0, DXGI_PRESENT(0)).ok()
-    };
-    if let Err(e) = presented {
+    if let Err(e) = sc.Present(0, DXGI_PRESENT(0)).ok() {
         let e = fence::api_error(&p.dev, "Present", e);
         p.disabled = matches!(&e, FenceError::Removed(_));
         crate::xlog_error!("present: {e}");
