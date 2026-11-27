@@ -3110,6 +3110,54 @@ fn static_sampler_word_from_s_brev_is_a_constant() {
     assert!(!t.hlsl.contains("SamplerDescriptorHeap"), "no sampler heap lookup left");
 }
 
+/// `s_cbranch_execz` to a join must not drop SRSRC words set on the live arm (transmission buffer).
+#[test]
+fn execz_dead_edge_at_join_keeps_live_arm_buffer_srsrc() {
+    let desc = [0x20u32, 0, 0x100, 0];
+    let code = prog(&[
+        ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 7)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 255)], Some(desc[0])),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 9), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 255)], Some(desc[2])),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 128)], None),
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128)], None),
+    ]);
+    let cs = Options {
+        mode: Mode::Compute(crate::gpu::recomp::CsInterface::default()),
+        ..Default::default()
+    };
+    let t = translate(&code, &cs).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(
+        t.hlsl.contains("0x20u") || t.hlsl.contains("32u"),
+        "buffer load should keep immediate SRSRC base from the live arm, got:\n{}",
+        t.hlsl
+    );
+}
+
+/// `s_cbranch_execz` to a join must not drop S# set on the live arm (CGBJ transmission prefilter pattern).
+#[test]
+fn execz_dead_edge_at_join_keeps_live_arm_sampler() {
+    let imm = [2 | 2 << 3 | 2 << 6, 0, 0, 0];
+    let code = prog(&[
+        ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 4)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 255)], Some(imm[0])),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 9), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 128)], None),
+        ("IMAGE_SAMPLE_LZ", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 2), ("DMASK", 0xF), ("DIM", 1)], None),
+    ]);
+    let cs = Options {
+        mode: Mode::Compute(crate::gpu::recomp::CsInterface::default()),
+        ..Default::default()
+    };
+    let t = translate(&code, &cs).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert_eq!(t.static_samplers, vec![(imm, false)]);
+}
+
 /// The same program on the GPU: the texel a point sampler picks at a texel boundary.
 #[test]
 fn gpu_static_sampler_word_from_s_brev() {
