@@ -4924,6 +4924,9 @@ impl Em {
             let ty = if *cmp { "SamplerComparisonState" } else { "SamplerState" };
             let _ = writeln!(h, "{ty} xcl_ss{k} : register(s{k}, space1);");
         }
+        if crate::hle::d3d12x::heap_strides::on() {
+            h.push_str("ByteAddressBuffer tb_heap_strides : register(t252, space1);\n");
+        }
         h.push_str(PRELUDE);
         if matches!(self.opt.mode, Mode::Pixel(_)) {
             h.push_str(PRELUDE_PIXEL);

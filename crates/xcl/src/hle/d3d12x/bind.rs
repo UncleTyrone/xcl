@@ -65,6 +65,9 @@ unsafe fn emit_abi_bindings(list: &ID3D12GraphicsCommandList, gfx: bool, rs: &ID
             }
         }
     }
+    if let Some(idx) = crate::gpu::recomp::pso::abi_heap_strides_root_index(false, false) {
+        super::heap_strides::bind_root(list, gfx, idx);
+    }
 }
 
 fn uma_va_in(u: &crate::gpu::uma::Uma, windows: &[u64], p: usize) -> Option<u64> {

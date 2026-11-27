@@ -1698,6 +1698,39 @@ pub(crate) unsafe fn record_dispatch_chain_indirect<'a>(
     }
 }
 
+/// Root parameter index for `tb_heap_strides` / `t252, space1` when `XCL_HEAP_STRIDES=1`.
+pub fn abi_heap_strides_root_index(split: bool, mesh_launch: bool) -> Option<u32> {
+    if !crate::hle::d3d12x::heap_strides::on() {
+        return None;
+    }
+    let mut n = 6u32;
+    if split {
+        n += 2;
+    }
+    if mesh_launch {
+        n += 3;
+    }
+    Some(n)
+}
+
+fn push_heap_strides_root(params: &mut Vec<D3D12_ROOT_PARAMETER1>) {
+    if !crate::hle::d3d12x::heap_strides::on() {
+        return;
+    }
+    let slot = crate::hle::d3d12x::heap_strides::SLOT_TABLE_STRIDES as u32;
+    params.push(D3D12_ROOT_PARAMETER1 {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                ShaderRegister: slot,
+                RegisterSpace: 1,
+                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    });
+}
+
 fn abi_signature(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler], split: bool) -> Result<ID3D12RootSignature, String> {
     let statics: Vec<D3D12_STATIC_SAMPLER_DESC> = samplers.iter().enumerate().map(|(k, s)| static_sampler_desc(k as u32, s)).collect();
     unsafe {
@@ -1727,6 +1760,7 @@ fn abi_signature(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler],
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        push_heap_strides_root(&mut params);
         let mut flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
         if graphics {
             flags |= D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
