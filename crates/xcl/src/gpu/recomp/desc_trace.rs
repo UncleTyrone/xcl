@@ -18,6 +18,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use super::rdna2::{self, Decoded};
 use super::{join_lane_phi, lane_masks, strict_joins};
 
+/// Stop origin tracing past this depth (retail shaders can chain thousands of mov/cselect defs).
+const MAX_TRACE_DEPTH: usize = 256;
+
 /// CGBJ `Source` analogue for a descriptor that may differ between lanes / SCC arms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DescSource {
@@ -562,7 +565,11 @@ fn lane_tsharp_from_srsrc(insts: &[Decoded], before_pc: u64, srsrc: Option<u64>)
 }
 
 fn sgpr_to_lane_vgpr(insts: &[Decoded], before_pc: u64, sgpr: u64) -> Option<u64> {
-    if sgpr >= 106 {
+    sgpr_to_lane_vgpr_depth(insts, before_pc, sgpr, 0)
+}
+
+fn sgpr_to_lane_vgpr_depth(insts: &[Decoded], before_pc: u64, sgpr: u64, depth: usize) -> Option<u64> {
+    if depth >= MAX_TRACE_DEPTH || sgpr >= 106 {
         return None;
     }
     let w = last_sgpr_writer(insts, before_pc, sgpr)?;
@@ -571,10 +578,10 @@ fn sgpr_to_lane_vgpr(insts: &[Decoded], before_pc: u64, sgpr: u64) -> Option<u64
             let set = f(w, "SSRC0")?;
             let clear = f(w, "SSRC1")?;
             if set == clear {
-                return sgpr_to_lane_vgpr(insts, w.pc, set);
+                return sgpr_to_lane_vgpr_depth(insts, w.pc, set, depth + 1);
             }
-            let vs = sgpr_to_lane_vgpr(insts, w.pc, set);
-            let vc = sgpr_to_lane_vgpr(insts, w.pc, clear);
+            let vs = sgpr_to_lane_vgpr_depth(insts, w.pc, set, depth + 1);
+            let vc = sgpr_to_lane_vgpr_depth(insts, w.pc, clear, depth + 1);
             match (vs, vc) {
                 (Some(a), Some(b)) if a == b => Some(a),
                 _ => None,
@@ -582,8 +589,8 @@ fn sgpr_to_lane_vgpr(insts: &[Decoded], before_pc: u64, sgpr: u64) -> Option<u64
         }
         "S_CMOV_B32" | "S_CMOV_B64" => {
             let set = f(w, "SSRC0")?;
-            let vs = sgpr_to_lane_vgpr(insts, w.pc, set);
-            let vc = sgpr_to_lane_vgpr(insts, w.pc, sgpr);
+            let vs = sgpr_to_lane_vgpr_depth(insts, w.pc, set, depth + 1);
+            let vc = sgpr_to_lane_vgpr_depth(insts, w.pc, sgpr, depth + 1);
             match (vs, vc) {
                 (Some(a), Some(b)) if a == b => Some(a),
                 _ => None,
@@ -594,7 +601,7 @@ fn sgpr_to_lane_vgpr(insts: &[Decoded], before_pc: u64, sgpr: u64) -> Option<u64
             if src >= 256 {
                 Some(src - 256)
             } else {
-                sgpr_to_lane_vgpr(insts, w.pc, src)
+                sgpr_to_lane_vgpr_depth(insts, w.pc, src, depth + 1)
             }
         }
         _ => None,
@@ -603,6 +610,13 @@ fn sgpr_to_lane_vgpr(insts: &[Decoded], before_pc: u64, sgpr: u64) -> Option<u64
 
 /// VGPR roots of a traced origin (Fetched x4 / uniform arms on Lanes|Select / LanePhi peel).
 fn lane_tsharp_from_source(insts: &[Decoded], src: &DescSource) -> [Option<u64>; 4] {
+    lane_tsharp_from_source_depth(insts, src, 0)
+}
+
+fn lane_tsharp_from_source_depth(insts: &[Decoded], src: &DescSource, depth: usize) -> [Option<u64>; 4] {
+    if depth >= MAX_TRACE_DEPTH {
+        return [None; 4];
+    }
     match src {
         DescSource::Fetched { load_pc, first, .. } => {
             let mut out = [None; 4];
@@ -629,14 +643,14 @@ fn lane_tsharp_from_source(insts: &[Decoded], src: &DescSource) -> [Option<u64>;
             out
         }
         DescSource::Lanes { set, clear, .. } | DescSource::Select { set, clear } => {
-            let s = lane_tsharp_from_source(insts, set);
-            let c = lane_tsharp_from_source(insts, clear);
+            let s = lane_tsharp_from_source_depth(insts, set, depth + 1);
+            let c = lane_tsharp_from_source_depth(insts, clear, depth + 1);
             merge_tsharp_uniform_arms(s, c)
         }
         DescSource::LanePhi { arms, .. } => {
             let live: Vec<_> = arms
                 .iter()
-                .filter_map(|a| a.as_ref().map(|s| lane_tsharp_from_source(insts, s)))
+                .filter_map(|a| a.as_ref().map(|s| lane_tsharp_from_source_depth(insts, s, depth + 1)))
                 .collect();
             match live.len() {
                 0 => [None; 4],
@@ -660,14 +674,21 @@ fn merge_tsharp_uniform_arms(a: [Option<u64>; 4], b: [Option<u64>; 4]) -> [Optio
 
 /// Fold `Loaded` table offsets into `Imm` heap indices with the access's descriptor stride.
 fn fold_select_heap_indices(src: DescSource, shift: u8) -> DescSource {
+    fold_select_heap_indices_depth(src, shift, 0)
+}
+
+fn fold_select_heap_indices_depth(src: DescSource, shift: u8, depth: usize) -> DescSource {
+    if depth >= MAX_TRACE_DEPTH {
+        return src;
+    }
     match src {
         DescSource::Loaded { offset, first, .. } => {
             let bytes = offset.saturating_add(4 * u32::from(first));
             DescSource::Imm(bytes >> shift)
         }
         DescSource::Select { set, clear } => DescSource::Select {
-            set: Box::new(fold_select_heap_indices(*set, shift)),
-            clear: Box::new(fold_select_heap_indices(*clear, shift)),
+            set: Box::new(fold_select_heap_indices_depth(*set, shift, depth + 1)),
+            clear: Box::new(fold_select_heap_indices_depth(*clear, shift, depth + 1)),
         },
         DescSource::Lanes {
             mask_sgpr,
@@ -675,8 +696,8 @@ fn fold_select_heap_indices(src: DescSource, shift: u8) -> DescSource {
             clear,
         } => DescSource::Lanes {
             mask_sgpr,
-            set: Box::new(fold_select_heap_indices(*set, shift)),
-            clear: Box::new(fold_select_heap_indices(*clear, shift)),
+            set: Box::new(fold_select_heap_indices_depth(*set, shift, depth + 1)),
+            clear: Box::new(fold_select_heap_indices_depth(*clear, shift, depth + 1)),
         },
         other => other,
     }
@@ -692,6 +713,19 @@ fn last_sgpr_writer<'a>(insts: &'a [Decoded], before_pc: u64, sgpr: u64) -> Opti
 
 /// Trace one half of an `s_cselect`/`s_cmov` operand back to a Loaded / Imm leaf.
 fn classify_select_arm(insts: &[Decoded], before_pc: u64, code: u64, shift: u8) -> Option<DescSource> {
+    classify_select_arm_depth(insts, before_pc, code, shift, 0)
+}
+
+fn classify_select_arm_depth(
+    insts: &[Decoded],
+    before_pc: u64,
+    code: u64,
+    shift: u8,
+    depth: usize,
+) -> Option<DescSource> {
+    if depth >= MAX_TRACE_DEPTH {
+        return None;
+    }
     if (128..=208).contains(&code) {
         let v = if code <= 192 {
             (code - 128) as u32
@@ -725,7 +759,7 @@ fn classify_select_arm(insts: &[Decoded], before_pc: u64, code: u64, shift: u8) 
     }
     if matches!(w.inst.name, "S_MOV_B32" | "S_MOV_B64") {
         let src = f(w, "SSRC0")?;
-        return classify_select_arm(insts, w.pc, src, shift);
+        return classify_select_arm_depth(insts, w.pc, src, shift, depth + 1);
     }
     // Known constant SGPR from a literal move earlier.
     if let Some(imm) = scalar_imm_at(insts, w.pc, code) {
@@ -821,6 +855,18 @@ fn collect_loads(src: &DescSource, loads: &mut BTreeSet<u64>) {
 
 /// Walk recent defs of `vgpr` to classify Fetched / Lanes / LanePhi / VgprDword0.
 fn classify_vgpr(insts: &[Decoded], vgpr: u64, only_edge: &BTreeMap<u64, u64>) -> DescSource {
+    classify_vgpr_depth(insts, vgpr, only_edge, 0)
+}
+
+fn classify_vgpr_depth(
+    insts: &[Decoded],
+    vgpr: u64,
+    only_edge: &BTreeMap<u64, u64>,
+    depth: usize,
+) -> DescSource {
+    if depth >= MAX_TRACE_DEPTH {
+        return DescSource::VgprDword0(vgpr);
+    }
     for d in insts.iter().rev() {
         let (_, w) = rdna2::vgpr_uses(d);
         if !w.contains(&vgpr) {
@@ -854,7 +900,7 @@ fn classify_vgpr(insts: &[Decoded], vgpr: u64, only_edge: &BTreeMap<u64, u64>) -
             };
             let resolve = |code: u64| -> DescSource {
                 if code >= 256 {
-                    classify_vgpr(insts, code - 256, only_edge)
+                    classify_vgpr_depth(insts, code - 256, only_edge, depth + 1)
                 } else if code < 106 {
                     DescSource::Loaded {
                         load_pc: d.pc,
@@ -881,7 +927,7 @@ fn classify_vgpr(insts: &[Decoded], vgpr: u64, only_edge: &BTreeMap<u64, u64>) -
         if name == "V_MOV_B32" {
             let src = f(d, "SRC0").unwrap_or(0);
             if src >= 256 {
-                return classify_vgpr(insts, src - 256, only_edge);
+                return classify_vgpr_depth(insts, src - 256, only_edge, depth + 1);
             }
         }
         if let Some(&pred_pc) = only_edge.get(&d.pc) {
@@ -893,6 +939,13 @@ fn classify_vgpr(insts: &[Decoded], vgpr: u64, only_edge: &BTreeMap<u64, u64>) -
 }
 
 fn heap_expr_from_source(src: &DescSource, sampler: bool) -> Option<LaneHeapExpr> {
+    heap_expr_from_source_depth(src, sampler, 0)
+}
+
+fn heap_expr_from_source_depth(src: &DescSource, sampler: bool, depth: usize) -> Option<LaneHeapExpr> {
+    if depth >= MAX_TRACE_DEPTH {
+        return None;
+    }
     let shift = if sampler { 4 } else { 5 };
     match src {
         DescSource::Fetched {
@@ -917,19 +970,19 @@ fn heap_expr_from_source(src: &DescSource, sampler: bool) -> Option<LaneHeapExpr
             clear,
         } => Some(LaneHeapExpr::Lanes {
             mask_sgpr: *mask_sgpr,
-            set: Box::new(heap_expr_from_source(set, sampler)?),
-            clear: Box::new(heap_expr_from_source(clear, sampler)?),
+            set: Box::new(heap_expr_from_source_depth(set, sampler, depth + 1)?),
+            clear: Box::new(heap_expr_from_source_depth(clear, sampler, depth + 1)?),
         }),
         DescSource::Select { set, clear } => Some(LaneHeapExpr::Select {
-            set: Box::new(heap_expr_from_source(set, sampler)?),
-            clear: Box::new(heap_expr_from_source(clear, sampler)?),
+            set: Box::new(heap_expr_from_source_depth(set, sampler, depth + 1)?),
+            clear: Box::new(heap_expr_from_source_depth(clear, sampler, depth + 1)?),
         }),
         DescSource::LanePhi { arms, .. } => {
             let mapped: Option<Vec<_>> = arms
                 .iter()
                 .map(|a| match a {
                     None => Some(None),
-                    Some(s) => heap_expr_from_source(s, sampler).map(Some),
+                    Some(s) => heap_expr_from_source_depth(s, sampler, depth + 1).map(Some),
                 })
                 .collect();
             Some(LaneHeapExpr::LanePhi { arms: mapped? })
