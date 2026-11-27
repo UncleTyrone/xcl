@@ -1046,6 +1046,13 @@ impl State {
                 s.reclaim_ring();
             }
             for &(dst, off, len) in pending.iter() {
+                if super::shadow::enabled() && super::land::enabled() {
+                    let card = std::slice::from_raw_parts(p.add(off), len);
+                    if unsafe { super::shadow::merge_if_covered(dst, card, len) }.is_some() {
+                        s.sync_sent_range(dst, len);
+                        continue;
+                    }
+                }
                 // copy only committed (non-hole) bytes
                 let mut at = dst;
                 let mut src_off = off;
@@ -1289,6 +1296,7 @@ pub(super) unsafe fn readback_after_execute_sync(queue: &ID3D12CommandQueue, ran
         let _ = s.queue.Wait(&s.rb_fence, v);
         super::list_x::note_internal_wait(s.queue.as_raw() as usize, "sparse readback behind a title queue", &s.rb_fence, v);
     }
+    super::shadow::declare_gpu_writes(&merged);
     s.readback_ranges(&merged);
     super::land::note_sparse_landed(&merged);
 }

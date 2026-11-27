@@ -226,6 +226,7 @@ pub fn note_sparse_landed(ranges: &[(usize, usize)]) {
         }
     }
     super::shadow::note_landed_ranges(ranges);
+    super::shadow::finish_gpu_writes(ranges);
 }
 
 /// Per-frame stats for the activity line.
