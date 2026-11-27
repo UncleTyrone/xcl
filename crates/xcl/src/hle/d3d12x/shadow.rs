@@ -363,6 +363,9 @@ impl Shadow {
             if t1 > title.len() || b > held.len() {
                 continue;
             }
+            if super::host::upcheck::on() {
+                super::host::upcheck::note(self.id, a, &held[a..b], &title[t0..t1]);
+            }
             held[a..b].copy_from_slice(&title[t0..t1]);
             bytes += b - a;
             if lo == (page * PAGE).max(start) && hi == ((page + 1) * PAGE).min(start + self.len as usize) {

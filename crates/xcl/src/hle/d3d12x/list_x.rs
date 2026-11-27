@@ -2782,6 +2782,14 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
     if d == s && dst < src + size && src < dst + size {
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) overlap"));
     }
+    if super::host::place::on() && !super::host::place::too_large(size as usize, false) {
+        super::host::place::note_copy(size as usize, false);
+        super::host::traffic::moved(
+            super::host::traffic::UP,
+            (dst, size),
+            std::iter::once((0, size as usize)),
+        );
+    }
     note_write(this as usize, dst, size);
     if d == s {
         // one window: one buffer cannot be in COPY_SOURCE and COPY_DEST at once (#958), so the

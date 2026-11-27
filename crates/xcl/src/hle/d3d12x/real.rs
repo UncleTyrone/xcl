@@ -9732,7 +9732,9 @@ pub(super) unsafe fn execute_mapped_lists(this: *mut c_void, mapped: &[*mut c_vo
             super::submit::pause_refresh(|| super::alloc_pool::wait_for_previous_submits(chunk));
         }
         let driver_prof = super::prof::span(super::prof::Kind::SubmitDriver);
+        let span = super::host::before_submit();
         super::submit::driver_execute(|| f(this, chunk.len() as u32, chunk.as_ptr()));
+        super::host::after_submit(span);
         drop(driver_prof);
         let _after = super::prof::span(super::prof::Kind::SubmitAfter);
         super::list_x::copy_scratch_submitted(this, chunk);
