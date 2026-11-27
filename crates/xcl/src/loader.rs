@@ -13,6 +13,7 @@ use windows_sys::Win32::System::Memory::{
 
 pub mod frame_rate;
 pub mod patch_insn;
+pub mod resolution;
 pub mod write_sites;
 
 use crate::modules::{self, MappedModule};
@@ -240,6 +241,7 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         crate::hle::d3d12x::descriptor_sites::install_on_main(base, size);
         unsafe { write_sites::apply_asked(&name, base, size) };
         unsafe { frame_rate::apply_if_asked(base, size) };
+        unsafe { resolution::apply_asked(base, size) };
     }
     Ok(module)
 }
