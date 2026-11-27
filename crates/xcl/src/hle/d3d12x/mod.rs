@@ -70,6 +70,7 @@ pub(crate) mod render_env;
 pub(crate) mod diag_env;
 pub(crate) mod faultbook;
 pub(crate) mod panel;
+pub(crate) mod host;
 pub(crate) mod partial_fill;
 pub(crate) mod bench_env;
 pub(crate) mod misc_env;

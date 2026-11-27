@@ -15,12 +15,14 @@
 //! | `List.commands` | `ListPayload` ops blob (`XLST` snapshot + draw/dispatch notes) |
 //! | `contents.bin` / `Content` | `ContentChunk` + `frames/frame_NNNN.contents.bin` |
 //! | Present picture / PresentX | Present plane tail + optional `XCL_REPLAY_PRESENT` re-issue |
-//! | Offline `victory replay` | Minimal `xcl replay <dir>` inspect CLI (no GPU player) |
+//! | Offline `victory replay` | `xcl replay` inspect + `--listing` / `--edit` / `--pixel` / `--diverge` |
+//! | `--pixel` / `--diverge` / edit | Offline `frame_tools` on wire blobs (no live GPU texel probe) |
 //!
 //! **Honest limits:** full cross-process list rehydration from payload bytes alone is not
 //! supported — Windows COM command-list handles and title GPU VAs are process-local. Same-process
 //! replay re-issues live lists when pointers remain readable. CGBJ-scale resource/PSO/descriptor
-//! snaps and offline command rebuild are still out of scope here.
+//! snaps and GPU multi-run diverge / live pixel probe remain out of scope; offline content/plane
+//! compare and ListPayload edit cover the product CLI surface.
 //!
 //! ### Environment (default off)
 //!

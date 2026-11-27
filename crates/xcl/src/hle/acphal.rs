@@ -469,6 +469,7 @@ pub unsafe extern "system" fn AcpHalAllocateShapeContexts(c: *mut ShapeContexts)
 
 /// AcpHalReleaseShapeContexts()
 pub unsafe extern "system" fn AcpHalReleaseShapeContexts() -> HRESULT {
+    crate::hle::shape_xma::on_shape_released();
     let arrays = std::mem::take(&mut *SHAPE.lock().unwrap());
     for a in arrays.into_iter().filter(|&a| a != 0) {
         ApuFree(a as *mut c_void);
@@ -582,6 +583,11 @@ unsafe extern "system" fn hal_submit(h: *mut Hal, kind: u32, id: u64, frame: u32
             crate::xlog_info!("acphal: audio processor command {kind:#x} first seen");
         }
     }
+    let word = |at: usize| -> Option<u32> {
+        (!data.is_null() && (at + 1) * 4 <= size as usize)
+            .then(|| data.cast::<u32>().add(at).read_unaligned())
+    };
+    let _ = crate::hle::shape_xma::command(kind, word);
     if (*h).channel.lock().unwrap().submit(id) {
         S_OK
     } else {
