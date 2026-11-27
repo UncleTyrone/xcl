@@ -298,22 +298,13 @@ unsafe fn check_uma_import(device: &ID3D12Device, u: &crate::gpu::uma::Uma, bufs
     Ok(format!("ok, {} window(s), {} µs", probes.len(), t0.elapsed().as_micros()))
 }
 
-unsafe fn open_uma(device: &ID3D12Device, allow_driver_remap: bool) {
+unsafe fn open_uma(device: &ID3D12Device) {
     let Some(u) = crate::gpu::uma::get() else {
         *UMA_ERROR.lock().unwrap() = "no UMA region".into();
         return;
     };
     let open = |k: usize| -> Result<(usize, u64, usize), String> {
         let (base, size) = u.window(k);
-        if allow_driver_remap && super::uma_driver::wanted(device) {
-            match super::uma_driver::remake(device, base, size) {
-                Ok((heap, buf)) => {
-                    u.set_driver_window(k);
-                    return Ok(super::uma_driver::raw(heap, buf));
-                }
-                Err(e) => crate::xlog_warn!("D3D12.X: coherent window {k} stays imported: {e}"),
-            }
-        }
         let dev3: ID3D12Device3 = device.cast().map_err(|e| format!("ID3D12Device3: {e}"))?;
         let heap: ID3D12Heap = dev3.OpenExistingHeapFromAddress(base as *const c_void).map_err(|e| format!("OpenExistingHeapFromAddress (window {k}): {e}"))?;
         let desc = D3D12_RESOURCE_DESC {
@@ -500,10 +491,6 @@ fn graphics_wave32(device: *mut c_void) -> bool {
 /// by default the high-performance GPU → WARP); once – later calls
 /// return the existing device's adapter.
 pub fn init() -> Result<String, String> {
-    init_with_remap(false)
-}
-
-pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String> {
     if !device_raw().is_null() {
         return Ok(ADAPTER.lock().map(|a| a.clone()).unwrap_or_default());
     }
@@ -548,7 +535,11 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI: {e}"))?;
         let mut device: Option<ID3D12Device> = None;
         let mut name = String::new();
-        let sel = crate::gpu::adapter::Selector::from_env_or(&cfg.d3d12_adapter);
+        let mut vram_mb = 0u64; // 0 = unknown (WARP)
+        let mut sel = crate::gpu::adapter::Selector::from_env_or(&cfg.d3d12_adapter);
+        if super::d3d12_boot::force_warp() {
+            sel = crate::gpu::adapter::Selector::Warp;
+        }
         if sel != crate::gpu::adapter::Selector::Warp {
             let mut list = crate::gpu::adapter::candidates(&factory, &sel);
             if list.is_empty() {
@@ -560,6 +551,8 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
                     super::gpu_awake::start(&dev, desc.VendorId);
                     device = Some(dev);
                     name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
+                    vram_mb = (desc.DedicatedVideoMemory >> 20) as u64;
+                    super::session::set_dedicated_vram_mb(vram_mb);
                     break;
                 }
             }
@@ -574,6 +567,12 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
                 d
             }
         };
+        // the resolved `title_memory_mb` is the console's budget unless the user set another one
+        let explicit = cfg.title_memory_mb != cfg.console_title_memory_mb();
+        if let Some(w) = title_memory_over_vram_warning(cfg.title_memory_budget_mb(), vram_mb, explicit) {
+            crate::xlog_warn!("{w}");
+        }
+        super::d3d12_boot::apply_device_boot(&device, debug);
         if debug {
             // the debug layer's messages into XCL's log (they otherwise go to a debugger only)
             if let Ok(q) = device.cast::<ID3D12InfoQueue1>() {
@@ -581,13 +580,58 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
                 let _ = q.RegisterMessageCallback(Some(debug_message), D3D12_MESSAGE_CALLBACK_FLAG_NONE, std::ptr::null_mut(), &mut cookie);
             }
         }
-        open_uma(&device, allow_driver_remap);
+        open_uma(&device);
         super::device_x::probe_dynamic_depth_bias(&device);
         let raw = device.into_raw(); // one reference kept for the process lifetime
         adopt(raw, Kind::Device);
         DEVICE.store(raw as usize, Ordering::Release);
         *ADAPTER.lock().unwrap() = name.clone();
         Ok(name)
+    }
+}
+
+/// The startup warning when the console's default title memory budget (`title_memory_mb = 0`)
+/// is larger than the adapter's dedicated video memory: the title plans its streaming against
+/// that budget and can run the GPU out of memory long after the start. `None` for a budget
+/// the user set, for enough VRAM and for an unknown VRAM (0, WARP). Nothing is clamped.
+fn title_memory_over_vram_warning(budget_mb: u64, vram_mb: u64, explicit: bool) -> Option<String> {
+    if explicit || vram_mb == 0 || budget_mb <= vram_mb {
+        return None;
+    }
+    Some(format!(
+        "title memory budget {budget_mb} MiB (the console's) is larger than the GPU's {vram_mb} MiB of dedicated video memory: \
+         the title may plan its streaming beyond what fits; set `title_memory_mb` in xcl.toml (e.g. {}) to lower it",
+        vram_mb * 3 / 4
+    ))
+}
+
+#[cfg(test)]
+mod title_memory_warning_tests {
+    use super::title_memory_over_vram_warning as warn;
+
+    #[test]
+    fn the_default_budget_over_the_vram_warns_with_both_numbers_and_the_setting() {
+        let w = warn(13_824, 12_282, false).expect("Series X budget on a 12 GB GPU");
+        assert!(w.contains("13824") && w.contains("12282") && w.contains("title_memory_mb"), "{w}");
+    }
+
+    #[test]
+    fn a_budget_the_user_set_never_warns() {
+        assert_eq!(warn(13_824, 8_192, true), None);
+        assert_eq!(warn(20_000, 8_192, true), None);
+    }
+
+    #[test]
+    fn enough_or_unknown_vram_does_not_warn() {
+        assert_eq!(warn(13_824, 16_303, false), None);
+        assert_eq!(warn(13_824, 13_824, false), None);
+        assert_eq!(warn(13_824, 0, false), None);
+    }
+
+    #[test]
+    fn the_series_s_budget_warns_on_a_smaller_gpu_only() {
+        assert!(warn(8_192, 6_144, false).is_some());
+        assert_eq!(warn(8_192, 12_282, false), None);
     }
 }
 
@@ -1435,12 +1479,9 @@ unsafe fn place_console_buffer_sparse(this: *mut c_void, d: &D3D12_RESOURCE_DESC
 
 /// Sanitize a console buffer description and initial state for placement in a coherent
 /// cross-adapter UMA heap (`OpenExistingHeapFromAddress`).
-fn sanitize_coherent_buffer(desc: &D3D12_RESOURCE_DESC, state: usize, cross_adapter: bool) -> (D3D12_RESOURCE_DESC, u32) {
+fn sanitize_coherent_buffer(desc: &D3D12_RESOURCE_DESC, state: usize) -> (D3D12_RESOURCE_DESC, u32) {
     let mut d = *desc;
-    d.Flags = D3D12_RESOURCE_FLAGS(d.Flags.0 & 0xFF);
-    if cross_adapter {
-        d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
-    }
+    d.Flags = D3D12_RESOURCE_FLAGS(d.Flags.0 & 0xFF) | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
     d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     d.Alignment = 0;
     (d, state as u32 & PC_RESOURCE_STATES)
@@ -1477,8 +1518,8 @@ unsafe fn place_console_buffer(this: *mut c_void, props: usize, desc: usize, sta
         return None;
     };
     // the heap from OpenExistingHeapFromAddress is cross-adapter: row-major + sanitized flags & state
+    let (d, st) = sanitize_coherent_buffer(&d, state);
     let k = u.window_of(p)?;
-    let (d, st) = sanitize_coherent_buffer(&d, state, !u.is_driver_window(k));
     let heap = (*UMA_HEAPS.lock().unwrap().get(k)?)?;
     let hr = dev_create_placed_resource(this, heap, p - u.window(k).0, &d as *const _ as usize, st as usize, clear, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
@@ -1547,9 +1588,7 @@ pub(super) unsafe fn place_at_title_address(this: *mut c_void, va: usize, desc: 
         return Some(hr);
     }
     let heap = (*UMA_HEAPS.lock().unwrap().get(k)?)?;
-    if !u.is_driver_window(k) {
-        d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
-    }
+    d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
     d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     d.Alignment = 0;
     d.Width = (delta + bytes) as u64;
@@ -4475,6 +4514,10 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if !is_console(cs) {
         return None;
     }
+    let record = crate::gpu::shader::fnv64(cs);
+    if crate::gpu::shader_env::defrag_off() && record == crate::gpu::shader_env::DEFRAG_SHADER_HASH {
+        return None;
+    }
     // made when first bound (`pso_async::lazy`): not even translated now
     if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
         return Some(Err(()));
@@ -4494,7 +4537,6 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if big && crate::gpu::recomp::dxc::defer() {
         return Some(Err(()));
     }
-    let record = crate::gpu::shader::fnv64(cs);
     let warm = compiled.dispatch_chain.as_ref().and_then(|_| {
         let rs = abi_rs_for(this, &compiled.samplers)?;
         let result = compute_container(this, f, d, rs, &dxil, record, riid, ppv, ComputeBuild::CachedWhole);
@@ -6379,12 +6421,23 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     }
     if let Some(a) = as_slot {
         let types: Vec<u32> = subs.iter().map(|s| s.0).collect();
+        // Refused, the title got no pipeline. Its shader pack may have no amplification
+        // programs – what sits in the AS slot is another mesh-stage container – so the pipeline
+        // is made from the MS slot alone: it exists (the title goes on), what it draws may be wrong.
         note_translation_error(format!(
-            "mesh pipeline with AS {:016x} (MS {:016x}) – not supported yet; subobjects {types:?}",
+            "mesh pipeline with AS {:016x} (MS {:016x}) – the AS slot is ignored; subobjects {types:?}",
             crate::gpu::shader::fnv64(a),
             crate::gpu::shader::fnv64(ms)
         ));
-        return Some(E_INVALIDARG);
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            crate::xlog_warn!(
+                "D3D12.X: mesh pipeline with a shader in the AS slot ({} B, console: {}) – made from its MS slot only ({} B)",
+                a.len(),
+                is_console(a),
+                ms.len()
+            );
+        }
     }
     // made when first bound (`pso_async::lazy`): not even translated now
     if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
@@ -7227,6 +7280,13 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
 /// A stand-in pipeline is bound as its real pipeline once that is built (compute: waited for at its use).
 /// SetPipelineState on the PC list (a pipeline still building in the background: its stand-in)
 pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
+    let _ = (
+        crate::gpu::shader_env::skip_pipelines(),
+        super::root_env::rt_resolve(),
+        crate::gpu::shader_env::shader_save_dir(),
+        crate::gpu::shader_env::shader_census_path(),
+        crate::gpu::shader_env::shader_loop_limit(),
+    );
     cl_set_pipeline_state(this, pso)
 }
 
@@ -7333,9 +7393,10 @@ pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
 }
 
 unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
-    // (lists may still hold recordings on it that the title submits again: `alloc_pool`)
+    // (lists may still hold recordings on it that the title submits again: `alloc_pool`, which
+    // also gives back what recordings on its PC allocators used once the GPU is done with them)
     let hr = match super::alloc_pool::title_reset(this) {
-        Some(hr) => hr,
+        Some(hr) => return hr,
         None => reset_pc_allocator(this),
     };
     if hr >= 0 {
@@ -8007,7 +8068,7 @@ mod readback_routing_tests {
         };
         let console_state = 0x0010_0000usize | (D3D12_RESOURCE_STATE_COPY_DEST.0 as usize);
 
-        let (clean, st) = sanitize_coherent_buffer(&raw_desc, console_state, true);
+        let (clean, st) = sanitize_coherent_buffer(&raw_desc, console_state);
         assert_eq!(clean.Alignment, 0);
         assert_eq!(clean.Layout, D3D12_TEXTURE_LAYOUT_ROW_MAJOR);
         assert_eq!(

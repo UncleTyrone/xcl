@@ -16,6 +16,36 @@ pub fn data_root() -> PathBuf {
     PathBuf::from(base).join("XCL")
 }
 
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+/// `XCL_DATA_DIR` / `VICTORY_DATA_DIR`: per-title data directory (overrides `%XCL_DATA_ROOT%\<title>`).
+pub fn data_dir_override() -> Option<PathBuf> {
+    env_path("XCL_DATA_DIR").or_else(|| env_path("VICTORY_DATA_DIR"))
+}
+
+/// `XCL_CACHE_DIR` / `VICTORY_CACHE_DIR`: cache directory (default `<data>/cache`).
+pub fn cache_dir_for(data: &Path) -> PathBuf {
+    static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if let Some(p) = env_path("XCL_CACHE_DIR").or_else(|| env_path("VICTORY_CACHE_DIR")) {
+        LOGGED.get_or_init(|| crate::xlog_info!("launcher: XCL_CACHE_DIR={}", p.display()));
+        p
+    } else {
+        data.join("cache")
+    }
+}
+
+/// `XCL_CONFIG` / `VICTORY_CONFIG`: explicit config file (`xcl.toml` by default under data).
+pub fn config_path_override() -> Option<PathBuf> {
+    env_path("XCL_CONFIG").or_else(|| env_path("VICTORY_CONFIG"))
+}
+
+/// `XCL_GAME_DIR` / `VICTORY_GAME_DIR`: explicit game package root.
+pub fn game_dir_override() -> Option<PathBuf> {
+    env_path("XCL_GAME_DIR").or_else(|| env_path("VICTORY_GAME_DIR"))
+}
+
 /// Values of `attr` on every `<tag …>` element (so "<Executable" != "<ExecutableList").
 pub(crate) fn xml_attrs(xml: &str, tag: &str, attr: &str) -> Vec<String> {
     let open = format!("<{tag}");
@@ -302,8 +332,17 @@ fn run_with_ui(target: &Path, args: &[String], menu: bool) -> i32 {
             return 2;
         }
     };
-    let data_dir = data_root().join(&title);
-    let mut config = match Config::load_or_create(&data_dir.join("xcl.toml")) {
+    let data_dir = data_dir_override().unwrap_or_else(|| data_root().join(&title));
+  if data_dir_override().is_some() {
+        static LOG_DATA: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        LOG_DATA.get_or_init(|| crate::xlog_info!("launcher: XCL_DATA_DIR={}", data_dir.display()));
+    }
+    let config_path = config_path_override().unwrap_or_else(|| data_dir.join("xcl.toml"));
+    if config_path_override().is_some() {
+        static LOG_CFG: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        LOG_CFG.get_or_init(|| crate::xlog_info!("launcher: XCL_CONFIG={}", config_path.display()));
+    }
+    let mut config = match Config::load_or_create(&config_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("xcl: error in xcl.toml: {e}");
@@ -326,9 +365,11 @@ fn run_with_ui(target: &Path, args: &[String], menu: bool) -> i32 {
             }
         }
     };
-    for d in ["logs", "cache", "overlay", "saves", "pls", "temp"] {
+    let cache = cache_dir_for(&data_dir);
+    for d in ["logs", "overlay", "saves", "pls", "temp"] {
         let _ = std::fs::create_dir_all(data_dir.join(d));
     }
+    let _ = std::fs::create_dir_all(&cache);
     config.exe = exe.strip_prefix(&root).ok().or(exe.file_name().map(Path::new)).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     let device_override = if let Ok(raw) = std::env::var("XCL_DEVICE_TYPE") {
         if !raw.trim().is_empty() {
@@ -347,9 +388,20 @@ fn run_with_ui(target: &Path, args: &[String], menu: bool) -> i32 {
     };
     let manifest = crate::manifest::load(&root);
     let from_manifest = config.resolve(manifest.as_ref());
-    crate::tls::cleanup_cache(&data_dir.join("cache"));
-    let boot = Boot { title: title.clone(), exe_path: exe.clone(), game_root: root.clone(), data_dir: data_dir.clone(), config };
-    let boot_path = data_dir.join("cache").join("boot.json");
+    crate::tls::cleanup_cache(&cache);
+    let game_root = game_dir_override().unwrap_or(root.clone());
+    if game_dir_override().is_some() {
+        static LOG_GAME: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        LOG_GAME.get_or_init(|| crate::xlog_info!("launcher: XCL_GAME_DIR={}", game_root.display()));
+    }
+    let boot = Boot {
+        title: title.clone(),
+        exe_path: exe.clone(),
+        game_root: game_root.clone(),
+        data_dir: data_dir.clone(),
+        config,
+    };
+    let boot_path = cache.join("boot.json");
     if let Err(e) = std::fs::write(&boot_path, serde_json::to_string_pretty(&boot).unwrap()) {
         eprintln!("xcl: writing {}: {e}", boot_path.display());
         return 2;

@@ -1,21 +1,26 @@
 //! Retail BCPack chunks decoded by XCL against a reference decoder's blocks.
-//! Set `XCL_SAMPLE_BCPACK` to a directory of `<name>.bc<N>` + `<name>.vic<N>` files;
-//! without it the test does nothing.
+//! Set `XCL_BCPACK_CASES`, `VICTORY_BCPACK_CASES`, or `XCL_SAMPLE_BCPACK` to a directory of
+//! `<name>.bc<N>` + `<name>.vic<N>` (or `.out`) files; without it the test does nothing.
+//! Optional `XCL_BCPACK_TABLES` / `VICTORY_BCPACK_TABLES` selects the constant tables file.
 
 #[test]
 fn retail_chunks_match_the_reference() {
-    let Some(dir) = std::env::var_os("XCL_SAMPLE_BCPACK") else { return };
-    let dir = std::path::Path::new(&dir);
-    let entries = std::fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("XCL_SAMPLE_BCPACK {}: {e}", dir.display()));
+    let Some(dir) = xcl::hle::bcpack::env::cases_dir() else {
+        return;
+    };
+    let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
     let mut cases = 0;
     let mut identical = 0;
     let mut bad_bytes = 0u64;
     let mut total_bytes = 0u64;
     for entry in entries {
         let path = entry.unwrap().path();
-        let Some(ext) = path.extension().and_then(|e| e.to_str()) else { continue };
-        let Some(mode) = ext.strip_prefix("bc").and_then(|m| m.parse::<u8>().ok()) else { continue };
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        let Some(mode) = ext.strip_prefix("bc").and_then(|m| m.parse::<u8>().ok()) else {
+            continue;
+        };
         let vic = path.with_extension(format!("vic{mode}"));
         let src = std::fs::read(&path).unwrap();
         let want = if vic.exists() {
@@ -38,7 +43,11 @@ fn retail_chunks_match_the_reference() {
         } else {
             let n = got.iter().zip(&want).filter(|(a, b)| a != b).count();
             bad_bytes += n as u64;
-            println!("{}: mode {mode}, {n} of {} bytes differ", path.file_name().unwrap().to_string_lossy(), want.len());
+            println!(
+                "{}: mode {mode}, {n} of {} bytes differ",
+                path.file_name().unwrap().to_string_lossy(),
+                want.len()
+            );
         }
     }
     println!(

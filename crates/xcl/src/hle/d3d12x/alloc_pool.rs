@@ -67,10 +67,23 @@ unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
-/// `XCL_ALLOC_SWAP=0` turns it off.
+/// `XCL_ALLOC_SWAP=0` turns it off. Also respects `XCL_LIST_POOL=0` (no recycling).
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !std::env::var("XCL_ALLOC_SWAP").is_ok_and(|v| v.trim() == "0"))
+    *ON.get_or_init(|| {
+        let swap = !std::env::var("XCL_ALLOC_SWAP").is_ok_and(|v| v.trim() == "0");
+        swap && super::render_env::list_pool()
+    })
+}
+
+/// Cap on idle / put-aside allocator stand-ins (`XCL_LIST_IDLE_MOST`).
+fn idle_most() -> usize {
+    super::render_env::list_idle_most()
+}
+
+/// Whether idle stand-ins may be trimmed (`XCL_LIST_IDLE_TRIM_S`).
+fn idle_trim_ms() -> u64 {
+    super::render_env::list_idle_trim_ms()
 }
 
 fn move_list(s: &mut State, list: usize, backing: usize) {
@@ -378,7 +391,16 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
             raw as usize
         }
     };
-    s.aside.entry(a).or_default().push(c);
+    {
+        let aside = s.aside.entry(a).or_default();
+        aside.push(c);
+        let cap = idle_most();
+        if aside.len() > cap {
+            let drop_n = aside.len() - cap;
+            aside.drain(0..drop_n);
+        }
+        let _ = idle_trim_ms(); // latch lived; full time-based trim lands with list-pool recycle
+    }
     s.cur.insert(a, next);
     s.swaps += 1;
     if s.swaps.is_power_of_two() {

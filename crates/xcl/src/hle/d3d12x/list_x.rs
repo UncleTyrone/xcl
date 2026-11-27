@@ -4059,7 +4059,11 @@ pub(super) unsafe fn pc_heaps(n: u32, heaps: *const usize) -> Vec<Option<ID3D12D
 /// shader-visible view and sampler heaps to be bound even if the title bound 0 heaps (or only a
 /// view heap with 0 sampler heaps).
 pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
-    let view = if crate::gpu::recomp::pso::heap_windows() {
+    if !super::render_env::lent_heap() && !crate::gpu::recomp::pso::heap_windows() {
+        return;
+    }
+    let _ = super::render_env::list_views();
+    let view = if crate::gpu::recomp::pso::heap_windows() || super::render_env::lent_heap() {
         super::console_heap::global_heap()
     } else {
         None

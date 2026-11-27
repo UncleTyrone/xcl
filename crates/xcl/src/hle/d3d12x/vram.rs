@@ -1341,7 +1341,13 @@ pub unsafe fn place_pages(
         return None;
     }
     // (one slice: the tiles of an array's packed levels are not asked about here)
-    let lazy = level_pages() && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.DepthOrArraySize == 1 && desc.SampleDesc.Count == 1 && desc.Flags == D3D12_RESOURCE_FLAG_NONE;
+    let big_enough = console_bytes.map_or(true, |b| b >= super::render_env::levels_min_bytes());
+    let lazy = level_pages()
+        && big_enough
+        && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && desc.DepthOrArraySize == 1
+        && desc.SampleDesc.Count == 1
+        && desc.Flags == D3D12_RESOURCE_FLAG_NONE;
     place_on_pages(dev, this, va, desc, state, clear, console_bytes, false, lazy, riid, ppv)
 }
 

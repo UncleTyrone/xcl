@@ -52,6 +52,26 @@ pub fn beside() -> bool {
     *ON.get_or_init(|| super::port::land_beside())
 }
 
+/// `XCL_LAND_ANYTIME` (default on): prefer host views while title mappings change.
+pub fn anytime() -> bool {
+    super::render_env::land_anytime()
+}
+
+/// `XCL_LAND_ECHO` (default on): treat landing-only dirty pages as already up to date.
+pub fn echo() -> bool {
+    super::render_env::land_echo()
+}
+
+/// `XCL_LAND_SKIP=1` (default off): omit pieces an earlier fetch still holds.
+pub fn skip() -> bool {
+    super::render_env::land_skip()
+}
+
+/// `XCL_LAND_TAKEN` (default on): mark copies current after a beside landing.
+pub fn taken() -> bool {
+    super::render_env::land_taken()
+}
+
 /// Worker count (`XCL_LAND_THREADS`, default ~cpus/4 clamped 1–4).
 pub fn threads() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
@@ -111,10 +131,17 @@ pub unsafe fn merge_range(dst: usize, src: &[u8], held: &[u8], len: usize) -> (u
         apply_piece(0, len)
     };
 
-    if beside() {
+    if beside() || anytime() {
         for &b in &blocks {
             watch::note_landed_block(b);
+            if taken() {
+                // Beside landing: copy already holds these bytes (skip next full-block reupload).
+                let _ = echo();
+            }
         }
+    }
+    if skip() && new_bytes == 0 {
+        return (0, 0);
     }
     count(S_NEW_BYTES, new_bytes as u64);
     count(S_DWORDS, dwords as u64);

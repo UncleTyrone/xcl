@@ -147,18 +147,64 @@ enum DstorageIo {
 fn dstorage_io() -> DstorageIo {
     static IO: OnceLock<DstorageIo> = OnceLock::new();
     *IO.get_or_init(|| {
-        let io = match std::env::var("XCL_DSTORAGE_IO").ok().as_deref().map(str::trim) {
-            Some("one") => DstorageIo::One,
-            Some("handles") => DstorageIo::Handles,
-            Some("overlapped") => DstorageIo::Overlapped,
-            Some("direct") => DstorageIo::Direct,
-            _ => DstorageIo::Handles,
+        let io = match std::env::var("XCL_DSTORAGE_IO") {
+            Ok(ref v) => match v.trim() {
+                "one" => DstorageIo::One,
+                "handles" => DstorageIo::Handles,
+                "overlapped" => DstorageIo::Overlapped,
+                "direct" => DstorageIo::Direct,
+                _ => DstorageIo::Handles,
+            },
+            Err(_) => DstorageIo::Handles,
         };
         if std::env::var_os("XCL_DSTORAGE_IO").is_some() {
             crate::xlog_info!("dstorage: XCL_DSTORAGE_IO={io:?}");
         }
         io
     })
+}
+
+fn dstorage_trace_level() -> u8 {
+    static L: OnceLock<u8> = OnceLock::new();
+    *L.get_or_init(|| {
+        std::env::var("XCL_DSTORAGE_TRACE")
+            .or_else(|_| std::env::var("VICTORY_DSTORAGE_TRACE"))
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+fn dstorage_stream_log_path() -> Option<std::path::PathBuf> {
+    static PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let path = std::env::var_os("XCL_DSTORAGE_LOG").or_else(|| std::env::var_os("VICTORY_DSTORAGE_LOG"))?;
+        let p = std::path::PathBuf::from(path);
+        crate::xlog_info!("dstorage: XCL_DSTORAGE_LOG={}", p.display());
+        Some(p)
+    })
+    .clone()
+}
+
+fn note_dstorage_request(seq: u64, lane: usize) {
+    let trace = dstorage_trace_level();
+    let log = dstorage_stream_log_path();
+    if trace == 0 && log.is_none() {
+        return;
+    }
+    if trace >= 1 {
+        static SEEN: OnceLock<()> = OnceLock::new();
+        SEEN.get_or_init(|| crate::xlog_info!("dstorage: XCL_DSTORAGE_TRACE={trace}"));
+        if trace >= 2 {
+            crate::xlog_info!("dstorage trace: lane {lane} request #{seq}");
+        }
+    }
+    if let Some(path) = log {
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open(&path).and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, "R\t{lane}\t{seq}")
+        });
+    }
 }
 
 fn same(a: &GUID, b: &GUID) -> bool {
@@ -1298,6 +1344,7 @@ impl QueueInner {
             let seq = p.next_seq;
             p.next_seq += 1;
             p.entries.push(entry(seq));
+            note_dstorage_request(seq, Arc::as_ptr(self) as usize);
             p.entries.len()
         };
         if n >= (self.capacity / 2).max(1) {

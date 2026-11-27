@@ -100,8 +100,49 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static WOKE: std::sync::Condvar = std::sync::Condvar::new();
 static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 
+/// Queued submissions allowed when a submit returns (`XCL_SUBMIT_DEPTH`; default 64).
+pub fn submit_depth() -> usize {
+    static MOST: OnceLock<usize> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        let n = std::env::var("XCL_SUBMIT_DEPTH")
+            .or_else(|_| std::env::var("VICTORY_SUBMIT_DEPTH"))
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(64)
+            .max(1);
+        if std::env::var_os("XCL_SUBMIT_DEPTH")
+            .or_else(|| std::env::var_os("VICTORY_SUBMIT_DEPTH"))
+            .is_some()
+        {
+            crate::xlog_info!("D3D12.X: XCL_SUBMIT_DEPTH={n}");
+        }
+        n
+    })
+}
+
+/// Presents that may sit in the async line (`XCL_SUBMIT_FRAMES`; default 1).
+pub fn submit_frames() -> usize {
+    static MOST: OnceLock<usize> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        let n = std::env::var("XCL_SUBMIT_FRAMES")
+            .or_else(|_| std::env::var("VICTORY_SUBMIT_FRAMES"))
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1);
+        if std::env::var_os("XCL_SUBMIT_FRAMES")
+            .or_else(|| std::env::var_os("VICTORY_SUBMIT_FRAMES"))
+            .is_some()
+        {
+            crate::xlog_info!("D3D12.X: XCL_SUBMIT_FRAMES={n}");
+        }
+        n
+    })
+}
+
 pub fn frames_cap() -> u32 {
-    super::port::frames_ahead()
+    let ahead = super::port::frames_ahead();
+    let frames = submit_frames() as u32;
+    ahead.max(frames).clamp(1, 8)
 }
 
 pub fn present_behind() -> u64 {
@@ -113,6 +154,10 @@ pub fn note_present_queued() {
 }
 
 pub fn note_submit_done() {
+    if super::session::card_spans() {
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        ONCE.get_or_init(|| crate::xlog_info!("D3D12.X: XCL_CARD_SPANS=1 — submission GPU timing stamps enabled"));
+    }
     let before = IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
     let v = before.saturating_sub(1);
     let cap = frames_cap() as u64;
@@ -126,6 +171,7 @@ pub fn present_may_queue() -> bool {
 }
 
 pub fn wait_present_room() {
+    let _ = submit_depth();
     let cap = frames_cap() as u64;
     if cap <= 1 {
         return;
@@ -133,4 +179,9 @@ pub fn wait_present_room() {
     while present_behind() >= cap {
         std::thread::sleep(std::time::Duration::from_micros(500));
     }
+}
+
+/// Whether the async submit queue still has room under [`submit_depth`].
+pub fn submit_has_room(queued: usize) -> bool {
+    queued < submit_depth()
 }

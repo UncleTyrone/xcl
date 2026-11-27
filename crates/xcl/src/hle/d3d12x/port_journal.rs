@@ -120,9 +120,24 @@ fn start_sync_thread() {
             .name("xcl-heap-sync".into())
             .spawn(|| {
                 loop {
+                    let early = super::render_env::heap_sync_early();
                     let mut r = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
                     while r.0 == r.1 {
-                        r = SYNC_ROUNDS.1.wait(r).unwrap_or_else(|e| e.into_inner());
+                        match early {
+                            Some(d) => {
+                                let (guard, wait) = SYNC_ROUNDS.1.wait_timeout(r, d).unwrap_or_else(|e| e.into_inner());
+                                r = guard;
+                                if wait.timed_out() && r.0 == r.1 {
+                                    // Early round while the submit lane has not asked yet.
+                                    r.0 = r.0.max(1);
+                                    STATS[EARLY_ROUNDS].fetch_add(1, Relaxed);
+                                    break;
+                                }
+                            }
+                            None => {
+                                r = SYNC_ROUNDS.1.wait(r).unwrap_or_else(|e| e.into_inner());
+                            }
+                        }
                     }
                     drop(r);
                     let _ = std::panic::catch_unwind(sync_heap_records_round);

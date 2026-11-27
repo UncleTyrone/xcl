@@ -237,6 +237,23 @@ const STAGING_POOL_DEFAULT_CAP: u64 = 256 << 20;
 const STAGING_IDLE_MS: u64 = 2_000;
 const STAGING_IDLE_FRAMES: u64 = 30;
 
+/// `XCL_STAGING_IDLE_MS` overrides free-memory idle reclaim; floored at 2 s.
+fn staging_idle_threshold_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        let over = std::env::var("XCL_STAGING_IDLE_MS")
+            .or_else(|_| std::env::var("VICTORY_STAGING_IDLE_MS"))
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        if let Some(ms) = over {
+            crate::xlog_info!("D3D12.X: XCL_STAGING_IDLE_MS={ms}");
+            ms.max(2_000)
+        } else {
+            STAGING_IDLE_MS
+        }
+    })
+}
+
 static CURRENT_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn monotonic_ms() -> u64 {
@@ -343,7 +360,7 @@ impl<T> StagingPool<T> {
                 list.clear();
             } else {
                 list.retain(|e| {
-                    let ms_idle = now_ms.saturating_sub(e.last_ms) >= STAGING_IDLE_MS;
+                    let ms_idle = now_ms.saturating_sub(e.last_ms) >= staging_idle_threshold_ms();
                     let fr_idle = frame.saturating_sub(e.last_frame) >= STAGING_IDLE_FRAMES;
                     !(ms_idle && fr_idle)
                 });
@@ -498,7 +515,7 @@ pub fn trim_idle_staging(frame: u64, low_commit: bool) {
         if let Some(map) = ups.as_mut() {
             for up in map.values_mut() {
                 let Some((_, _, cap)) = up.staging else { continue };
-                let idle = now_ms.saturating_sub(up.last_used_ms) >= STAGING_IDLE_MS
+                let idle = now_ms.saturating_sub(up.last_used_ms) >= staging_idle_threshold_ms()
                     && frame.saturating_sub(up.last_used_frame) >= STAGING_IDLE_FRAMES;
                 let shrink_low = low_commit && cap > STAGING_MIN;
                 if idle || shrink_low {

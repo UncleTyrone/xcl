@@ -20,6 +20,11 @@ pub fn join_parts() -> usize {
     })
 }
 
+/// Max lists in one thin join batch (`XCL_JOIN_LISTS`, default 48).
+pub fn join_lists() -> usize {
+    super::pipeline_env::join_lists()
+}
+
 /// When thin: do not build or submit prelude lists from KickoffX (join at ExecuteCommandLists).
 pub fn defer_kickoff_prelude() -> bool {
     enabled()
@@ -61,24 +66,32 @@ pub unsafe fn map_lists(lists: &[*mut c_void]) -> Vec<*mut c_void> {
         }
         return mapped;
     }
+    let cap = join_lists().min(n);
     static LOGGED: OnceLock<()> = OnceLock::new();
     LOGGED.get_or_init(|| {
         crate::xlog_info!(
-            "D3D12.X: thin translate join ({n} lists, {} workers)",
+            "D3D12.X: thin translate join ({n} lists, {} workers, JOIN_LISTS={cap})",
             super::join::parts()
         );
     });
-    let titles: Vec<usize> = lists.iter().map(|&p| p as usize).collect();
-    let chunks: Vec<Vec<usize>> = super::join::parallel_collect(n, |i| {
-        let mut segs = Vec::new();
-        // SAFETY: list pointers stay live until ExecuteCommandLists returns; each index is distinct.
-        let list = titles[i] as *mut c_void;
-        unsafe { push_one(list, &mut segs) };
-        segs.into_iter().map(|p| p as usize).collect()
-    });
     let mut mapped = Vec::new();
-    for segs in chunks {
-        mapped.extend(segs.into_iter().map(|p| p as *mut c_void));
+    let mut offset = 0usize;
+    while offset < n {
+        let end = (offset + cap).min(n);
+        let batch = &lists[offset..end];
+        let bn = batch.len();
+        let titles: Vec<usize> = batch.iter().map(|&p| p as usize).collect();
+        let chunks: Vec<Vec<usize>> = super::join::parallel_collect(bn, |i| {
+            let mut segs = Vec::new();
+            // SAFETY: list pointers stay live until ExecuteCommandLists returns; each index is distinct.
+            let list = titles[i] as *mut c_void;
+            unsafe { push_one(list, &mut segs) };
+            segs.into_iter().map(|p| p as usize).collect()
+        });
+        for segs in chunks {
+            mapped.extend(segs.into_iter().map(|p| p as *mut c_void));
+        }
+        offset = end;
     }
     mapped
 }
