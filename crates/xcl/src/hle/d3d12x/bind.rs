@@ -270,10 +270,78 @@ fn signature_dispatches(sig: usize) -> bool {
     DISPATCH_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig))
 }
 
+fn indirect_command_span(sig: usize, max: u32) -> usize {
+    if signature_dispatches(sig) {
+        (max as usize).saturating_mul(12)
+    } else {
+        (max as usize).saturating_mul(16)
+    }
+}
+
+fn console_indirect_region(args: usize, args_off: u64) -> Option<(usize, usize)> {
+    super::real::console_buffer(args).and_then(|(p, n)| {
+        let off = usize::try_from(args_off).ok()?;
+        (off <= n).then(|| p.checked_add(off).map(|addr| (addr, n - off))).flatten()
+    })
+}
+
+fn console_indirect_count(count_buf: usize, count_off: u64) -> Option<usize> {
+    super::real::console_buffer(count_buf).and_then(|(p, n)| {
+        let off = usize::try_from(count_off).ok()?;
+        (off.checked_add(4)? <= n).then(|| p.checked_add(off)).flatten()
+    })
+}
+
+fn constants_order_active(commands_at: Option<(usize, usize)>, count_at: Option<usize>, span: usize) -> bool {
+    if !super::port::constants_order() {
+        return false;
+    }
+    commands_at.is_some_and(|(_, n)| {
+        let need = if span > 0 { span } else { 1 };
+        n >= need
+    }) || count_at.is_some()
+}
+
+fn prepare_constants_order_indirect(_this: *mut c_void) {
+    let _ = (_this, super::port::constants_order_alone());
+}
+
+/// HLSL prefix for indirect clamp shaders (`REST`, CGBJ batch budget policy).
+fn indirect_clamp_shader_source(body: &str) -> String {
+    super::clamp::indirect_clamp_shader_source(body)
+}
+
+pub(super) unsafe fn prepare_deferred_indirect_execute(
+    list: *mut c_void,
+    sig: usize,
+    max: u32,
+    args: usize,
+    args_off: u64,
+    count_buf: usize,
+    count_off: u64,
+) {
+    if !super::port::constants_order() {
+        return;
+    }
+    let span = indirect_command_span(sig, max);
+    if constants_order_active(console_indirect_region(args, args_off), console_indirect_count(count_buf, count_off), span) {
+        prepare_constants_order_indirect(list);
+    }
+}
+
+unsafe fn indirect_execute_after_order(list: *mut c_void, order: bool, op: impl FnOnce()) {
+    if order {
+        fresh_indirect_arguments(list, op);
+    } else {
+        op();
+    }
+}
+
 /// #59 ExecuteIndirect(signature, max count, arguments, offset, count buffer, offset): with a
 /// translated pipeline, on XCL's ABI with the kept root arguments (signatures that change root
 /// arguments themselves cannot be – skipped, logged)
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
+    super::clamp::log_policy_once();
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let raw_pso = with(this, |s| s.pso);
@@ -282,6 +350,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return super::pso_async::need_by_submit(raw_pso);
     }
     let pso = super::pso_async::resolve_wait(raw_pso);
+    let commands_at = console_indirect_region(args, args_off);
+    let count_at = console_indirect_count(count_buf, count_off);
+    let constants_ordered = constants_order_active(commands_at, count_at, indirect_command_span(sig, max));
+    if constants_ordered {
+        prepare_constants_order_indirect(this);
+    }
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if !gfx && !compute {
@@ -333,7 +407,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
             list.SetGraphicsRootSignature(r);
         }
-        return fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
+        return indirect_execute_after_order(this, constants_ordered, || pc(this, sig, max, args, args_off, count_buf, count_off));
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -357,7 +431,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 }
             }
             count(if gfx { DRAWS } else { DISPATCHES });
-            fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off))
+            indirect_execute_after_order(this, constants_ordered, || pc(this, sig, max, args, args_off, count_buf, count_off))
         }
         Err(e) => {
             count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
@@ -1124,6 +1198,12 @@ mod tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn indirect_clamp_shader_source_prepends_rest() {
+        let src = indirect_clamp_shader_source("void main() {}");
+        assert!(src.starts_with("#define REST false\n"));
+    }
 
     #[test]
     fn dispatches_past_the_d3d12_limit_are_folded_or_clamped() {
