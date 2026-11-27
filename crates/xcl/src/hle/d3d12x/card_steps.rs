@@ -58,6 +58,11 @@ pub fn rehash_runs() -> bool {
     super::port::card_rehash_runs()
 }
 
+/// Join sparse chunk compare/upload runs when [`rehash_runs`].
+pub fn join_compare_runs(runs: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    super::card_rehash::join_runs(runs)
+}
+
 /// Whether `next` continues `last` as one contiguous copy (dest/source both advance).
 pub fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
     let ((d, s, n), (dst, src, len)) = (last, next);

@@ -36,6 +36,7 @@ mod late_release;
 mod late_wait;
 pub mod layout;
 pub(crate) mod join;
+pub(crate) mod card_rehash;
 pub(crate) mod card_steps;
 pub(crate) mod land;
 pub(crate) mod relay;
