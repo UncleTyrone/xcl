@@ -2,7 +2,8 @@
 //!
 //! CGBJ draws white bitmap text onto the swap chain (F3 toggles). XCL currently samples the same
 //! counter set into the log twice a second when the latch is on, and toggles visibility with F3
-//! when an XCL/title window is foreground — GPU blit overlay lands with the full host panel port.
+//! when an XCL/title window is foreground. Set `XCL_PANEL_GPU=1` for a small GPU status box
+//! on the swap-chain back buffer (8-bit RGBA formats only); full CGBJ glyph+scale depth is still open.
 //!
 //! Study-only reference: CGBJ `victory-gpu` `host/panel.rs` (GPL-3); this file is GPL-2.
 
@@ -28,6 +29,11 @@ fn asked() -> bool {
 fn shown() -> &'static AtomicBool {
     static SHOWN: OnceLock<AtomicBool> = OnceLock::new();
     SHOWN.get_or_init(|| AtomicBool::new(asked()))
+}
+
+/// Whether the panel is visible (F3 toggle).
+pub(crate) fn visible() -> bool {
+    asked() && shown().load(Ordering::Relaxed)
 }
 
 fn f3_edge() -> bool {
@@ -87,6 +93,7 @@ pub(crate) fn on_frame(frame: u64) {
     let line = format!(
         "FPS {fps:.1}  DRAWS {d_draws:.0}  DISPATCH {d_disp:.0}  frame={frame}  {mem}"
     );
+    super::panel_gpu::set_overlay_text(&line);
     crate::xlog_info!("XCL PANEL {line}");
     if let Some(hwnd) = super::present::window_hwnd() {
         let title = format!("XCL | {line}");

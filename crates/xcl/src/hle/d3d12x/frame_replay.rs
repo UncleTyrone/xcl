@@ -18,6 +18,11 @@
 //! | Offline `victory replay` | `xcl replay` inspect + `--listing` / `--edit` / `--pixel` / `--diverge` |
 //! | `--pixel` / `--diverge` / edit | Offline `frame_tools` on wire blobs (no live GPU texel probe) |
 //!
+//! **Cross-process (impossible on Windows host):** `ID3D12CommandList` / queue COM pointers and
+//! title GPU VAs are meaningless after the recording process exits or the device is torn down.
+//! There is no DXGI/D3D12 API to deserialize a VICFRAME/CGBJ command stream into live lists in a
+//! fresh process; `xcl replay --run` only re-issues while the game is still running (`XCL_REPLAY`).
+//!
 //! **Honest limits:** full cross-process list rehydration from payload bytes alone is not
 //! supported — Windows COM command-list handles and title GPU VAs are process-local. Same-process
 //! replay re-issues live lists when pointers remain readable. CGBJ-scale resource/PSO/descriptor
@@ -822,11 +827,37 @@ fn recorded_from_wire(events: &[super::frame_wire::WireEvent]) -> Vec<RecordedEv
         .collect()
 }
 
+static FRAME_NOTES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Best-effort note for `frames/frame_NNNN.notes.txt` (CGBJ `notes.txt` role).
+pub(crate) fn note_frame_problem(msg: impl Into<String>) {
+    if let Ok(mut n) = FRAME_NOTES.lock() {
+        n.push(msg.into());
+    }
+}
+
+/// JSON sidecar for `XCL_CAPTURE` (`frame-<n>.json`).
+pub fn capture_companion_json(boundary: u64) -> Option<String> {
+    let s = settings();
+    let body = serde_json::json!({
+        "boundary": boundary,
+        "xcl_record": s.record_dir.as_ref().map(|p| p.display().to_string()),
+        "recording_active": record_enabled() && recording_active(),
+        "wire": s.write_wire,
+        "contents": s.write_contents,
+        "lists": s.write_lists,
+        "wire_version": super::frame_wire::VERSION,
+        "cross_process": "unsupported",
+    });
+    Some(body.to_string())
+}
+
 fn flush_frame_file(frame: u64) {
     let s = settings();
     let Some(dir) = &s.record_dir else { return };
     let events = std::mem::take(&mut *FRAME_BUF.lock().unwrap());
     let contents = std::mem::take(&mut *FRAME_CONTENTS_BIN.lock().unwrap());
+    let notes = std::mem::take(&mut *FRAME_NOTES.lock().unwrap());
     if events.is_empty() {
         return;
     }
@@ -851,6 +882,21 @@ fn flush_frame_file(frame: u64) {
             crate::xlog_warn!("D3D12.X: contents.bin write {}: {e}", bin_path.display());
         }
     }
+    let notes_path = dir.join("frames").join(format!("frame_{frame:04}.notes.txt"));
+    let mut note_body = String::from(
+        "XCL frame record notes (same-process replay only; cross-process list rebuild unsupported)\n",
+    );
+    if settings().write_lists {
+        note_body.push_str("- ListPayload: structured XLST + draw/dispatch bytes (not a full Cmd codec)\n");
+    }
+    for line in &notes {
+        note_body.push_str(line);
+        note_body.push('\n');
+    }
+    if notes.is_empty() && events.iter().any(|e| matches!(e, RecordedEvent::ListPayload { .. })) {
+        note_body.push_str("- list payloads recorded; replay needs live COM pointers\n");
+    }
+    let _ = std::fs::write(&notes_path, note_body);
 }
 
 fn load_wire_frame(dir: &Path, frame: u64) -> Option<Vec<RecordedEvent>> {
@@ -1048,6 +1094,10 @@ pub fn on_submit(queue: *mut c_void, title_lists: &[*mut c_void], mapped: &[*mut
             bound_heaps,
         };
         append_event(&ev);
+        super::host::timeline::frame_record(
+            "xcl_record_submit",
+            format!("n={n} lists={} wire={}", title_lists.len(), settings().write_wire),
+        );
         if settings().write_wire || settings().write_contents || settings().write_lists {
             for meta in list_meta_events(mapped) {
                 append_event(&meta);
@@ -1099,6 +1149,7 @@ pub fn on_present(token: u64) {
                 planes,
             };
             append_event(&ev);
+            super::host::timeline::frame_record("xcl_record_present", format!("frame={frame} token={token}"));
             flush_frame_file(frame);
             if !settings().always {
                 if settings().max_frames.is_none_or(|m| frame >= m) {

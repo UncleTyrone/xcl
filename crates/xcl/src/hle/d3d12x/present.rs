@@ -1185,6 +1185,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
             }
             p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
             if comp.record(&p.dev, &p.list, &bb, w, h, fmt, &resolved, p.ring.cur) {
+                super::panel_gpu::draw(&p.dev, &p.list, &bb, fmt, w, h, D3D12_RESOURCE_STATE_RENDER_TARGET);
                 if due {
                     p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
                     let bb_desc = bb.GetDesc();
@@ -1197,6 +1198,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
                 }
                 composited = true;
             } else {
+                super::panel_gpu::draw(&p.dev, &p.list, &bb, fmt, w, h, D3D12_RESOURCE_STATE_RENDER_TARGET);
                 p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
             }
         } else {
@@ -1230,6 +1232,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
             let _ = ManuallyDrop::into_inner(dst.pResource);
             let _ = ManuallyDrop::into_inner(src_loc.pResource);
         }
+        super::panel_gpu::draw(&p.dev, &p.list, &bb, fmt, w, h, D3D12_RESOURCE_STATE_COPY_DEST);
         if due {
             if let Some((buffer, footprint)) = readback_copy(&p.list, src, desc) {
                 dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
@@ -1527,6 +1530,9 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
         let cap_n = n.saturating_add(1);
         if super::host::capture::wanted(cap_n) {
             super::host::capture::save_bmp(cap_n, &bmp);
+            if let Some(body) = super::frame_replay::capture_companion_json(cap_n) {
+                super::host::capture::save_companion(cap_n, &body);
+            }
         }
     }
     let Some(boot) = crate::state::boot() else { return };

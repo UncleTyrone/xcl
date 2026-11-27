@@ -6,6 +6,16 @@
 //! subset for validation (heaps, bind ids, title GPU addresses, list meta/payloads, title-memory
 //! samples and content chunks).
 //!
+//! ## Cross-process replay (why it stays same-process)
+//!
+//! `ListPayload` command bytes and `ListMeta` pointer ids are enough to **diagnose** a frame
+//! offline (`xcl replay --listing/--edit`) but not to rebuild live `ID3D12GraphicsCommandList`
+//! objects in another process: COM interface pointers and title GPU VAs are tied to one virtual
+//! address space and one D3D12 device lifetime. Windows does not expose a supported API to
+//! “rehydrate” a recorded command list from bytes alone (unlike writing a new list from host code).
+//! XCL therefore documents cross-process play as **unsupported** and re-issues only while the title
+//! is live with still-readable pointers (`XCL_REPLAY` / `--run`).
+//!
 //! ## `XCLFRAME` version 4 (current [`VERSION`])
 //!
 //! Same stream as version 3, plus:
