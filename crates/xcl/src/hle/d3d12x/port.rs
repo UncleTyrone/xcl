@@ -199,6 +199,17 @@ pub fn target_variants() -> bool {
     *ON.get_or_init(|| std::env::var_os("XCL_TARGET_VARIANTS").is_none_or(|v| v != "0"))
 }
 
+/// Join compare re-hash passes across runs (`XCL_CARD_REHASH_RUNS=1`, legacy `VICTORY_CARD_REHASH_RUNS=1`).
+pub fn card_rehash_runs() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = env_on("XCL_CARD_REHASH_RUNS")
+            || std::env::var("VICTORY_CARD_REHASH_RUNS").is_ok_and(|v| v.trim() == "1");
+        once("XCL_CARD_REHASH_RUNS", on);
+        on
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

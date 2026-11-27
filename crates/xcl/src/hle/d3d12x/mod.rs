@@ -34,6 +34,7 @@ mod gpu_profile;
 mod gpu_times;
 pub mod guard;
 mod indirect_guard;
+pub(crate) mod card_rehash;
 pub(crate) mod join;
 mod frame_replay;
 mod late_release;

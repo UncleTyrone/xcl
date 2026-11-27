@@ -2665,6 +2665,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
         }
         pg = tile_end;
     }
+    dirty_runs = super::card_rehash::join_runs(dirty_runs);
     if !dirty_runs.is_empty() {
         s.upload_dirty(&dirty_runs);
     }
@@ -4475,6 +4476,7 @@ impl State {
             let (scanned, unchanged) = own_scanned(&found, &pages, &dirty_runs);
             super::look_stats::own_writes(written, found.len(), scanned, unchanged);
         }
+        dirty_runs = super::card_rehash::join_runs(dirty_runs);
         PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Ordering::Relaxed);
         PHASES[3].fetch_add((zero_runs.len() + dirty_runs.len()) as u64, Ordering::Relaxed);
         // Submit tile clears before CPU writes so overlapping CopyBufferRegion destinations have no WAW hazard.
