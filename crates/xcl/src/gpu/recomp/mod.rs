@@ -56,6 +56,7 @@ pub mod shader_opt;
 pub mod dxc;
 pub mod dxil;
 pub mod lane_masks;
+mod join_lane_phi;
 pub mod lower;
 pub mod lower_dxil;
 pub(crate) mod emit;
@@ -1473,7 +1474,7 @@ pub fn detect_wave64(code: &[u8]) -> bool {
 }
 
 /// Value of a scalar constant source operand (inline constant or literal), if it is one.
-fn scalar_constant(d: &Decoded, code: u64) -> Option<u32> {
+pub(crate) fn scalar_constant(d: &Decoded, code: u64) -> Option<u32> {
     Some(match code {
         128..=192 => (code - 128) as u32,
         193..=208 => (-((code - 192) as i32)) as u32,
@@ -1526,7 +1527,7 @@ fn join_skip_pred(from: &[Decoded], join_pc: u64) -> bool {
 
 /// LanePhi-inspired: is this predecessor edge lane-dead at the join (do not intersect away
 /// constants defined only on live arms)?
-fn join_lane_dead_pred(from: &[Decoded], join_pc: u64, join_idx: usize, preds: &[usize], rpo: &[usize]) -> bool {
+pub(crate) fn join_lane_dead_pred(from: &[Decoded], join_pc: u64, join_idx: usize, preds: &[usize], rpo: &[usize]) -> bool {
     if !strict_joins() {
         return false;
     }
@@ -1546,10 +1547,10 @@ fn join_lane_dead_pred(from: &[Decoded], join_pc: u64, join_idx: usize, preds: &
     })
 }
 
-type SgprKnown = std::collections::HashMap<u64, u32>;
+use join_lane_phi::{propagate_sgpr_descriptors, sgpr_const_step, SgprKnown};
 
 /// Merge incoming SGPR constants at a CFG join (LanePhi-inspired live-arm preservation).
-fn merge_known_at_join(have: &mut SgprKnown, incoming: &SgprKnown, dead_edge: bool) {
+pub(crate) fn merge_known_at_join(have: &mut SgprKnown, incoming: &SgprKnown, dead_edge: bool) {
     if !strict_joins() {
         if have.is_empty() {
             have.extend(incoming.iter().map(|(&r, &v)| (r, v)));
@@ -1604,7 +1605,7 @@ mod join_merge_tests {
     }
 }
 
-fn block_rpo(next: &[Vec<usize>]) -> Vec<usize> {
+pub(crate) fn block_rpo(next: &[Vec<usize>]) -> Vec<usize> {
     let n = next.len();
     let mut rpo = vec![usize::MAX; n];
     let mut time = 0usize;
@@ -1648,260 +1649,65 @@ fn block_rpo(next: &[Vec<usize>]) -> Vec<usize> {
 /// compute when `follow` is true). LanePhi-inspired join merge keeps constants from live
 /// predecessors when another arm defines none; full per-lane `LanePhi` tracing in emit unported.
 pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, follow: bool) -> BTreeMap<u64, [u32; 4]> {
-    type Known = SgprKnown;
-    // one block's instructions on `known`; the S# of its MIMG instructions into `out`
-    fn run(block: &[Decoded], known: &mut Known, mut out: Option<&mut BTreeMap<u64, [u32; 4]>>) {
-        for d in block {
+    propagate_sgpr_descriptors(
+        insts,
+        leaders,
+        follow,
+        |block, known, _| {
+            for d in block {
+                sgpr_const_step(d, known);
+            }
+        },
+        |d, known, out| {
+            if d.enc.name != "ENC_MIMG" {
+                return;
+            }
             let f = |n: &str| rdna2::field_value(d.enc, &d.words, n);
-            if d.enc.name == "ENC_MIMG" {
-                if let (Some(out), Some(s)) = (out.as_deref_mut(), f("SSAMP").map(|v| v * rdna2::register_scale("SSAMP"))) {
-                    if let (Some(a), Some(b), Some(c), Some(e)) = (known.get(&s), known.get(&(s + 1)), known.get(&(s + 2)), known.get(&(s + 3))) {
-                        out.insert(d.pc, [*a, *b, *c, *e]);
-                    }
-                }
-            }
-            let set: Vec<(u64, u32)> = match d.inst.name {
-                "S_MOV_B32" => f("SDST").zip(f("SSRC0").and_then(|c| scalar_constant(d, c))).map(|(r, v)| vec![(r, v)]).unwrap_or_default(),
-                "S_MOVK_I32" => f("SDST").zip(f("SIMM16")).map(|(r, v)| vec![(r, v as u16 as i16 as i32 as u32)]).unwrap_or_default(),
-                // a constant with only high bits set, as the compiler writes it: `s_brev_b32 s66, 40`
-                "S_BREV_B32" => f("SDST").zip(f("SSRC0").and_then(|c| scalar_constant(d, c))).map(|(r, v)| vec![(r, v.reverse_bits())]).unwrap_or_default(),
-                // 64-bit moves of inline integers (sign-extended): S# words that are 0 / -1
-                "S_MOV_B64" => match (f("SDST"), f("SSRC0")) {
-                    (Some(r), Some(c @ 128..=208)) => {
-                        let v = scalar_constant(d, c).unwrap() as i32 as i64;
-                        vec![(r, v as u32), (r + 1, (v >> 32) as u32)]
-                    }
-                    // a 32-bit literal, zero-extended: `s_mov_b64 s[18:19], 0x18500000`
-                    (Some(r), Some(255)) => d.literal.map(|v| vec![(r, v), (r + 1, 0)]).unwrap_or_default(),
-                    _ => Vec::new(),
-                },
-                // a run of set bits: `s_bfm_b32 s17, 12, 12` is 0x00fff000
-                "S_BFM_B32" => match (f("SDST"), f("SSRC0").and_then(|c| scalar_constant(d, c)), f("SSRC1").and_then(|c| scalar_constant(d, c))) {
-                    (Some(r), Some(a), Some(b)) => vec![(r, ((1u32 << (a & 31)) - 1) << (b & 31))],
-                    _ => Vec::new(),
-                },
-                _ => Vec::new(),
+            let Some(s) = f("SSAMP").map(|v| v * rdna2::register_scale("SSAMP")) else {
+                return;
             };
-            for w in rdna2::sgpr_uses(d).1 {
-                known.remove(&w);
+            if let (Some(a), Some(b), Some(c), Some(e)) = (
+                known.get(&s),
+                known.get(&(s + 1)),
+                known.get(&(s + 2)),
+                known.get(&(s + 3)),
+            ) {
+                out.insert(d.pc, [*a, *b, *c, *e]);
             }
-            for (r, v) in set {
-                if r < 106 {
-                    known.insert(r, v);
-                }
-            }
-        }
-    }
-    // the blocks, in address order
-    let mut starts: Vec<usize> = insts.iter().enumerate().filter(|(i, d)| *i == 0 || leaders.contains(&d.pc)).map(|(i, _)| i).collect();
-    starts.push(insts.len());
-    let blocks: Vec<&[Decoded]> = starts.windows(2).map(|w| &insts[w[0]..w[1]]).filter(|b| !b.is_empty()).collect();
-    let at: std::collections::HashMap<u64, usize> = blocks.iter().enumerate().map(|(k, b)| (b[0].pc, k)).collect();
-    // where each block goes on; None: somewhere that is not known
-    let next: Option<Vec<Vec<usize>>> = blocks
-        .iter()
-        .enumerate()
-        .map(|(k, b)| {
-            let d = b.last().unwrap();
-            let after = (k + 1 < blocks.len()).then_some(k + 1);
-            Some(match (rdna2::branch_target(d), d.inst.name) {
-                (Some(t), n) if n.starts_with("S_CBRANCH") => after.into_iter().chain([*at.get(&t)?]).collect(),
-                (Some(t), "S_BRANCH" | "S_SETPC_B64") => vec![*at.get(&t)?],
-                (Some(_), _) => return None,
-                (None, "S_ENDPGM") => Vec::new(),
-                (None, _) if d.inst.flags & rdna2::F_TERMINATOR != 0 => return None,
-                _ => after.into_iter().collect(),
-            })
-        })
-        .collect();
-    let mut out = BTreeMap::new();
-    let Some(next) = next.filter(|_| follow) else {
-        for b in &blocks {
-            run(b, &mut Known::new(), Some(&mut out));
-        }
-        return out;
-    };
-    // what is known at each block's start (None: not reached yet): what every way in agrees on
-    let mut pred: Vec<Vec<usize>> = vec![Vec::new(); blocks.len()];
-    for (k, succs) in next.iter().enumerate() {
-        for &n in succs {
-            pred[n].push(k);
-        }
-    }
-    let rpo = block_rpo(&next);
-    let mut start: Vec<Option<Known>> = vec![None; blocks.len()];
-    let mut work: Vec<usize> = Vec::new();
-    if !blocks.is_empty() {
-        start[0] = Some(Known::new());
-        work.push(0);
-    }
-    while let Some(k) = work.pop() {
-        let mut known = start[k].clone().unwrap_or_default();
-        run(blocks[k], &mut known, None);
-        for &n in &next[k] {
-            let join_pc = blocks[n].first().map(|d| d.pc).unwrap_or(0);
-            let dead = join_lane_dead_pred(blocks[k], join_pc, n, &pred[n], &rpo);
-            let changed = match &mut start[n] {
-                slot @ None => {
-                    *slot = Some(known.clone());
-                    true
-                }
-                Some(have) => {
-                    let before = have.len();
-                    merge_known_at_join(have, &known, dead);
-                    have.len() != before
-                }
-            };
-            if changed {
-                work.push(n);
-            }
-        }
-    }
-    for (k, b) in blocks.iter().enumerate() {
-        // (a block nothing leads to: nothing known at its start)
-        run(b, &mut start[k].clone().unwrap_or_default(), Some(&mut out));
-    }
-    out
+        },
+    )
 }
 
 /// Buffer / flat / UAV SRSRC words built from constants on every path (same LanePhi-inspired
 /// join rules as [`constant_samplers`]: lane-dead edges at a merge do not clear the live arm).
 pub(crate) fn constant_srsrc(insts: &[Decoded], leaders: &BTreeSet<u64>, follow: bool) -> BTreeMap<u64, [u32; 4]> {
-    type Known = SgprKnown;
-    fn run(block: &[Decoded], known: &mut Known, mut out: Option<&mut BTreeMap<u64, [u32; 4]>>) {
-        for d in block {
+    propagate_sgpr_descriptors(
+        insts,
+        leaders,
+        follow,
+        |block, known, _| {
+            for d in block {
+                sgpr_const_step(d, known);
+            }
+        },
+        |d, known, out| {
+            if !matches!(&*d.enc.name, "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL") {
+                return;
+            }
             let f = |n: &str| rdna2::field_value(d.enc, &d.words, n);
-            if matches!(&*d.enc.name, "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL") {
-                if let (Some(out), Some(s)) = (
-                    out.as_deref_mut(),
-                    f("SRSRC").map(|v| v * rdna2::register_scale("SRSRC")),
-                ) {
-                    if let (Some(a), Some(b), Some(c), Some(e)) = (
-                        known.get(&s),
-                        known.get(&(s + 1)),
-                        known.get(&(s + 2)),
-                        known.get(&(s + 3)),
-                    ) {
-                        out.insert(d.pc, [*a, *b, *c, *e]);
-                    }
-                }
-            }
-            let set: Vec<(u64, u32)> = match d.inst.name {
-                "S_MOV_B32" => f("SDST")
-                    .zip(f("SSRC0").and_then(|c| scalar_constant(d, c)))
-                    .map(|(r, v)| vec![(r, v)])
-                    .unwrap_or_default(),
-                "S_MOVK_I32" => f("SDST")
-                    .zip(f("SIMM16"))
-                    .map(|(r, v)| vec![(r, v as u16 as i16 as i32 as u32)])
-                    .unwrap_or_default(),
-                "S_BREV_B32" => f("SDST")
-                    .zip(f("SSRC0").and_then(|c| scalar_constant(d, c)))
-                    .map(|(r, v)| vec![(r, v.reverse_bits())])
-                    .unwrap_or_default(),
-                "S_MOV_B64" => match (f("SDST"), f("SSRC0")) {
-                    (Some(r), Some(c @ 128..=208)) => {
-                        let v = scalar_constant(d, c).unwrap() as i32 as i64;
-                        vec![(r, v as u32), (r + 1, (v >> 32) as u32)]
-                    }
-                    (Some(r), Some(255)) => d.literal.map(|v| vec![(r, v), (r + 1, 0)]).unwrap_or_default(),
-                    _ => Vec::new(),
-                },
-                "S_BFM_B32" => match (
-                    f("SDST"),
-                    f("SSRC0").and_then(|c| scalar_constant(d, c)),
-                    f("SSRC1").and_then(|c| scalar_constant(d, c)),
-                ) {
-                    (Some(r), Some(a), Some(b)) => vec![(r, ((1u32 << (a & 31)) - 1) << (b & 31))],
-                    _ => Vec::new(),
-                },
-                _ => Vec::new(),
+            let Some(s) = f("SRSRC").map(|v| v * rdna2::register_scale("SRSRC")) else {
+                return;
             };
-            for w in rdna2::sgpr_uses(d).1 {
-                known.remove(&w);
+            if let (Some(a), Some(b), Some(c), Some(e)) = (
+                known.get(&s),
+                known.get(&(s + 1)),
+                known.get(&(s + 2)),
+                known.get(&(s + 3)),
+            ) {
+                out.insert(d.pc, [*a, *b, *c, *e]);
             }
-            for (r, v) in set {
-                if r < 106 {
-                    known.insert(r, v);
-                }
-            }
-        }
-    }
-    let mut starts: Vec<usize> = insts
-        .iter()
-        .enumerate()
-        .filter(|(i, d)| *i == 0 || leaders.contains(&d.pc))
-        .map(|(i, _)| i)
-        .collect();
-    starts.push(insts.len());
-    let blocks: Vec<&[Decoded]> = starts
-        .windows(2)
-        .map(|w| &insts[w[0]..w[1]])
-        .filter(|b| !b.is_empty())
-        .collect();
-    let at: std::collections::HashMap<u64, usize> = blocks.iter().enumerate().map(|(k, b)| (b[0].pc, k)).collect();
-    let next: Option<Vec<Vec<usize>>> = blocks
-        .iter()
-        .enumerate()
-        .map(|(k, b)| {
-            let d = b.last().unwrap();
-            let after = (k + 1 < blocks.len()).then_some(k + 1);
-            Some(match (rdna2::branch_target(d), d.inst.name) {
-                (Some(t), n) if n.starts_with("S_CBRANCH") => after.into_iter().chain([*at.get(&t)?]).collect(),
-                (Some(t), "S_BRANCH" | "S_SETPC_B64") => vec![*at.get(&t)?],
-                (Some(_), _) => return None,
-                (None, "S_ENDPGM") => Vec::new(),
-                (None, _) if d.inst.flags & rdna2::F_TERMINATOR != 0 => return None,
-                _ => after.into_iter().collect(),
-            })
-        })
-        .collect();
-    let mut out = BTreeMap::new();
-    let Some(next) = next.filter(|_| follow) else {
-        for b in &blocks {
-            run(b, &mut Known::new(), Some(&mut out));
-        }
-        return out;
-    };
-    let mut pred: Vec<Vec<usize>> = vec![Vec::new(); blocks.len()];
-    for (k, succs) in next.iter().enumerate() {
-        for &n in succs {
-            pred[n].push(k);
-        }
-    }
-    let rpo = block_rpo(&next);
-    let mut start: Vec<Option<Known>> = vec![None; blocks.len()];
-    let mut work: Vec<usize> = Vec::new();
-    if !blocks.is_empty() {
-        start[0] = Some(Known::new());
-        work.push(0);
-    }
-    while let Some(k) = work.pop() {
-        let mut known = start[k].clone().unwrap_or_default();
-        run(blocks[k], &mut known, None);
-        for &n in &next[k] {
-            let join_pc = blocks[n].first().map(|d| d.pc).unwrap_or(0);
-            let dead = join_lane_dead_pred(blocks[k], join_pc, n, &pred[n], &rpo);
-            let changed = match &mut start[n] {
-                slot @ None => {
-                    *slot = Some(known.clone());
-                    true
-                }
-                Some(have) => {
-                    let before = have.len();
-                    merge_known_at_join(have, &known, dead);
-                    have.len() != before
-                }
-            };
-            if changed {
-                work.push(n);
-            }
-        }
-    }
-    for (k, b) in blocks.iter().enumerate() {
-        run(b, &mut start[k].clone().unwrap_or_default(), Some(&mut out));
-    }
-    out
+        },
+    )
 }
 
 /// Does the program require `globallycoherent` flat memory windows (`mem`, `mem1`…)?
