@@ -1,4 +1,4 @@
-﻿//! d3d12_xs.dll – D3D12.X.
+//! d3d12_xs.dll – D3D12.X.
 //!
 //! Backends:
 //! * `real` (default): genuine PC D3D12 objects from the GPU driver with extended
@@ -17,6 +17,7 @@ mod bvh_env;
 mod bvh_want;
 mod capture;
 pub mod console_heap;
+pub(crate) mod desc_recycle;
 pub(crate) mod heap_strides;
 pub mod console_list;
 pub mod clamp;

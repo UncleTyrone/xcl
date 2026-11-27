@@ -30,6 +30,11 @@ fn shown() -> &'static AtomicBool {
     SHOWN.get_or_init(|| AtomicBool::new(asked()))
 }
 
+/// Whether the panel is visible (F3 toggle).
+pub(crate) fn visible() -> bool {
+    asked() && shown().load(Ordering::Relaxed)
+}
+
 fn f3_edge() -> bool {
     static DOWN: AtomicBool = AtomicBool::new(false);
     let down = unsafe { GetAsyncKeyState(i32::from(VK_F3)) } < 0;
