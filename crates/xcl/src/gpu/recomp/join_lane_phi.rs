@@ -6,8 +6,15 @@
 //! a join do not intersect away constants the sole live arm defines, matching transmission /
 //! alpha-prefilter patterns.
 //!
+//! Depth vs earlier XCL pass:
+//! - [`only_edge`]-style sole-live predecessor (loop headers refused)
+//! - Dead edges do **not** seed join state (CGBJ `None` on unused edges)
+//! - [`live_peel_known`]: nested sole-live peel at record time (Tracer `live` analogue)
+//! - SGPR copies / same-arm `s_cselect` / const SALU followed through blocks
+//!
 //! **Not ported (honest gap vs full CGBJ):** per-lane heap-index `LanePhi` phis in DXIL/HLSL,
-//! `Source::Lanes` / `Fetched`, waterfall tracing, and `Tracer::live` phi peeling.
+//! `Source::Lanes` / `Fetched`, waterfall tracing, Structured `meet` / `lanes.guards`, and
+//! SCC-dependent `Source::Select` when arms differ.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -15,6 +22,9 @@ use super::rdna2::{self, Decoded};
 use super::{block_rpo, join_lane_dead_pred, merge_known_at_join, scalar_constant, strict_joins};
 
 pub(crate) type SgprKnown = HashMap<u64, u32>;
+
+/// CGBJ `MAX_JOINS`: nested `only_edge` / `live` peel budget.
+pub(crate) const MAX_JOINS: usize = 8;
 
 /// Block CFG used for SGPR constant propagation at joins (leaders = basic-block entries).
 pub(crate) struct SgprJoinCfg<'a> {
@@ -114,6 +124,63 @@ pub(crate) fn merge_sgpr_known_at_join(
     have.len() != before
 }
 
+/// End-of-block SGPR map: `start` constants then `run_block` without recording.
+fn block_end_known<FRun>(
+    cfg: &SgprJoinCfg,
+    start: &[Option<SgprKnown>],
+    block: usize,
+    run_block: &mut FRun,
+) -> SgprKnown
+where
+    FRun: FnMut(&[Decoded], &mut SgprKnown, bool),
+{
+    let mut known = start.get(block).and_then(|s| s.clone()).unwrap_or_default();
+    run_block(&cfg.blocks[block], &mut known, false);
+    known
+}
+
+/// Tracer `live` analogue: peel nested sole-live join edges (up to [`MAX_JOINS`]) so a
+/// guarded access at a join sees the live arm's SGPR constants even when an earlier seed
+/// left the join map thin.
+pub(crate) fn live_peel_known<FRun>(
+    cfg: &SgprJoinCfg,
+    start: &[Option<SgprKnown>],
+    mut block: usize,
+    run_block: &mut FRun,
+) -> SgprKnown
+where
+    FRun: FnMut(&[Decoded], &mut SgprKnown, bool),
+{
+    let mut known = start.get(block).and_then(|s| s.clone()).unwrap_or_default();
+    if !strict_joins() {
+        return known;
+    }
+    for _ in 0..MAX_JOINS {
+        let Some(only) = join_sole_live_predecessor(cfg, block) else {
+            break;
+        };
+        let arm = block_end_known(cfg, start, only, run_block);
+        let mut changed = false;
+        for (r, v) in arm {
+            match known.get(&r) {
+                Some(hv) if *hv == v => {}
+                Some(_) => {
+                    // Conflict at peel: keep join map (forward merge already decided).
+                }
+                None => {
+                    known.insert(r, v);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+        block = only;
+    }
+    known
+}
+
 /// Forward-propagate SGPR constants and record four-word descriptors at `record` sites.
 pub(crate) fn propagate_sgpr_descriptors<FRun, FRecord>(
     insts: &[Decoded],
@@ -175,8 +242,13 @@ where
             let dead = join_lane_dead_pred(&cfg.blocks[k], join_pc, n, &cfg.pred[n], &cfg.rpo);
             let changed = match &mut start[n] {
                 slot @ None => {
-                    *slot = Some(known.clone());
-                    true
+                    // CGBJ LanePhi: dead edges contribute `None` — do not seed the join from them.
+                    if dead && strict_joins() {
+                        false
+                    } else {
+                        *slot = Some(known.clone());
+                        true
+                    }
                 }
                 Some(have) => merge_sgpr_known_at_join(&cfg, n, k, have, &known, dead),
             };
@@ -186,7 +258,7 @@ where
         }
     }
     for (k, b) in cfg.blocks.iter().enumerate() {
-        let mut known = start[k].clone().unwrap_or_default();
+        let mut known = live_peel_known(&cfg, &start, k, &mut run_block);
         run_block(b, &mut known, true);
         for d in *b {
             record(d, &known, &mut out);
@@ -195,12 +267,20 @@ where
     out
 }
 
-/// SGPR `s_mov*` / `s_brev` / `s_bfm` tracking inside one block (shared by sampler and SRSRC passes).
+/// Resolve a scalar operand to a tracked constant (inline/literal or known SGPR).
+fn known_scalar(d: &Decoded, known: &SgprKnown, code: u64) -> Option<u32> {
+    if let Some(v) = scalar_constant(d, code) {
+        return Some(v);
+    }
+    (code < 106).then(|| known.get(&code).copied()).flatten()
+}
+
+/// SGPR `s_mov*` / copies / same-arm `s_cselect` / const SALU tracking (sampler + SRSRC passes).
 pub(crate) fn sgpr_const_step(d: &Decoded, known: &mut SgprKnown) {
     let f = |n: &str| rdna2::field_value(d.enc, &d.words, n);
     let set: Vec<(u64, u32)> = match d.inst.name {
         "S_MOV_B32" => f("SDST")
-            .zip(f("SSRC0").and_then(|c| scalar_constant(d, c)))
+            .zip(f("SSRC0").and_then(|c| known_scalar(d, known, c)))
             .map(|(r, v)| vec![(r, v)])
             .unwrap_or_default(),
         "S_MOVK_I32" => f("SDST")
@@ -208,8 +288,12 @@ pub(crate) fn sgpr_const_step(d: &Decoded, known: &mut SgprKnown) {
             .map(|(r, v)| vec![(r, v as u16 as i16 as i32 as u32)])
             .unwrap_or_default(),
         "S_BREV_B32" => f("SDST")
-            .zip(f("SSRC0").and_then(|c| scalar_constant(d, c)))
+            .zip(f("SSRC0").and_then(|c| known_scalar(d, known, c)))
             .map(|(r, v)| vec![(r, v.reverse_bits())])
+            .unwrap_or_default(),
+        "S_NOT_B32" => f("SDST")
+            .zip(f("SSRC0").and_then(|c| known_scalar(d, known, c)))
+            .map(|(r, v)| vec![(r, !v)])
             .unwrap_or_default(),
         "S_MOV_B64" => match (f("SDST"), f("SSRC0")) {
             (Some(r), Some(c @ 128..=208)) => {
@@ -217,14 +301,117 @@ pub(crate) fn sgpr_const_step(d: &Decoded, known: &mut SgprKnown) {
                 vec![(r, v as u32), (r + 1, (v >> 32) as u32)]
             }
             (Some(r), Some(255)) => d.literal.map(|v| vec![(r, v), (r + 1, 0)]).unwrap_or_default(),
+            (Some(r), Some(c)) if c < 106 => match (known.get(&c), known.get(&(c + 1))) {
+                (Some(&lo), Some(&hi)) => vec![(r, lo), (r + 1, hi)],
+                _ => Vec::new(),
+            },
             _ => Vec::new(),
         },
         "S_BFM_B32" => match (
             f("SDST"),
-            f("SSRC0").and_then(|c| scalar_constant(d, c)),
-            f("SSRC1").and_then(|c| scalar_constant(d, c)),
+            f("SSRC0").and_then(|c| known_scalar(d, known, c)),
+            f("SSRC1").and_then(|c| known_scalar(d, known, c)),
         ) {
             (Some(r), Some(a), Some(b)) => vec![(r, ((1u32 << (a & 31)) - 1) << (b & 31))],
+            _ => Vec::new(),
+        },
+        "S_AND_B32" | "S_OR_B32" | "S_XOR_B32" | "S_NAND_B32" | "S_NOR_B32" | "S_XNOR_B32"
+        | "S_ANDN2_B32" | "S_ORN2_B32" => {
+            match (
+                f("SDST"),
+                f("SSRC0").and_then(|c| known_scalar(d, known, c)),
+                f("SSRC1").and_then(|c| known_scalar(d, known, c)),
+            ) {
+                (Some(r), Some(a), Some(b)) => {
+                    let v = match d.inst.name {
+                        "S_AND_B32" => a & b,
+                        "S_OR_B32" => a | b,
+                        "S_XOR_B32" => a ^ b,
+                        "S_NAND_B32" => !(a & b),
+                        "S_NOR_B32" => !(a | b),
+                        "S_XNOR_B32" => !(a ^ b),
+                        "S_ANDN2_B32" => a & !b,
+                        "S_ORN2_B32" => a | !b,
+                        _ => unreachable!(),
+                    };
+                    vec![(r, v)]
+                }
+                _ => Vec::new(),
+            }
+        }
+        "S_LSHL_B32" | "S_LSHR_B32" | "S_ASHR_I32" => {
+            match (
+                f("SDST"),
+                f("SSRC0").and_then(|c| known_scalar(d, known, c)),
+                f("SSRC1").and_then(|c| known_scalar(d, known, c)),
+            ) {
+                (Some(r), Some(a), Some(b)) => {
+                    let s = b & 31;
+                    let v = match d.inst.name {
+                        "S_LSHL_B32" => a << s,
+                        "S_LSHR_B32" => a >> s,
+                        "S_ASHR_I32" => ((a as i32) >> s) as u32,
+                        _ => unreachable!(),
+                    };
+                    vec![(r, v)]
+                }
+                _ => Vec::new(),
+            }
+        }
+        "S_BITSET0_B32" | "S_BITSET1_B32" => match (
+            f("SDST"),
+            f("SSRC0").and_then(|c| known_scalar(d, known, c)),
+        ) {
+            (Some(r), Some(bit)) => match known.get(&r).copied() {
+                Some(cur) => {
+                    let m = 1u32 << (bit & 31);
+                    let v = if d.inst.name == "S_BITSET1_B32" {
+                        cur | m
+                    } else {
+                        cur & !m
+                    };
+                    vec![(r, v)]
+                }
+                None => Vec::new(),
+            },
+            _ => Vec::new(),
+        },
+        // Same-arm cselect/cmov: both outcomes fold to one constant (SCC irrelevant).
+        "S_CSELECT_B32" => match (
+            f("SDST"),
+            f("SSRC0").and_then(|c| known_scalar(d, known, c)),
+            f("SSRC1").and_then(|c| known_scalar(d, known, c)),
+        ) {
+            (Some(r), Some(a), Some(b)) if a == b => vec![(r, a)],
+            _ => Vec::new(),
+        },
+        "S_CMOV_B32" => {
+            // Fold only when SCC-set and SCC-clear outcomes agree (dst already holds clear arm).
+            match (
+                f("SDST"),
+                f("SSRC0").and_then(|c| known_scalar(d, known, c)),
+            ) {
+                (Some(r), Some(a)) => match known.get(&r).copied() {
+                    Some(b) if a == b => vec![(r, a)],
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            }
+        },
+        "S_CSELECT_B64" => match (f("SDST"), f("SSRC0"), f("SSRC1")) {
+            (Some(r), Some(a), Some(b)) => {
+                match (
+                    known_scalar(d, known, a),
+                    known_scalar(d, known, a + 1),
+                    known_scalar(d, known, b),
+                    known_scalar(d, known, b + 1),
+                ) {
+                    (Some(a0), Some(a1), Some(b0), Some(b1)) if a0 == b0 && a1 == b1 => {
+                        vec![(r, a0), (r + 1, a1)]
+                    }
+                    _ => Vec::new(),
+                }
+            }
             _ => Vec::new(),
         },
         _ => Vec::new(),
@@ -236,5 +423,130 @@ pub(crate) fn sgpr_const_step(d: &Decoded, known: &mut SgprKnown) {
         if r < 106 {
             known.insert(r, v);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu::rdna2;
+
+    fn decode_lines(lines: &[(&str, &str, &[(&str, u64)], Option<u32>)]) -> Vec<Decoded> {
+        let bytes: Vec<u8> = lines
+            .iter()
+            .flat_map(|(n, e, f, lit)| rdna2::encode(n, e, f, *lit).unwrap())
+            .collect();
+        let mut insts = Vec::new();
+        let mut off = 0usize;
+        while off + 4 <= bytes.len() {
+            let d = rdna2::decode(&bytes[off..], off as u64).unwrap();
+            off += d.len;
+            insts.push(d);
+        }
+        rdna2::resolve_far_jumps(&mut insts);
+        insts
+    }
+
+    /// Transmission-style join: execz arm is lane-dead; only the fall-through arm defines S#.
+    /// `SIMM16` counts dwords after the branch word — skip the literal `s_mov` (2 dwords) to ENDPGM.
+    #[test]
+    fn sole_live_predecessor_on_execz_transmission_join() {
+        let insts = decode_lines(&[
+            ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 2)], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 255)], Some(0x1234_5678)),
+            ("S_ENDPGM", "ENC_SOPP", &[("SIMM16", 0)], None),
+        ]);
+        let leaders: BTreeSet<u64> = insts.iter().map(|d| d.pc).collect();
+        let cfg = build_sgpr_join_cfg(&insts, &leaders).expect("transmission cfg");
+        let join = cfg.blocks.len() - 1;
+        let only = join_sole_live_predecessor(&cfg, join);
+        let join_pc = cfg.blocks[join][0].pc;
+        let dead = cfg
+            .pred[join]
+            .iter()
+            .copied()
+            .filter(|&p| join_lane_dead_pred(cfg.blocks[p], join_pc, join, &cfg.pred[join], &cfg.rpo))
+            .collect::<Vec<_>>();
+        let live: Vec<_> = cfg.pred[join].iter().copied().filter(|p| !dead.contains(p)).collect();
+        assert_eq!(live.len(), 1, "one live arm at transmission join");
+        assert_eq!(only, Some(live[0]));
+    }
+
+    #[test]
+    fn lane_phi_merge_sole_live_replaces_join_state() {
+        // Match `execz_dead_edge_at_join_keeps_live_arm_sampler`: skip four SGPRs (lit + 3) to the sample.
+        let imm = 0x1234_5678u32;
+        let insts = decode_lines(&[
+            ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 5)], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 255)], Some(imm)),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 9), ("SSRC0", 128)], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 128)], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 128)], None),
+            (
+                "IMAGE_SAMPLE_LZ",
+                "ENC_MIMG",
+                &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 2), ("DMASK", 0xF), ("DIM", 1)],
+                None,
+            ),
+            ("S_ENDPGM", "ENC_SOPP", &[("SIMM16", 0)], None),
+        ]);
+        let leaders: BTreeSet<u64> = insts.iter().map(|d| d.pc).collect();
+        let map = constant_samplers_for_test(&insts, &leaders);
+        let sample_pc = insts.iter().find(|d| d.enc.name == "ENC_MIMG").unwrap().pc;
+        assert_eq!(map.get(&sample_pc).map(|w| w[0]), Some(imm));
+    }
+
+    /// Copies of known SGPRs must stay constant through a live arm (Tracer origin follow).
+    #[test]
+    fn sgpr_copy_follow_keeps_sampler_after_execz_join() {
+        let imm = 0xA5A5_5A5Au32;
+        let insts = decode_lines(&[
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 255)], Some(imm)),
+            // Skip four dword-sized movs (s8 copy + s9..s11) onto the sample join.
+            ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 4)], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 4)], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 9), ("SSRC0", 128)], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 128)], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 128)], None),
+            (
+                "IMAGE_SAMPLE_LZ",
+                "ENC_MIMG",
+                &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 2), ("DMASK", 0xF), ("DIM", 1)],
+                None,
+            ),
+            ("S_ENDPGM", "ENC_SOPP", &[("SIMM16", 0)], None),
+        ]);
+        let leaders: BTreeSet<u64> = insts.iter().map(|d| d.pc).collect();
+        let map = constant_samplers_for_test(&insts, &leaders);
+        let sample_pc = insts.iter().find(|d| d.enc.name == "ENC_MIMG").unwrap().pc;
+        assert_eq!(map.get(&sample_pc).map(|w| w[0]), Some(imm), "copy of known SGPR must fold");
+    }
+
+    /// Same-arm `s_cselect` (both sides equal) keeps the constant through the join.
+    #[test]
+    fn same_arm_cselect_folds_constant_sampler_word() {
+        let imm = 0x1111_2222u32;
+        let insts = decode_lines(&[
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 255)], Some(imm)),
+            ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 8), ("SSRC0", 4), ("SSRC1", 4)], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 9), ("SSRC0", 128)], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 128)], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 128)], None),
+            (
+                "IMAGE_SAMPLE_LZ",
+                "ENC_MIMG",
+                &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 2), ("DMASK", 0xF), ("DIM", 1)],
+                None,
+            ),
+            ("S_ENDPGM", "ENC_SOPP", &[("SIMM16", 0)], None),
+        ]);
+        let leaders: BTreeSet<u64> = insts.iter().map(|d| d.pc).collect();
+        let map = constant_samplers_for_test(&insts, &leaders);
+        let sample_pc = insts.iter().find(|d| d.enc.name == "ENC_MIMG").unwrap().pc;
+        assert_eq!(map.get(&sample_pc).map(|w| w[0]), Some(imm));
+    }
+
+    fn constant_samplers_for_test(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64, [u32; 4]> {
+        super::super::constant_samplers(insts, leaders, true)
     }
 }

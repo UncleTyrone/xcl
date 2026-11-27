@@ -340,8 +340,13 @@ pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
     if now.saturating_sub(LAST_MAINT_MS.load(Ordering::Relaxed)) >= 1000 {
         LAST_MAINT_MS.store(now, Ordering::Relaxed);
         super::residency::refresh();
-        super::texture_pool::tick(None);
+        let (used, _) = super::vram::page_bytes();
+        let budget = super::partial_fill::texture_budget_mb().saturating_mul(1 << 20);
+        super::texture_pool::tick(Some((budget, used as u64)));
     }
+    // Long-session DRM: drain deferred dynamic descriptor ranges when their submit fence completes
+    // (aligned with nvidia-dev; gated by XCL_RESIDENCY / XCL_DYNAMIC_SLOTS).
+    super::console_heap::settle_for_fence();
     super::console_heap::recycle_after_submit(queue as usize);
     super::late_release::drain_known(false);
     if !enabled() || IN_PRESENT.with(|c| c.get()) || PRESENTX.load(Ordering::Relaxed) {

@@ -2730,9 +2730,8 @@ impl Em {
             }
         };
         let t = self.t();
-        let tw0 = self.sreg(srsrc);
-        let tw1 = self.sreg(srsrc + 1);
-        let tw3 = self.sreg(srsrc + 3);
+        // Constant T# when `static_sr` / LanePhi joins prove SRSRC; else live SGPRs.
+        let (tw0, tw1, _, tw3) = self.buffer_sr(d.pc, srsrc);
         let act = self.act();
         let ps = matches!(self.opt.mode, Mode::Pixel(_));
         // Guard against null / unpatched / OOB T# descriptors so AMD Tier-3 GPUs never page-fault
