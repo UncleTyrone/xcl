@@ -746,9 +746,107 @@ unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty:
 struct QueueUploads {
     fence: ID3D12Fence,
     value: u64,
+    in_flight: std::collections::VecDeque<(u64, texture::InFlight)>,
+    bytes: u64,
 }
 
+unsafe impl Send for QueueUploads {}
+
 static ON_QUEUE: Mutex<BTreeMap<usize, QueueUploads>> = Mutex::new(BTreeMap::new());
+
+const IN_FLIGHT_BYTES: u64 = 512 << 20;
+
+unsafe fn title_queue_for(dev: &ID3D12Device, title: Option<&ID3D12CommandQueue>) -> Option<ID3D12CommandQueue> {
+    let q = title?;
+    if q.GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT {
+        return None;
+    }
+    let mut qd: Option<ID3D12Device> = None;
+    q.GetDevice(&mut qd).ok()?;
+    (qd?.as_raw() == dev.as_raw()).then(|| q.clone())
+}
+
+/// Non-blockingly release completed in-flight upload batches for `queue_key` so staging buffers do
+/// not stay pinned during quiet frames with no new texture uploads.
+unsafe fn reclaim_completed_on_queue(queue_key: usize) {
+    if queue_key == 0 {
+        return;
+    }
+    let mut g = ON_QUEUE.lock().unwrap();
+    let Some(q) = g.get_mut(&queue_key) else { return };
+    if q.in_flight.is_empty() {
+        return;
+    }
+    let done = q.fence.GetCompletedValue();
+    while q.in_flight.front().is_some_and(|&(v, _)| v <= done) {
+        let (_, f) = q.in_flight.pop_front().unwrap();
+        q.bytes = q.bytes.saturating_sub(f.bytes);
+    }
+}
+
+unsafe fn reclaim(dev: &ID3D12Device, q: &mut QueueUploads, cap: u64, wait_ms: u32) {
+    let done = q.fence.GetCompletedValue();
+    while q.in_flight.front().is_some_and(|&(v, _)| v <= done) {
+        let (_, f) = q.in_flight.pop_front().unwrap();
+        q.bytes = q.bytes.saturating_sub(f.bytes);
+    }
+    while q.bytes > cap {
+        let Some(&(v, _)) = q.in_flight.front() else { break };
+        if crate::gpu::fence::wait(&q.fence, v, dev, None, wait_ms).is_err() {
+            break;
+        }
+        let (_, f) = q.in_flight.pop_front().unwrap();
+        q.bytes = q.bytes.saturating_sub(f.bytes);
+    }
+}
+
+unsafe fn submit_on_title_queue(dev: &ID3D12Device, queue: &ID3D12CommandQueue, batch: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<Vec<(usize, String)>, String> {
+    super::vram::before_execute(queue);
+    let (failed, f) = texture::submit_batch(dev, queue, batch)?;
+    let Some(f) = f else { return Ok(failed) };
+    let mut g = ON_QUEUE.lock().unwrap();
+    let key = queue.as_raw() as usize;
+    if !g.contains_key(&key) {
+        match dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
+            Ok(fence) => {
+                g.insert(key, QueueUploads { fence, value: 0, in_flight: std::collections::VecDeque::new(), bytes: 0 });
+            }
+            Err(e) => {
+                texture::wait(dev, queue)?;
+                drop(f);
+                return Err(e.to_string());
+            }
+        }
+    }
+    let q = g.get_mut(&key).unwrap();
+    q.value += 1;
+    if let Err(e) = queue.Signal(&q.fence, q.value) {
+        q.value -= 1;
+        texture::wait(dev, queue)?;
+        drop(f);
+        return Err(e.to_string());
+    }
+    super::flight::signaled("texture uploads", key, &q.fence, q.value);
+    q.bytes = q.bytes.saturating_add(f.bytes);
+    let v = q.value;
+    q.in_flight.push_back((v, f));
+    reclaim(dev, q, IN_FLIGHT_BYTES, 10_000);
+    super::texture_upload_ahead::record_sent(&super::texture_upload_ahead::Sent {
+        fence: q.fence.clone(),
+        value: q.value,
+    });
+    Ok(failed)
+}
+
+unsafe fn ahead_sent(_dev: &ID3D12Device, queue: &ID3D12CommandQueue) -> Option<super::texture_upload_ahead::Sent> {
+    let key = queue.as_raw() as usize;
+    let g = ON_QUEUE.lock().unwrap();
+    let q = g.get(&key)?;
+    Some(super::texture_upload_ahead::Sent {
+        fence: q.fence.clone(),
+        value: q.value,
+    })
+}
 
 unsafe fn wait_queue_uploads(queue: &ID3D12CommandQueue) {
     let key = queue.as_raw() as usize;
@@ -764,12 +862,54 @@ unsafe fn wait_queue_uploads(queue: &ID3D12CommandQueue) {
     super::list_x::note_internal_wait(key, "texture uploads", &fence, value);
 }
 
-/// Upload one still-pending texture (`XCL_UPLOAD_AHEAD` worker).
-pub(super) unsafe fn upload_if_pending(_res: usize) -> Result<Option<super::texture_upload_ahead::Sent>, String> {
-    Ok(None)
+/// Upload one still-pending texture on XCL's upload queue (`XCL_UPLOAD_AHEAD`).
+pub(super) unsafe fn upload_if_pending(res: usize) -> Result<Option<super::texture_upload_ahead::Sent>, String> {
+    let (r, upload, device) = {
+        let t = TEXTURES.lock().unwrap();
+        let Some(e) = t.by_res.get(&res) else {
+            return Ok(None);
+        };
+        if !e.pending || e.gpu_written {
+            return Ok(None);
+        }
+        let p = res as *mut c_void;
+        let r = ID3D12Resource::from_raw_borrowed(&p).ok_or_else(|| "no resource".to_string())?;
+        (
+            r.clone(),
+            (e.device, e.src, Arc::clone(&e.tex), e.states.clone()),
+            e.device,
+        )
+    };
+    let size = upload.2.size() as usize;
+    let picked = [(r.clone(), upload.1, upload.2, upload.3)];
+    let subs = subresources_of_all(&picked, size);
+    let Some(subs) = subs.into_iter().next() else {
+        return Ok(None);
+    };
+    if super::vram::level_pages() {
+        map_levels_with_texels(&r, &subs);
+    }
+    let d = device as *mut c_void;
+    let dev = ID3D12Device::from_raw_borrowed(&d).ok_or_else(|| "no device".to_string())?;
+    let queue = upload_queue(dev, device)?;
+    let states = picked[0].3.clone();
+    let batch = [(r, subs, states)];
+    let failed = submit_on_title_queue(dev, &queue, &batch)?;
+    if let Some((_, e)) = failed.into_iter().next() {
+        return Err(e);
+    }
+    let mut t = TEXTURES.lock().unwrap();
+    if let Some(e) = t.by_res.get_mut(&res).filter(|e| e.pending) {
+        e.pending = false;
+        adjust_pending(-1);
+    }
+    drop(t);
+    UPLOADS.fetch_add(1, Ordering::Relaxed);
+    Ok(ahead_sent(dev, &queue))
 }
 
 unsafe fn refresh_once(queue: *mut c_void) {
+    reclaim_completed_on_queue(queue as usize);
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
         super::texture_upload_ahead::wait_for(q);
         if super::texture_policy::show_after() {
@@ -887,7 +1027,13 @@ unsafe fn refresh_once(queue: *mut c_void) {
             .collect()
     });
     seed_stream_recheck(&todo, &ranges, recheck_frame);
-    upload_all(todo);
+    let uploaded = !todo.is_empty();
+    upload_all(todo, ID3D12CommandQueue::from_raw_borrowed(&queue));
+    if uploaded {
+        if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
+            super::vram::before_execute(q);
+        }
+    }
 }
 
 /// texture → `content_hash` of its memory at its last upload
@@ -1147,8 +1293,10 @@ fn batch_fits(picked_count: usize, picked_bytes: usize, batch_dev: usize, next_d
             && picked_bytes.saturating_add(next_bytes) <= BATCH_BYTES)
 }
 
-/// The uploads `todo`, in batches of up to `BATCH_BYTES` and `BATCH_ITEMS` (one list and one wait each).
-unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
+/// The uploads `todo`, in batches of up to `BATCH_BYTES` and `BATCH_ITEMS`. Direct title queues
+/// execute uploads inline with a bounded in-flight staging ring (no CPU fence stall); other queues
+/// fall back to the upload queue.
+unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12CommandQueue>) {
     static N: AtomicU64 = AtomicU64::new(0);
     let warn = |e: &str| {
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -1200,6 +1348,18 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
         }
         let d = device as *mut c_void;
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
+        if let Some(tq) = title_queue_for(dev, title) {
+            match own_work(|| submit_on_title_queue(dev, &tq, &batch)) {
+                Ok(failed) => {
+                    for (_, e) in failed {
+                        warn(&e);
+                    }
+                    UPLOADS.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                }
+                Err(e) => warn(&e),
+            }
+            continue;
+        }
         let queue = match upload_queue(dev, device) {
             Ok(q) => q,
             Err(e) => {
