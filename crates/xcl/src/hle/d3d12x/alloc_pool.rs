@@ -286,7 +286,12 @@ unsafe fn wait_for_previous_submits_within(lists: &[*mut c_void], limit: std::ti
 /// submitted again before that; `title_list` records the title's next recording elsewhere).
 pub fn in_flight(list: usize) -> bool {
     let g = STATE.lock().unwrap();
-    g.as_ref().and_then(|s| s.last_submit.get(&list)).is_some_and(|l| unsafe { l.fence.GetCompletedValue() } < l.value)
+    g.as_ref().and_then(|s| s.last_submit.get(&list)).is_some_and(|l| unsafe { super::real::fence_completed(&l.fence) } < l.value)
+}
+
+/// Fence value after the latest tracked submit on `queue` (deferred descriptor recycle).
+pub fn queue_submission_mark(queue: usize) -> Option<(ID3D12Fence, u64)> {
+    STATE.lock().unwrap().as_ref()?.fences.get(&queue).cloned()
 }
 
 /// `lists` were just submitted to `queue`.

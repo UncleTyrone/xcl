@@ -63,6 +63,7 @@ impl FenceTable {
         for (p, mirror) in cells {
             Self::refresh_one(p, &mirror);
         }
+        unsafe { super::console_heap::settle_for_fence() };
     }
 
     fn note_queue_signal(&self, fence: usize, value: u64) -> bool {

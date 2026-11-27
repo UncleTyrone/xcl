@@ -12,14 +12,18 @@ use std::sync::{Mutex, OnceLock};
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 use super::list_x;
 use super::real;
 
 static SKIPPED: AtomicU64 = AtomicU64::new(0);
 static SUBMITTED: AtomicU64 = AtomicU64::new(0);
 static COPIES: AtomicU64 = AtomicU64::new(0);
+static FILLS: AtomicU64 = AtomicU64::new(0);
 static GAP_LOGGED: OnceLock<()> = OnceLock::new();
 static ENABLED_LOGGED: OnceLock<()> = OnceLock::new();
+
+const STAGING_BYTES: u64 = 4 << 20;
 
 #[derive(Clone, Copy, Debug)]
 struct CopyStep {
@@ -28,7 +32,23 @@ struct CopyStep {
     len: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct FillStep {
+    src: usize,
+    len: usize,
+    slot_cpu: u64,
+}
+
 static PENDING: Mutex<VecDeque<CopyStep>> = Mutex::new(VecDeque::new());
+static PENDING_FILLS: Mutex<VecDeque<FillStep>> = Mutex::new(VecDeque::new());
+
+struct StagingBuf {
+    buf: ID3D12Resource,
+    gpu: u64,
+    dev_key: usize,
+}
+
+static STAGING: Mutex<Option<StagingBuf>> = Mutex::new(None);
 
 struct Own {
     alloc: ID3D12CommandAllocator,
@@ -100,8 +120,42 @@ pub fn defer_copy_to_prelude(dst: usize, src: usize, len: usize) -> bool {
     true
 }
 
+fn fill_eligible(src: usize, len: usize) -> bool {
+    if len == 0 || len > 64 * 1024 || !len.is_multiple_of(16) {
+        return false;
+    }
+    if !super::port::constants() {
+        return false;
+    }
+    if super::port_constants::on() && !super::port_constants::touches_range(src, len) {
+        return false;
+    }
+    real::uma_window_buffer(src, len).is_some()
+}
+
+/// Stage 1+: queue a constant-buffer fill for the GPU prelude (CBV retargeted at staging).
+pub fn defer_fill_to_prelude(src: usize, len: usize, slot_cpu: u64) -> bool {
+    if stage() < 1 || !super::relay::exact() {
+        return false;
+    }
+    if !fill_eligible(src, len) {
+        return false;
+    }
+    let mut q = PENDING_FILLS.lock().unwrap_or_else(|e| e.into_inner());
+    q.push_back(FillStep { src, len, slot_cpu });
+    true
+}
+
 fn drain_pending() -> Vec<CopyStep> {
     let mut q = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    if q.is_empty() {
+        return Vec::new();
+    }
+    std::mem::take(&mut *q).into()
+}
+
+fn drain_fills() -> Vec<FillStep> {
+    let mut q = PENDING_FILLS.lock().unwrap_or_else(|e| e.into_inner());
     if q.is_empty() {
         return Vec::new();
     }
@@ -125,35 +179,73 @@ pub fn try_prep_before_lists(queue: *mut c_void, _mapped: &[*mut c_void]) -> boo
     }
   ENABLED_LOGGED.get_or_init(|| {
         crate::xlog_info!(
-            "D3D12.X: XCL_CARD_STEPS={st} GPU prelude enabled (deferred buffer copies before title lists)"
+            "D3D12.X: XCL_CARD_STEPS={st} GPU prelude enabled (constant fills / deferred copies before title lists)"
         );
     });
 
-    let ops = drain_pending();
-    if ops.is_empty() {
-        return false;
-    }
-    if st < 2 {
-        // Stage 1 constant fills are not queued on this path yet; copies still require stage 2.
-        SKIPPED.fetch_add(1, Ordering::Relaxed);
+    let fills = if st >= 1 { drain_fills() } else { Vec::new() };
+    let copies = if st >= 2 { drain_pending() } else { Vec::new() };
+    if fills.is_empty() && copies.is_empty() {
         return false;
     }
 
-    let ok = unsafe { submit_copies(queue, &ops) };
+    let ok = unsafe { submit_prelude(queue, &fills, &copies) };
     if ok {
         SUBMITTED.fetch_add(1, Ordering::Relaxed);
-        COPIES.fetch_add(ops.len() as u64, Ordering::Relaxed);
+        if !fills.is_empty() {
+            FILLS.fetch_add(fills.len() as u64, Ordering::Relaxed);
+        }
+        if !copies.is_empty() {
+            COPIES.fetch_add(copies.len() as u64, Ordering::Relaxed);
+        }
     } else {
         SKIPPED.fetch_add(1, Ordering::Relaxed);
-        for op in ops {
+        for op in copies {
             let _ = defer_copy_to_prelude(op.dst, op.src, op.len);
+        }
+        for op in fills {
+            let _ = defer_fill_to_prelude(op.src, op.len, op.slot_cpu);
         }
     }
     ok
 }
 
-unsafe fn submit_copies(queue: *mut c_void, ops: &[CopyStep]) -> bool {
-    if queue.is_null() || ops.is_empty() {
+unsafe fn staging(dev: &ID3D12Device, dev_key: usize) -> Result<(), String> {
+    let mut g = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = g.as_ref() {
+        if s.dev_key == dev_key {
+            return Ok(());
+        }
+    }
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Alignment: 0,
+        Width: STAGING_BYTES,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_NONE,
+    };
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_UPLOAD,
+        CreationNodeMask: 1,
+        VisibleNodeMask: 1,
+        ..Default::default()
+    };
+    let mut buf: Option<ID3D12Resource> = None;
+    dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut buf)
+        .map_err(|e| format!("card staging buffer: {e}"))?;
+    let buf = buf.ok_or("card staging buffer missing")?;
+    let gpu = buf.GetGPUVirtualAddress();
+    *g = Some(StagingBuf { buf, gpu, dev_key });
+    Ok(())
+}
+
+unsafe fn submit_prelude(queue: *mut c_void, fills: &[FillStep], copies: &[CopyStep]) -> bool {
+    if queue.is_null() || (fills.is_empty() && copies.is_empty()) {
         return false;
     }
     let Some(queue) = ID3D12CommandQueue::from_raw_borrowed(&queue) else {
@@ -173,8 +265,34 @@ unsafe fn submit_copies(queue: *mut c_void, ops: &[CopyStep]) -> bool {
     }
 
     let run = (|| -> Result<(), String> {
+        if !fills.is_empty() {
+            staging(&dev, dev_key)?;
+        }
+        let staging_raw = STAGING.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|s| s.buf.as_raw() as usize);
+        let staging_gpu = STAGING.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|s| s.gpu).unwrap_or(0);
         let (alloc, list, list_raw) = take_list(&dev, dev_key, ty)?;
-        for op in ops {
+        let mut off = 0u64;
+        let mut planned: Vec<(FillStep, u64)> = Vec::with_capacity(fills.len());
+        for fill in fills {
+            let len = fill.len as u64;
+            if off + len > STAGING_BYTES {
+                return Err("card prelude staging overflow".into());
+            }
+            let Some(staging_raw) = staging_raw else {
+                return Err("fill staging missing".into());
+            };
+            let Some((s, soff)) = real::uma_window_buffer(fill.src, fill.len) else {
+                return Err("fill no longer in UMA".into());
+            };
+            list_x::transition(list_raw, s, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list_x::as_copy_dest(list_raw, staging_raw, || {
+                list_x::copy_buffer_region(list_raw, staging_raw, off, s, soff, len);
+            });
+            list_x::transition(list_raw, s, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            planned.push((*fill, off));
+            off = (off + len).next_multiple_of(256);
+        }
+        for op in copies {
             let (Some((d, doff)), Some((s, soff))) = (
                 real::uma_window_buffer(op.dst, op.len),
                 real::uma_window_buffer(op.src, op.len),
@@ -197,6 +315,11 @@ unsafe fn submit_copies(queue: *mut c_void, ops: &[CopyStep]) -> bool {
         queue.Signal(&fence, value).map_err(|e| format!("Signal: {e}"))?;
         crate::gpu::fence::wait(&fence, value, &dev, None, 30_000)
             .map_err(|e| format!("card prelude wait: {e}"))?;
+        for (fill, at) in planned {
+            if let Some(slot) = super::console_heap::slot(fill.slot_cpu).filter(|s| !s.sampler) {
+                super::console_heap::write(&slot, &crate::gpu::desc::cbv_words(staging_gpu + at, fill.len as u32));
+            }
+        }
         return_list(dev_key, ty, alloc, list);
         Ok(())
     })();
@@ -250,12 +373,14 @@ pub fn log_stats(frames: f64) {
     }
     let submitted = SUBMITTED.swap(0, Ordering::Relaxed) as f64 / frames;
     let copies = COPIES.swap(0, Ordering::Relaxed) as f64 / frames;
+    let fills = FILLS.swap(0, Ordering::Relaxed) as f64 / frames;
     let skip = SKIPPED.swap(0, Ordering::Relaxed) as f64 / frames;
     if submitted > 0.0 || skip > 0.0 {
         crate::xlog_info!(
-            "D3D12.X: card_steps (XCL_CARD_STEPS={}): {:.1} GPU preludes/frame, {:.0} copies/frame{skip}",
+            "D3D12.X: card_steps (XCL_CARD_STEPS={}): {:.1} GPU preludes/frame, {:.0} fills/frame, {:.0} copies/frame{skip}",
             stage(),
             submitted,
+            fills,
             copies,
             skip = if skip > 0.0 { format!(", {:.0} skipped/frame", skip) } else { String::new() },
         );

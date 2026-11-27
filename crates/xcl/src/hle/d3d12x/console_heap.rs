@@ -278,6 +278,9 @@ static GLOBAL_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 
 /// descriptors of the shared heap at most (the GPU may take more: OPTIONS19)
 pub const GLOBAL_MAX: u32 = 1_000_000;
+/// First PC index for dynamic view ranges in the shared heap; below this are null views and
+/// memory-window UAVs (`set_window_views`, `null_views_to`).
+pub const MIN_DYNAMIC: u32 = 1 << 18;
 // (one million: what every resource binding tier 2+ GPU takes. The translated shaders accept a
 // T# index only below it (`gpu::dxil::lower_image::VIEW_HEAP_MAX_SRV`), so the heap must never be
 // smaller than that bound: an index past the heap's end hangs NVIDIA GPUs, which took 1 000 000
@@ -363,17 +366,17 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             }
         };
         crate::xlog_info!("console descriptor heaps: one shader-visible PC heap of {cap} view descriptors for all of them");
-        null_views(dev, heap.GetCPUDescriptorHandleForHeapStart().ptr as u64, dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+        let cpu = heap.GetCPUDescriptorHandleForHeapStart().ptr as u64;
+        let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        null_views_to(dev, cpu, inc, MIN_DYNAMIC);
         *g = Some(Global {
             dev: dev.clone(),
-            cpu: heap.GetCPUDescriptorHandleForHeapStart().ptr as u64,
+            cpu,
             gpu: heap.GetGPUDescriptorHandleForHeapStart().ptr,
-            inc: dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
+            inc,
             heap,
             cap,
-            // the memory windows' raw UAVs and the null view after them (`set_window_views`)
-            // come first
-            next: crate::gpu::recomp::MEM_HEAP_NULL + 1,
+            next: MIN_DYNAMIC,
             free: Vec::new(),
             retired: VecDeque::new(),
             leases: LeasePool::default(),
@@ -387,7 +390,12 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
 /// console slot: even SRV, odd UAV), where shaders land for a T# of zeros (word 0, the PC index,
 /// is 0): they read zeros there rather than whatever an unwritten descriptor holds.
 unsafe fn null_views(dev: &ID3D12Device, cpu: u64, inc: u32) {
-    for k in 0..crate::gpu::recomp::MEM_HEAP_BASE as u64 {
+    null_views_to(dev, cpu, inc, crate::gpu::recomp::MEM_HEAP_BASE);
+}
+
+/// Even SRV / odd UAV null views at `0..to`.
+unsafe fn null_views_to(dev: &ID3D12Device, cpu: u64, inc: u32, to: u32) {
+    for k in 0..to as u64 {
         let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + k * inc as u64) as usize };
         if k % 2 == 0 {
             let d = D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -404,6 +412,89 @@ unsafe fn null_views(dev: &ID3D12Device, cpu: u64, inc: u32) {
                 Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_UAV::default() },
             };
             dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&d), at);
+        }
+    }
+}
+
+static SUBMIT_HOLDS: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+
+struct PendingDynamic {
+    fence: ID3D12Fence,
+    value: u64,
+    ranges: Vec<(u32, u32)>,
+}
+
+static PENDING_DYNAMIC: Mutex<Vec<PendingDynamic>> = Mutex::new(Vec::new());
+
+/// Hold a dynamic descriptor range until the submit that recorded it finishes (`recycle_after_submit`).
+pub fn hold_for_submit(first: u32, count: u32) {
+    if count > 0 && first >= MIN_DYNAMIC {
+        SUBMIT_HOLDS.lock().unwrap().push((first, count));
+    }
+}
+
+/// Return dynamic descriptor ranges after a queue submit; call from `present::note_execute`.
+pub fn recycle_after_submit(queue: usize) {
+    let holds = std::mem::take(&mut *SUBMIT_HOLDS.lock().unwrap());
+    if holds.is_empty() {
+        return;
+    }
+    if super::residency::defer_dynamic_slots() {
+        if let Some((fence, value)) = super::alloc_pool::queue_submission_mark(queue) {
+            PENDING_DYNAMIC.lock().unwrap().push(PendingDynamic { fence, value, ranges: holds });
+            return;
+        }
+    }
+    for (first, count) in holds {
+        release_global(first, count);
+    }
+}
+
+fn pending_dynamic_len() -> usize {
+    PENDING_DYNAMIC.lock().unwrap().len()
+}
+
+/// Retry fence-driven release of deferred dynamic descriptor ranges (CGBJ `settle_for_fence`).
+pub unsafe fn settle_for_fence() {
+    if !super::residency::defer_dynamic_slots() {
+        return;
+    }
+    for _ in 0..4 {
+        let before = pending_dynamic_len();
+        drain_completed_dynamic_slots();
+        if pending_dynamic_len() == before {
+            break;
+        }
+    }
+}
+
+/// Ranges held until the submit fence that recorded them has completed.
+pub unsafe fn drain_completed_dynamic_slots() {
+    if !super::residency::defer_dynamic_slots() {
+        return;
+    }
+    let mut pending = PENDING_DYNAMIC.lock().unwrap();
+    let mut released = 0u32;
+    let mut i = 0;
+    while i < pending.len() {
+        let done = pending[i].ranges.is_empty()
+            || super::real::fence_completed(&pending[i].fence) >= pending[i].value;
+        if done {
+            let gone = pending.swap_remove(i);
+            for (first, count) in gone.ranges {
+                release_global(first, count);
+                released = released.saturating_add(count);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    if released > 0 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static RELEASED: AtomicU64 = AtomicU64::new(0);
+        let n = RELEASED.fetch_add(released as u64, Ordering::Relaxed) + released as u64;
+        if n == released as u64 || (n >= 4096 && n.saturating_sub(released as u64) < 4096) {
+            crate::xlog_info!("D3D12.X: released {released} dynamic descriptor slots after GPU fence completion ({n} total)");
         }
     }
 }
@@ -670,7 +761,13 @@ pub fn free(Taken(h): Taken) {
         if h.sampler {
             release_global_sampler(f, sampler_page_descriptors(h.n, p as u32));
         } else {
-            release_global(f, page_descriptors(h.n, p as u32));
+            let first = f;
+            let count = page_descriptors(h.n, p as u32);
+            if super::residency::defer_dynamic_slots() && first >= MIN_DYNAMIC {
+                hold_for_submit(first, count);
+            } else {
+                release_global(first, count);
+            }
         }
     }
     match h.memory {

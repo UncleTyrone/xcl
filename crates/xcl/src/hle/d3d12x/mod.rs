@@ -51,6 +51,7 @@ pub(crate) mod port_constants;
 pub(crate) mod port_cbv;
 pub(crate) mod dxr_build;
 pub mod present;
+mod residency;
 pub mod prof;
 pub mod pso_async;
 pub mod pso_library;

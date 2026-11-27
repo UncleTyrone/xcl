@@ -727,6 +727,11 @@ pub(super) unsafe fn is_adopted(obj: *mut c_void) -> bool {
     !obj.is_null() && crate::gpu::shader::readable(obj as usize, 8) && is_ext(*(obj as *const usize))
 }
 
+/// GetCompletedValue without re-entering the title's fence hook (`console_heap::settle_for_fence`).
+pub(super) unsafe fn fence_completed(fence: &ID3D12Fence) -> u64 {
+    fence.GetCompletedValue()
+}
+
 /// A struct-returning method's first two arguments: true when `a` is the object (the C++ way:
 /// this, return buffer, …), false when `b` is (the C way: return buffer, this, …). A return
 /// buffer on the stack can hold a stale copy of an object's vtable pointer and look adopted
@@ -2598,6 +2603,9 @@ unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12
         }
     };
     super::console_heap::write(&slot, &crate::gpu::desc::cbv_words(va, size));
+    if va != 0 {
+        let _ = super::card_steps::defer_fill_to_prelude(va as usize, size as usize, cpu);
+    }
     if super::port_cbv::constants_raw() {
         let in_place = super::port_constants::on() && super::port_constants::touches_range(va as usize, size as usize);
         if in_place && super::port_cbv::in_place_on() && super::port_cbv::raw_ok(va) {

@@ -335,7 +335,7 @@ pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
             q.push(queue as usize);
         }
     }
-    super::console_heap::recycle_after_submit();
+    super::console_heap::recycle_after_submit(queue as usize);
     super::late_release::drain_known(false);
     if !enabled() || IN_PRESENT.with(|c| c.get()) || PRESENTX.load(Ordering::Relaxed) {
         return;
