@@ -141,6 +141,44 @@ impl Bdd {
         self.implies_in(a, b, &mut HashSet::new())
     }
 
+    /// Whether some assignment satisfies every `(node, holds)` — CGBJ `Bools::meet` subset
+    /// (case-split on top vars with a split budget; yes when the budget runs out).
+    fn meet_sat(&self, all: &[(B, bool)], budget: usize) -> bool {
+        let mut work: Vec<(B, bool)> = Vec::with_capacity(all.len());
+        for &(b, holds) in all {
+            if b == FALSE {
+                if holds {
+                    return false;
+                }
+                continue;
+            }
+            if b == TRUE {
+                if !holds {
+                    return false;
+                }
+                continue;
+            }
+            work.push((b, holds));
+        }
+        if work.is_empty() || budget == 0 {
+            return true;
+        }
+        let top = work.iter().map(|&(b, _)| self.nodes[b as usize].0).min().unwrap();
+        let mut lo_side = Vec::with_capacity(work.len());
+        let mut hi_side = Vec::with_capacity(work.len());
+        for &(b, holds) in &work {
+            let (v, lo, hi) = self.nodes[b as usize];
+            if v == top {
+                lo_side.push((lo, holds));
+                hi_side.push((hi, holds));
+            } else {
+                lo_side.push((b, holds));
+                hi_side.push((b, holds));
+            }
+        }
+        self.meet_sat(&lo_side, budget - 1) || self.meet_sat(&hi_side, budget - 1)
+    }
+
     fn implies_in(&self, a: B, b: B, seen: &mut HashSet<(B, B)>) -> bool {
         if a == FALSE || b == TRUE || a == b {
             return true;
@@ -1031,6 +1069,15 @@ mod tests {
     }
 
     #[test]
+    fn meet_sat_rejects_contradiction_and_accepts_atom() {
+        let mut bdd = Bdd::new();
+        let a = bdd.mk(0, FALSE, TRUE).unwrap();
+        let na = bdd.not(a).unwrap();
+        assert!(bdd.meet_sat(&[(a, true)], 8));
+        assert!(!bdd.meet_sat(&[(a, true), (na, true)], 8));
+        assert!(bdd.meet_sat(&[(a, true), (na, false)], 8));
+    }
+
     fn implication_tests_agree_with_the_built_formulas() {
         let mut bdd = Bdd::new();
         let x: Vec<B> = (0..4).map(|v| bdd.mk(v, FALSE, TRUE).unwrap()).collect();
