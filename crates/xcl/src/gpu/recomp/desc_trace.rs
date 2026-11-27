@@ -1,21 +1,21 @@
 //! Per-lane descriptor origin tracing and waterfall proof (GPL-2).
 //!
 //! Study-only CGBJ (`victory-shader` `Source::{Fetched,Lanes,LanePhi,Select}`, Tracer waterfall,
-//! emit `lane_heap_index`) is GPL-3; this module reimplements the **subset** XCL can prove on
-//! decoded RDNA2 without CGBJ's SSA `Value` / full Structured BDD IR:
+//! emit `lane_heap_index`) is GPL-3; this module reimplements what XCL can **prove** on decoded
+//! RDNA2 without CGBJ's SSA `Value` / Structured block IR:
 //! - waterfall loops via [`scan_waterfall_loops`] (`v_readfirstlane` + `v_cmp_eq` + `s_cbranch_execnz`);
-//!   whole-loop `SPLIT` when reads/accesses span blocks; [`peel_same_block_waterfalls`] still meets
-//!   self-contained per-block sites (CGBJ proves `waterfall` per CFG block)
-//! - selected/remaining/retry structural meet + VCC/saveexec wiring; when [`lane_masks::analyze`]
-//!   succeeds, per-`v_cmp_eq` pairing (`compares_pair_reads`) and guarded-PC refuse
-//! - `Fetched` (optional `saddr`) / `Lanes` (SGPR arms followed) / `LanePhi` / SCC `Select`
-//! - per-access [`LaneHeapExpr`] for DXIL/HLSL `NonUniformResourceIndex` (lane_heap_index analogue),
-//!   including off-waterfall Fetched / Lanes / Select fills
-//! - per-lane T# dwords 0..3 from waterfall `v_readfirstlane` sources (not only dword0)
-//! - nested [`only_edge`] peel (Tracer `live` / `MAX_JOINS` budget) + lane_masks BDD polarity
+//!   whole-loop `SPLIT` when reads/accesses span blocks (**MATCH** CGBJ per-block rule);
+//!   [`peel_same_block_waterfalls`] meets self-contained per-block sites
+//! - selected/remaining/retry **structural** meet + VCC/saveexec wiring + guarded-PC refuse
+//! - `Fetched` (optional `saddr`, multi-load OFFSET lineup) / `Lanes` (mask-bit known fold) /
+//!   `LanePhi` (joined VGPR emit; dead edges → `None`) / SCC `Select` (mixed high-half refuse)
+//! - per-access [`LaneHeapExpr`] for DXIL/HLSL `NonUniformResourceIndex` (lane_heap_index analogue)
+//! - per-lane T# dwords 0..3 as [`TsharpWord`] (VGPR or SCC select pair)
+//! - nested sole-live peel (Tracer `live` / `MAX_JOINS`) + lane_masks BDD polarity / `dead_edges`
 //!
-//! Nested / multi-block natural loops may still whole-loop `split`; peeled same-block accesses can
-//! `meet_ok`. Full IR-level Structured BDD `meet` remains subset (no CGBJ SSA Bools).
+//! **IMPOSSIBLE digression (decoded-RDNA2):** full CGBJ Structured BDD `Bools::meet` over SSA
+//! atoms (selected/remaining/retry as shared variables with birth/`forget`). XCL keeps the
+//! structural + `implies`/`guarded` subset; do not raise [`MAX_TRACE_DEPTH`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -35,12 +35,14 @@ pub enum DescSource {
     Loaded { load_pc: u64, first: u8, offset: u32 },
     /// `global_load_dword*` into VGPRs (per-lane heap table entry).
     /// `saddr_sgpr` is the scalar base when present (not `null` / `EXEC`).
+    /// `sibling_load_pc` is a lined-up second load (OFFSET += width) when present (image T#).
     Fetched {
         load_pc: u64,
         first: u8,
         addr_vgpr: u64,
         saddr_sgpr: Option<u64>,
         offset: u32,
+        sibling_load_pc: Option<u64>,
     },
     /// `v_cndmask_b32` pick by one lane mask (set arm, then clear arm).
     Lanes {
@@ -49,8 +51,11 @@ pub enum DescSource {
         clear: Box<DescSource>,
     },
     /// Control-flow join of per-lane sources (one arm per predecessor; `None` = dead edge).
+    /// `vgpr` is the joined register after the CFG merge (emit uses it when arms differ —
+    /// reconstructing a DXIL phi of predecessor `Value`s is an SSA digression).
     LanePhi {
         join_pc: u64,
+        vgpr: u64,
         arms: Vec<Option<DescSource>>,
     },
     /// Chosen by wave-uniform SCC (`s_cselect` / `s_cmov`): source when set, then when clear.
@@ -101,9 +106,12 @@ pub enum LaneHeapExpr {
         set: Box<LaneHeapExpr>,
         clear: Box<LaneHeapExpr>,
     },
-    /// Nested select over predecessor arms (dead arms → 0); join already happened in VGPRs when
-    /// only [`LaneHeapExpr::VgprDword0`] appears uniformly.
-    LanePhi { arms: Vec<Option<LaneHeapExpr>> },
+    /// Nested select over predecessor arms (dead arms → 0). When arms differ, emit
+    /// [`joined_vgpr`] (the post-join VGPR) — SSA CFG phi is an IMPOSSIBLE digression.
+    LanePhi {
+        arms: Vec<Option<LaneHeapExpr>>,
+        joined_vgpr: Option<u64>,
+    },
     /// `select(scc != 0, set, clear)` — wave-uniform SCC (CGBJ `Source::Select`).
     Select {
         set: Box<LaneHeapExpr>,
@@ -112,15 +120,32 @@ pub enum LaneHeapExpr {
     Imm(u32),
 }
 
+/// One T# / V# dword proven per lane (waterfall VGPR or SCC select of two VGPRs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TsharpWord {
+    Vgpr(u64),
+    /// `select(scc != 0, set, clear)` when non-waterfall SCC arms differ on this dword.
+    Select { set: u64, clear: u64 },
+}
+
+impl TsharpWord {
+    pub fn as_vgpr(self) -> Option<u64> {
+        match self {
+            TsharpWord::Vgpr(v) => Some(v),
+            TsharpWord::Select { set, clear } if set == clear => Some(set),
+            _ => None,
+        }
+    }
+}
+
 /// Result of tracing a program for per-lane descriptors + waterfall.
 #[derive(Debug, Clone, Default)]
 pub struct DescTrace {
     pub waterfall: WaterfallProof,
     /// Access PC → per-lane heap index when a waterfall (or uniform Fetched / Select) proves it.
     pub lane_heap: BTreeMap<u64, LaneHeapExpr>,
-    /// Access PC → VGPR holding each of T# dwords 0..3 when waterfall readfirstlanes prove them.
-    /// `None` slot falls back to the live SGPR (readfirstlane result) at emit time.
-    pub lane_tsharp: BTreeMap<u64, [Option<u64>; 4]>,
+    /// Access PC → each of T# dwords 0..3 when proven; `None` → live SGPR at emit.
+    pub lane_tsharp: BTreeMap<u64, [Option<TsharpWord>; 4]>,
     /// Access PC → classified descriptor origin (Fetched / Lanes / LanePhi / Select / …).
     pub origins: BTreeMap<u64, DescSource>,
     /// Join PC → sole live predecessor block-start PC when BDD polarity + heuristics agree.
@@ -129,6 +154,8 @@ pub struct DescTrace {
     pub dead_edges: BTreeMap<u64, Vec<u64>>,
     /// Vector instruction PCs that still need a per-lane EXEC guard (Structured `guards` analogue).
     pub guarded: BTreeSet<u64>,
+    /// `(pc, mask_sgpr) → known lane-bit` from BDD (`TRUE`/`FALSE`) for Lanes fold.
+    pub mask_known: BTreeMap<(u64, u64), bool>,
 }
 
 fn f(d: &Decoded, n: &str) -> Option<u64> {
@@ -169,6 +196,7 @@ pub fn trace(insts: &[Decoded]) -> DescTrace {
     let join_pol = masks.as_ref().ok().map(|s| s.join_edge_live.clone());
     if let Ok(ref sum) = masks {
         out.guarded.extend(sum.guarded.iter().copied());
+        out.mask_known.extend(sum.mask_known.iter().map(|(&(pc, sg), &v)| ((pc, sg), v)));
         for (join_pc, edges) in &sum.join_edge_live {
             let live: Vec<u64> = edges.iter().filter(|(_, l)| *l).map(|(p, _)| *p).collect();
             let dead: Vec<u64> = edges.iter().filter(|(_, l)| !*l).map(|(p, _)| *p).collect();
@@ -201,6 +229,56 @@ pub fn trace(insts: &[Decoded]) -> DescTrace {
     prove_lane_heap_origins(insts, join_pol.as_ref(), &mut out);
     prove_per_lane_tsharp(insts, join_pol.as_ref(), &mut out);
     out
+}
+
+/// Byte width of a `GLOBAL_`/`FLAT_LOAD_DWORD*` for Fetched OFFSET lineup.
+fn load_byte_width(name: &str) -> u32 {
+    if name.contains("X16") {
+        64
+    } else if name.contains("X8") {
+        32
+    } else if name.contains("X4") {
+        16
+    } else if name.contains("X3") {
+        12
+    } else if name.contains("X2") {
+        8
+    } else {
+        4
+    }
+}
+
+/// Sibling `global`/`flat` load with same ADDR/SADDR and OFFSET += width (CGBJ Fetched lineup).
+fn fetched_sibling_load(insts: &[Decoded], load: &Decoded) -> Option<u64> {
+    let name = load.inst.name;
+    if !(name.starts_with("GLOBAL_LOAD_DWORD") || name.starts_with("FLAT_LOAD_DWORD")) {
+        return None;
+    }
+    let addr = f(load, "ADDR")?;
+    let saddr = f(load, "SADDR");
+    let offset = f(load, "OFFSET").unwrap_or(0) as u32;
+    let width = load_byte_width(name);
+    let want = offset.wrapping_add(width);
+    let li = insts.iter().position(|d| d.pc == load.pc)?;
+    let window = MAX_TRACE_DEPTH.min(insts.len());
+    let lo = li.saturating_sub(window / 2);
+    let hi = (li + window).min(insts.len());
+    for d in &insts[lo..hi] {
+        if d.pc == load.pc {
+            continue;
+        }
+        let n = d.inst.name;
+        if !(n.starts_with("GLOBAL_LOAD_DWORD") || n.starts_with("FLAT_LOAD_DWORD")) {
+            continue;
+        }
+        if f(d, "ADDR") != Some(addr) || f(d, "SADDR") != saddr {
+            continue;
+        }
+        if f(d, "OFFSET").unwrap_or(0) as u32 == want {
+            return Some(d.pc);
+        }
+    }
+    None
 }
 
 /// Collapse `only_edge` chains up to [`MAX_ONLY_EDGE_PEEL`] (CGBJ Tracer `live` peel).
@@ -562,10 +640,13 @@ fn waterfall_meet_ok(
     };
     let se_pc = insts[se].pc;
     let se_d = &insts[se];
-    // AND_SAVEEXEC must take the compare mask (VCC / EXEC from v_cmpx).
+    // AND_SAVEEXEC must take the compare mask (VCC / EXEC from v_cmpx / readfirstlane SGPR).
+    // Do **not** accept every SAVEEXEC by name — that made the VCC check vacuous.
     let saveexec_from_mask = {
         let src = f(se_d, "SSRC0").unwrap_or(u64::MAX);
-        src == 106 || src == 126 || se_d.inst.name.starts_with("S_AND_SAVEEXEC")
+        src == 106
+            || src == 126
+            || wf.reads.iter().any(|&(_, _, dst, _)| dst == src)
     };
     if !saveexec_from_mask {
         return false;
@@ -672,7 +753,14 @@ fn prove_waterfalls(
                 }
                 merge_lane_tsharp(out, apc, tsharp);
 
-                let origin = classify_vgpr(insts, vgpr0, &out.only_edge, join_pol);
+                let origin = classify_vgpr(
+                    insts,
+                    vgpr0,
+                    &out.only_edge,
+                    join_pol,
+                    &out.dead_edges,
+                    &out.mask_known,
+                );
                 out.origins.insert(apc, origin.clone());
                 let sampler = ad.enc.name == "ENC_MIMG" && f(ad, "SSAMP").is_some();
                 if let Some(expr) = heap_expr_from_source(&origin, sampler) {
@@ -723,7 +811,14 @@ fn prove_lane_heap_origins(
             .cloned()
             .or_else(|| {
                 let vgpr = sgpr_to_lane_vgpr(insts, d.pc, srsrc)?;
-                Some(classify_vgpr(insts, vgpr, &out.only_edge, join_pol))
+                Some(classify_vgpr(
+                    insts,
+                    vgpr,
+                    &out.only_edge,
+                    join_pol,
+                    &out.dead_edges,
+                    &out.mask_known,
+                ))
             });
         let Some(origin) = origin else { continue };
         let keep = matches!(
@@ -793,13 +888,13 @@ fn prove_scc_selects(insts: &[Decoded], out: &mut DescTrace) {
     }
 }
 
-/// Per-dword SCC select when set/clear arms map to distinct lane VGPR roots (dwords 1..3).
+/// Per-dword SCC select → [`TsharpWord`] (same VGPR, or select pair; never prefer set alone).
 fn lane_tsharp_select_dword(
     insts: &[Decoded],
     access_pc: u64,
     sgpr: u64,
     shift: u8,
-) -> Option<u64> {
+) -> Option<TsharpWord> {
     let w0 = last_sgpr_writer(insts, access_pc, sgpr)?;
     let (set0, clear0) = match w0.inst.name {
         "S_CSELECT_B32" => (f(w0, "SSRC0")?, f(w0, "SSRC1")?),
@@ -809,20 +904,19 @@ fn lane_tsharp_select_dword(
         _ => return None,
     };
     if set0 == clear0 {
-        return sgpr_to_lane_vgpr(insts, w0.pc, set0);
+        return sgpr_to_lane_vgpr(insts, w0.pc, set0).map(TsharpWord::Vgpr);
     }
     let set = classify_select_arm(insts, w0.pc, set0, shift)?;
     let clear = classify_select_arm(insts, w0.pc, clear0, shift)?;
     if set == clear {
-        return sgpr_to_lane_vgpr(insts, w0.pc, set0);
+        return sgpr_to_lane_vgpr(insts, w0.pc, set0).map(TsharpWord::Vgpr);
     }
-    let vs = sgpr_to_lane_vgpr(insts, w0.pc, set0);
-    let vc = sgpr_to_lane_vgpr(insts, w0.pc, clear0);
-    match (vs, vc) {
-        (Some(a), Some(b)) if a == b => Some(a),
-        (Some(a), _) => Some(a),
-        (_, Some(b)) => Some(b),
-        _ => None,
+    let vs = sgpr_to_lane_vgpr(insts, w0.pc, set0)?;
+    let vc = sgpr_to_lane_vgpr(insts, w0.pc, clear0)?;
+    if vs == vc {
+        Some(TsharpWord::Vgpr(vs))
+    } else {
+        Some(TsharpWord::Select { set: vs, clear: vc })
     }
 }
 
@@ -856,6 +950,8 @@ fn prove_per_lane_tsharp(
                     vgpr,
                     &out.only_edge,
                     join_pol,
+                    &out.dead_edges,
+                    &out.mask_known,
                 ))
             });
         let Some(origin) = origin else { continue };
@@ -867,7 +963,7 @@ fn prove_per_lane_tsharp(
     }
 }
 
-fn merge_lane_tsharp(out: &mut DescTrace, access_pc: u64, words: [Option<u64>; 4]) {
+fn merge_lane_tsharp(out: &mut DescTrace, access_pc: u64, words: [Option<TsharpWord>; 4]) {
     if words.iter().all(|w| w.is_none()) {
         return;
     }
@@ -883,7 +979,10 @@ fn merge_lane_tsharp(out: &mut DescTrace, access_pc: u64, words: [Option<u64>; 4
         .or_insert(words);
 }
 
-fn merge_tsharp_slots(a: [Option<u64>; 4], b: [Option<u64>; 4]) -> [Option<u64>; 4] {
+fn merge_tsharp_slots(
+    a: [Option<TsharpWord>; 4],
+    b: [Option<TsharpWord>; 4],
+) -> [Option<TsharpWord>; 4] {
     let mut out = a;
     for k in 0..4 {
         if out[k].is_none() {
@@ -893,24 +992,28 @@ fn merge_tsharp_slots(a: [Option<u64>; 4], b: [Option<u64>; 4]) -> [Option<u64>;
     out
 }
 
-fn lane_tsharp_from_reads(srsrc: Option<u64>, reads: &[(u64, u64, u64)]) -> [Option<u64>; 4] {
+fn lane_tsharp_from_reads(srsrc: Option<u64>, reads: &[(u64, u64, u64)]) -> [Option<TsharpWord>; 4] {
     let mut tsharp = [None; 4];
     let Some(s) = srsrc else { return tsharp };
     for k in 0..4u64 {
         if let Some(&(_, _, v)) = reads.iter().find(|&&(_, dst, _)| dst == s + k) {
-            tsharp[k as usize] = Some(v);
+            tsharp[k as usize] = Some(TsharpWord::Vgpr(v));
         }
     }
     tsharp
 }
 
 /// Trace SRSRC dwords back to a shared per-lane VGPR when SCC arms agree on the dword.
-fn lane_tsharp_from_srsrc(insts: &[Decoded], before_pc: u64, srsrc: Option<u64>) -> [Option<u64>; 4] {
+fn lane_tsharp_from_srsrc(
+    insts: &[Decoded],
+    before_pc: u64,
+    srsrc: Option<u64>,
+) -> [Option<TsharpWord>; 4] {
     let Some(base) = srsrc else { return [None; 4] };
     let mut out = [None; 4];
     for k in 0..4u64 {
         if let Some(v) = sgpr_to_lane_vgpr(insts, before_pc, base + k) {
-            out[k as usize] = Some(v);
+            out[k as usize] = Some(TsharpWord::Vgpr(v));
         }
     }
     out
@@ -961,11 +1064,15 @@ fn sgpr_to_lane_vgpr_depth(insts: &[Decoded], before_pc: u64, sgpr: u64, depth: 
 }
 
 /// VGPR roots of a traced origin (Fetched x4 / uniform arms on Lanes|Select / LanePhi peel).
-fn lane_tsharp_from_source(insts: &[Decoded], src: &DescSource) -> [Option<u64>; 4] {
+fn lane_tsharp_from_source(insts: &[Decoded], src: &DescSource) -> [Option<TsharpWord>; 4] {
     lane_tsharp_from_source_depth(insts, src, 0)
 }
 
-fn lane_tsharp_from_source_depth(insts: &[Decoded], src: &DescSource, depth: usize) -> [Option<u64>; 4] {
+fn lane_tsharp_from_source_depth(
+    insts: &[Decoded],
+    src: &DescSource,
+    depth: usize,
+) -> [Option<TsharpWord>; 4] {
     if depth >= MAX_TRACE_DEPTH {
         return [None; 4];
     }
@@ -989,23 +1096,28 @@ fn lane_tsharp_from_source_depth(insts: &[Decoded], src: &DescSource, depth: usi
                     break;
                 }
                 let v = vdst + start + k as u64;
-                out[k] = Some(v);
+                out[k] = Some(TsharpWord::Vgpr(v));
             }
-            // Multi-load image T#: second global_load_dwordx4 for dwords 4..7 is ignored for
-            // heap index (dword0 only); T# words 0..3 stay on this load's VGPRs.
+            // Multi-load image T#: sibling dwordx4 (dwords 4..7) is recorded on Fetched for
+            // lineup; heap index stays dword0; T# words 0..3 stay on this load's VGPRs.
             out
         }
         DescSource::VgprDword0(v) => {
             let mut out = [None; 4];
-            out[0] = Some(*v);
+            out[0] = Some(TsharpWord::Vgpr(*v));
             out
         }
-        DescSource::Lanes { set, clear, .. } | DescSource::Select { set, clear } => {
+        DescSource::Lanes { set, clear, .. } => {
             let s = lane_tsharp_from_source_depth(insts, set, depth + 1);
             let c = lane_tsharp_from_source_depth(insts, clear, depth + 1);
             merge_tsharp_uniform_arms(s, c)
         }
-        DescSource::LanePhi { arms, .. } => {
+        DescSource::Select { set, clear } => {
+            let s = lane_tsharp_from_source_depth(insts, set, depth + 1);
+            let c = lane_tsharp_from_source_depth(insts, clear, depth + 1);
+            merge_tsharp_select_arms(s, c)
+        }
+        DescSource::LanePhi { arms, vgpr, .. } => {
             let live: Vec<_> = arms
                 .iter()
                 .filter_map(|a| a.as_ref().map(|s| lane_tsharp_from_source_depth(insts, s, depth + 1)))
@@ -1014,7 +1126,6 @@ fn lane_tsharp_from_source_depth(insts: &[Decoded], src: &DescSource, depth: usi
                 0 => [None; 4],
                 1 => live[0],
                 _ => {
-                    // Uniform arms: keep agreeing slots (CGBJ anywhere/fold when edges agree).
                     let mut acc = live[0];
                     for arm in &live[1..] {
                         for k in 0..4 {
@@ -1022,6 +1133,9 @@ fn lane_tsharp_from_source_depth(insts: &[Decoded], src: &DescSource, depth: usi
                                 acc[k] = None;
                             }
                         }
+                    }
+                    if acc[0].is_none() {
+                        acc[0] = Some(TsharpWord::Vgpr(*vgpr));
                     }
                     acc
                 }
@@ -1031,11 +1145,32 @@ fn lane_tsharp_from_source_depth(insts: &[Decoded], src: &DescSource, depth: usi
     }
 }
 
-fn merge_tsharp_uniform_arms(a: [Option<u64>; 4], b: [Option<u64>; 4]) -> [Option<u64>; 4] {
+fn merge_tsharp_uniform_arms(
+    a: [Option<TsharpWord>; 4],
+    b: [Option<TsharpWord>; 4],
+) -> [Option<TsharpWord>; 4] {
     let mut out = [None; 4];
     for k in 0..4 {
         out[k] = match (a[k], b[k]) {
             (Some(x), Some(y)) if x == y => Some(x),
+            _ => None,
+        };
+    }
+    out
+}
+
+/// SCC Select arms: same VGPR → keep; differing VGPR roots → [`TsharpWord::Select`].
+fn merge_tsharp_select_arms(
+    a: [Option<TsharpWord>; 4],
+    b: [Option<TsharpWord>; 4],
+) -> [Option<TsharpWord>; 4] {
+    let mut out = [None; 4];
+    for k in 0..4 {
+        out[k] = match (a[k], b[k]) {
+            (Some(x), Some(y)) if x == y => Some(x),
+            (Some(TsharpWord::Vgpr(s)), Some(TsharpWord::Vgpr(c))) => {
+                Some(TsharpWord::Select { set: s, clear: c })
+            }
             _ => None,
         };
     }
@@ -1172,31 +1307,28 @@ fn classify_select_srsrc(
     if set == clear {
         return None;
     }
-    // Optional: require the high half also selected from matching loads (same SCC).
-    if let Some(w1) = last_sgpr_writer(insts, access_pc, srsrc + 2) {
-        if matches!(
+    // High half must also be a select whose set/clear identity matches the low pair
+    // (CGBJ mixed high-half refuse — fail closed, never keep a select that mixes descriptors).
+    let high_sgpr = if matches!(name, "S_CSELECT_B32" | "S_CMOV_B32") {
+        srsrc + 1
+    } else {
+        srsrc + 2
+    };
+    if let Some(w1) = last_sgpr_writer(insts, access_pc, high_sgpr) {
+        if !matches!(
             w1.inst.name,
             "S_CSELECT_B32" | "S_CSELECT_B64" | "S_CMOV_B32" | "S_CMOV_B64"
         ) {
-            // High half present and also a select — good; mixed halves refused by CGBJ.
-            let (s1, c1) = match w1.inst.name {
-                "S_CSELECT_B32" | "S_CSELECT_B64" => (f(w1, "SSRC0")?, f(w1, "SSRC1")?),
-                _ => (f(w1, "SSRC0")?, srsrc + 2),
-            };
-            // Refuse mixed: set arm's high must come from the same load family as set's low.
-            let set_h = classify_select_arm(insts, w1.pc, s1, shift);
-            let clear_h = classify_select_arm(insts, w1.pc, c1, shift);
-            if let (Some(sh), Some(ch), DescSource::Loaded { load_pc: lp, .. }, DescSource::Loaded { load_pc: lc, .. }) =
-                (set_h, clear_h, &set, &clear)
-            {
-                match (&sh, &ch) {
-                    (
-                        DescSource::Loaded { load_pc: a, .. },
-                        DescSource::Loaded { load_pc: b, .. },
-                    ) if a == lp && b == lc => {}
-                    _ => return None,
-                }
-            }
+            return None; // non-select high writer → mixed / untracked
+        }
+        let (s1, c1) = match w1.inst.name {
+            "S_CSELECT_B32" | "S_CSELECT_B64" => (f(w1, "SSRC0")?, f(w1, "SSRC1")?),
+            _ => (f(w1, "SSRC0")?, high_sgpr),
+        };
+        let set_h = classify_select_arm(insts, w1.pc, s1, shift)?;
+        let clear_h = classify_select_arm(insts, w1.pc, c1, shift)?;
+        if !select_arms_same_family(&set, &set_h) || !select_arms_same_family(&clear, &clear_h) {
+            return None;
         }
     }
     Some(DescSource::Select {
@@ -1205,9 +1337,29 @@ fn classify_select_srsrc(
     })
 }
 
+/// Low/high select arms share a load_pc or Imm identity (mixed high-half check).
+fn select_arms_same_family(low: &DescSource, high: &DescSource) -> bool {
+    match (low, high) {
+        (DescSource::Loaded { load_pc: a, .. }, DescSource::Loaded { load_pc: b, .. }) => a == b,
+        (DescSource::Imm(a), DescSource::Imm(b)) => a == b,
+        (DescSource::VgprDword0(a), DescSource::VgprDword0(b)) => a == b,
+        _ => false,
+    }
+}
+
 fn collect_loads(src: &DescSource, loads: &mut BTreeSet<u64>) {
     match src {
-        DescSource::Fetched { load_pc, .. } | DescSource::Loaded { load_pc, .. } => {
+        DescSource::Fetched {
+            load_pc,
+            sibling_load_pc,
+            ..
+        } => {
+            loads.insert(*load_pc);
+            if let Some(s) = sibling_load_pc {
+                loads.insert(*s);
+            }
+        }
+        DescSource::Loaded { load_pc, .. } => {
             loads.insert(*load_pc);
         }
         DescSource::Lanes { set, clear, .. } | DescSource::Select { set, clear } => {
@@ -1243,8 +1395,19 @@ fn classify_vgpr(
     vgpr: u64,
     only_edge: &BTreeMap<u64, u64>,
     join_pol: Option<&BTreeMap<u64, Vec<(u64, bool)>>>,
+    dead_edges: &BTreeMap<u64, Vec<u64>>,
+    mask_known: &BTreeMap<(u64, u64), bool>,
 ) -> DescSource {
-    classify_vgpr_depth(insts, vgpr, only_edge, join_pol, 0, None)
+    classify_vgpr_depth(
+        insts,
+        vgpr,
+        only_edge,
+        join_pol,
+        dead_edges,
+        mask_known,
+        0,
+        None,
+    )
 }
 
 fn lane_phi_at_join(
@@ -1253,6 +1416,8 @@ fn lane_phi_at_join(
     join_pc: u64,
     only_edge: &BTreeMap<u64, u64>,
     join_pol: Option<&BTreeMap<u64, Vec<(u64, bool)>>>,
+    dead_edges: &BTreeMap<u64, Vec<u64>>,
+    mask_known: &BTreeMap<(u64, u64), bool>,
     depth: usize,
 ) -> Option<DescSource> {
     if depth >= MAX_TRACE_DEPTH {
@@ -1264,6 +1429,13 @@ fn lane_phi_at_join(
     if cfg.pred[join_idx].len() < 2 {
         return None;
     }
+    // Loop-header refuse (MATCH): any back-edge pred → no LanePhi (CGBJ Tracer).
+    if cfg.pred[join_idx]
+        .iter()
+        .any(|&p| cfg.rpo[p] >= cfg.rpo[join_idx])
+    {
+        return None;
+    }
     if let Some(&sole_pred) = only_edge.get(&join_pc) {
         let lo = sole_pred;
         let hi = join_pc;
@@ -1272,16 +1444,26 @@ fn lane_phi_at_join(
             vgpr,
             only_edge,
             join_pol,
+            dead_edges,
+            mask_known,
             depth + 1,
             Some((lo, hi)),
         ));
     }
-    let pol = join_pol?;
-    let edges = pol.get(&join_pc)?;
+    let dead = dead_edges.get(&join_pc);
+    let pol = join_pol;
+    let edges = pol.and_then(|p| p.get(&join_pc));
     let mut arms: Vec<Option<DescSource>> = Vec::new();
     for &pred_idx in &cfg.pred[join_idx] {
         let pred_pc = cfg.blocks[pred_idx][0].pc;
-        let live = edges.iter().find(|(p, _)| *p == pred_pc).map(|(_, l)| *l).unwrap_or(true);
+        let dead_map = dead.is_some_and(|d| d.contains(&pred_pc));
+        let live = if dead_map {
+            false
+        } else {
+            edges
+                .and_then(|e| e.iter().find(|(p, _)| *p == pred_pc).map(|(_, l)| *l))
+                .unwrap_or(true)
+        };
         if !live {
             arms.push(None);
             continue;
@@ -1291,6 +1473,8 @@ fn lane_phi_at_join(
             vgpr,
             only_edge,
             join_pol,
+            dead_edges,
+            mask_known,
             depth + 1,
             Some((pred_pc, join_pc)),
         )));
@@ -1298,7 +1482,11 @@ fn lane_phi_at_join(
     if arms.iter().filter_map(|a| a.as_ref()).count() < 2 {
         return arms.into_iter().flatten().next();
     }
-    Some(DescSource::LanePhi { join_pc, arms })
+    Some(DescSource::LanePhi {
+        join_pc,
+        vgpr,
+        arms,
+    })
 }
 
 fn classify_vgpr_depth(
@@ -1306,6 +1494,8 @@ fn classify_vgpr_depth(
     vgpr: u64,
     only_edge: &BTreeMap<u64, u64>,
     join_pol: Option<&BTreeMap<u64, Vec<(u64, bool)>>>,
+    dead_edges: &BTreeMap<u64, Vec<u64>>,
+    mask_known: &BTreeMap<(u64, u64), bool>,
     depth: usize,
     bound: Option<(u64, u64)>,
 ) -> DescSource {
@@ -1324,7 +1514,16 @@ fn classify_vgpr_depth(
         }
         let leader = block_start_at(insts, d.pc);
         if cfg_pred_count(insts, leader) >= 2 {
-            if let Some(phi) = lane_phi_at_join(insts, vgpr, leader, only_edge, join_pol, depth) {
+            if let Some(phi) = lane_phi_at_join(
+                insts,
+                vgpr,
+                leader,
+                only_edge,
+                join_pol,
+                dead_edges,
+                mask_known,
+                depth,
+            ) {
                 return phi;
             }
         }
@@ -1342,12 +1541,14 @@ fn classify_vgpr_depth(
                 }
             });
             let offset = f(d, "OFFSET").unwrap_or(0) as u32;
+            let sibling_load_pc = fetched_sibling_load(insts, d);
             return DescSource::Fetched {
                 load_pc: d.pc,
                 first,
                 addr_vgpr: addr,
                 saddr_sgpr: saddr,
                 offset,
+                sibling_load_pc,
             };
         }
         if name == "V_CNDMASK_B32" {
@@ -1367,15 +1568,22 @@ fn classify_vgpr_depth(
             };
             let resolve = |code: u64| -> DescSource {
                 if code >= 256 {
-                    classify_vgpr_depth(insts, code - 256, only_edge, join_pol, depth + 1, bound)
+                    classify_vgpr_depth(
+                        insts,
+                        code - 256,
+                        only_edge,
+                        join_pol,
+                        dead_edges,
+                        mask_known,
+                        depth + 1,
+                        bound,
+                    )
                 } else if code < 106 {
-                    // Follow scalar arm to Loaded / Imm (CGBJ `lane_select` per outcome).
-                    classify_select_arm(insts, d.pc, code, 5)
-                        .unwrap_or(DescSource::Loaded {
-                            load_pc: d.pc,
-                            first: 0,
-                            offset: 0,
-                        })
+                    classify_select_arm(insts, d.pc, code, 5).unwrap_or(DescSource::Loaded {
+                        load_pc: d.pc,
+                        first: 0,
+                        offset: 0,
+                    })
                 } else if (128..=208).contains(&code) {
                     let v = if code <= 192 {
                         (code - 128) as u32
@@ -1387,6 +1595,14 @@ fn classify_vgpr_depth(
                     DescSource::VgprDword0(vgpr)
                 }
             };
+            // Mask-bit known fold (CGBJ `known` push): BDD TRUE → set arm, FALSE → clear.
+            if let Some(&holds) = mask_known.get(&(d.pc, mask)) {
+                return if holds {
+                    resolve(set_src)
+                } else {
+                    resolve(clear_src)
+                };
+            }
             return DescSource::Lanes {
                 mask_sgpr: mask,
                 set: Box::new(resolve(set_src)),
@@ -1396,17 +1612,24 @@ fn classify_vgpr_depth(
         if name == "V_MOV_B32" {
             let src = f(d, "SRC0").unwrap_or(0);
             if src >= 256 {
-                return classify_vgpr_depth(insts, src - 256, only_edge, join_pol, depth + 1, bound);
+                return classify_vgpr_depth(
+                    insts,
+                    src - 256,
+                    only_edge,
+                    join_pol,
+                    dead_edges,
+                    mask_known,
+                    depth + 1,
+                    bound,
+                );
             }
             if src < 106 {
-                // Scalar → VGPR copy of a descriptor dword (lane_copies prelude).
                 if let Some(arm) = classify_select_arm(insts, d.pc, src, 5) {
                     return arm;
                 }
             }
         }
         let leader = block_start_at(insts, d.pc);
-        // Nested only_edge peel (Tracer `live` through several sole-live joins).
         if let Some(&pred0) = only_edge.get(&leader) {
             let mut deep = pred0;
             for _ in 1..MAX_ONLY_EDGE_PEEL {
@@ -1420,6 +1643,8 @@ fn classify_vgpr_depth(
                 vgpr,
                 only_edge,
                 join_pol,
+                dead_edges,
+                mask_known,
                 depth + 1,
                 Some((deep, leader)),
             );
@@ -1483,7 +1708,7 @@ fn heap_expr_from_source_depth(src: &DescSource, sampler: bool, depth: usize) ->
             set: Box::new(heap_expr_from_source_depth(set, sampler, depth + 1)?),
             clear: Box::new(heap_expr_from_source_depth(clear, sampler, depth + 1)?),
         }),
-        DescSource::LanePhi { arms, .. } => {
+        DescSource::LanePhi { arms, vgpr, .. } => {
             let mapped: Option<Vec<_>> = arms
                 .iter()
                 .map(|a| match a {
@@ -1500,7 +1725,11 @@ fn heap_expr_from_source_depth(src: &DescSource, sampler: bool, depth: usize) ->
             if live.len() > 1 && live.iter().all(|e| *e == live[0]) {
                 return Some(live[0].clone());
             }
-            Some(LaneHeapExpr::LanePhi { arms })
+            // Differing arms: emit the joined VGPR (SSA CFG phi = IMPOSSIBLE digression).
+            Some(LaneHeapExpr::LanePhi {
+                arms,
+                joined_vgpr: Some(*vgpr),
+            })
         }
     }
 }
@@ -1547,15 +1776,16 @@ pub fn lane_heap_hlsl(
             // SCC is wave-uniform (kernel ABI slot / HLSL `scc`).
             format!("select(scc != 0u, {s}, {c})")
         }
-        LaneHeapExpr::LanePhi { arms } => {
+        LaneHeapExpr::LanePhi { arms, joined_vgpr } => {
             let live: Vec<&LaneHeapExpr> = arms.iter().flatten().collect();
             match live.len() {
-                0 => "0u".into(),
+                0 => joined_vgpr.map(|v| vreg(v)).unwrap_or_else(|| "0u".into()),
                 1 => lane_heap_hlsl(live[0], sreg, vreg),
                 _ if live.iter().all(|e| *e == live[0]) => lane_heap_hlsl(live[0], sreg, vreg),
-                // Distinct CFG arms without an edge predicate: prefer first live (join already
-                // happened in VGPRs for VgprDword0-uniform cases folded above).
-                _ => lane_heap_hlsl(live[0], sreg, vreg),
+                // Distinct CFG arms: joined VGPR already holds the merge (no SSA phi).
+                _ => joined_vgpr
+                    .map(|v| vreg(v))
+                    .unwrap_or_else(|| lane_heap_hlsl(live[0], sreg, vreg)),
             }
         }
     }
@@ -1627,10 +1857,10 @@ mod tests {
             "selected/remaining/retry structural meet"
         );
         let ts = t.lane_tsharp.get(&sample_pc).expect("per-lane T# dwords");
-        assert_eq!(ts[0], Some(4));
-        assert_eq!(ts[1], Some(5));
-        assert_eq!(ts[2], Some(6));
-        assert_eq!(ts[3], Some(7));
+        assert_eq!(ts[0], Some(TsharpWord::Vgpr(4)));
+        assert_eq!(ts[1], Some(TsharpWord::Vgpr(5)));
+        assert_eq!(ts[2], Some(TsharpWord::Vgpr(6)));
+        assert_eq!(ts[3], Some(TsharpWord::Vgpr(7)));
     }
 
     #[test]
@@ -1919,6 +2149,90 @@ mod tests {
             ),
             "got {:?}",
             t.lane_heap.get(&access)
+        );
+    }
+
+    #[test]
+    fn fetched_sibling_dwordx4_lineup_recorded() {
+        const V: u64 = 256;
+        let insts = decode_lines(&[
+            (
+                "GLOBAL_LOAD_DWORDX4",
+                "ENC_FLAT_GLBL",
+                &[("VDST", 4), ("ADDR", 1), ("SADDR", 0x7D), ("OFFSET", 0)],
+                None,
+            ),
+            (
+                "GLOBAL_LOAD_DWORDX4",
+                "ENC_FLAT_GLBL",
+                &[("VDST", 8), ("ADDR", 1), ("SADDR", 0x7D), ("OFFSET", 16)],
+                None,
+            ),
+            ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 12), ("SRC0", V + 4)], None),
+            ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 12), ("VSRC1", 4)], None),
+            ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 106)], None),
+            (
+                "BUFFER_LOAD_DWORD",
+                "ENC_MUBUF",
+                &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)],
+                None,
+            ),
+            ("S_XOR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 4)], None),
+            ("S_CBRANCH_EXECNZ", "ENC_SOPP", &[("SIMM16", 0xFFF8)], None),
+            ("S_ENDPGM", "ENC_SOPP", &[("SIMM16", 0)], None),
+        ]);
+        let t = trace(&insts);
+        let access = insts.iter().find(|d| d.enc.name == "ENC_MUBUF").unwrap().pc;
+        let sib = insts
+            .iter()
+            .find(|d| d.inst.name.starts_with("GLOBAL_LOAD") && f(d, "OFFSET") == Some(16))
+            .map(|d| d.pc);
+        assert!(
+            matches!(
+                t.origins.get(&access),
+                Some(DescSource::Fetched {
+                    sibling_load_pc: s,
+                    ..
+                }) if *s == sib
+            ),
+            "got {:?}",
+            t.origins.get(&access)
+        );
+    }
+
+    #[test]
+    fn scc_select_mixed_high_half_refused() {
+        // Low half switches A/B; high half is a plain mov from A — mixed → no Select.
+        let insts = decode_lines(&[
+            (
+                "S_LOAD_DWORDX4",
+                "ENC_SMEM",
+                &[("SDATA", 0), ("SBASE", 6), ("OFFSET", 0), ("SOFFSET", 125)],
+                None,
+            ),
+            (
+                "S_LOAD_DWORDX4",
+                "ENC_SMEM",
+                &[("SDATA", 4), ("SBASE", 6), ("OFFSET", 0x10), ("SOFFSET", 125)],
+                None,
+            ),
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 14), ("SSRC1", 128)], None),
+            ("S_CSELECT_B64", "ENC_SOP2", &[("SDST", 8), ("SSRC0", 0), ("SSRC1", 4)], None),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 2)], None),
+            (
+                "BUFFER_LOAD_DWORD",
+                "ENC_MUBUF",
+                &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)],
+                None,
+            ),
+            ("S_ENDPGM", "ENC_SOPP", &[("SIMM16", 0)], None),
+        ]);
+        let t = trace(&insts);
+        let access = insts.iter().find(|d| d.enc.name == "ENC_MUBUF").unwrap().pc;
+        assert!(
+            !matches!(t.origins.get(&access), Some(DescSource::Select { .. })),
+            "mixed high half must refuse Select, got {:?}",
+            t.origins.get(&access)
         );
     }
 }

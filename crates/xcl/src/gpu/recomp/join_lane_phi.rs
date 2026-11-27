@@ -15,8 +15,9 @@
 //! - Differing-arm SCC `Select` / Fetched / Lanes / LanePhi live in [`super::desc_trace`]
 //! - Waterfall selected/remaining/retry structural meet + VCC/saveexec wiring + per-lane T#
 //!
-//! **Still out of scope vs full CGBJ:** full Structured BDD `Bools::meet` on waterfall
-//! selected/remaining/retry atoms; IR-level SSA phi reconstruction.
+//! **IMPOSSIBLE digression (decoded-RDNA2):** full Structured BDD `Bools::meet` on SSA atoms
+//! and IR-level SSA phi reconstruction. Behavioral MATCH: sole-live peel, dead edges → `None`,
+//! SGPR follow, structural waterfall + joined-VGPR emit.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -217,7 +218,9 @@ where
             match known.get(&r) {
                 Some(hv) if *hv == v => {}
                 Some(_) => {
-                    // Conflict at peel: keep join map (forward merge already decided).
+                    // Sole-live peel wins over a conflicting join seed (CGBJ `live` arm).
+                    known.insert(r, v);
+                    changed = true;
                 }
                 None => {
                     known.insert(r, v);

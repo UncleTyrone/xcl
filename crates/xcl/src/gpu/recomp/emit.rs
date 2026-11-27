@@ -63,7 +63,7 @@ pub(super) struct Em {
     /// SCC Select descriptor (CGBJ `lane_heap_index` analogue).
     pub lane_heap: BTreeMap<u64, super::desc_trace::LaneHeapExpr>,
     /// Access PC → VGPR for each of T# dwords 0..3 when waterfall readfirstlanes prove them.
-    pub lane_tsharp: BTreeMap<u64, [Option<u64>; 4]>,
+    pub lane_tsharp: BTreeMap<u64, [Option<super::desc_trace::TsharpWord>; 4]>,
     /// the static samplers sampled with: (S#, comparison), in register order
     pub static_used: Vec<([u32; 4], bool)>,
     /// highest VGPR the program references (v_movrel* ranges)
@@ -809,9 +809,18 @@ impl Em {
             };
             super::desc_trace::lane_heap_hlsl(&expr, &mut sfn, &mut vfn)
         });
-        // Per-lane T# dwords 1..3 from waterfall VGPRs (CGBJ keeps the whole descriptor per lane).
+        // Per-lane T# dwords 1..3 from waterfall VGPRs / SCC select pairs.
         let lane_word = |s: &mut Self, k: usize| -> Option<String> {
-            s.lane_tsharp.get(&pc).and_then(|ts| ts[k]).map(|v| s.vreg(v))
+            use super::desc_trace::TsharpWord;
+            match s.lane_tsharp.get(&pc).and_then(|ts| ts[k]) {
+                Some(TsharpWord::Vgpr(v)) => Some(s.vreg(v)),
+                Some(TsharpWord::Select { set, clear }) => {
+                    let a = s.vreg(set);
+                    let b = s.vreg(clear);
+                    Some(format!("select(scc != 0u, {a}, {b})"))
+                }
+                None => None,
+            }
         };
         let tw0 = lane_tw0
             .or_else(|| lane_word(self, 0))
