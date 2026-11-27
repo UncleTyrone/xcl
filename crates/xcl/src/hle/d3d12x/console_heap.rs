@@ -25,6 +25,7 @@
 //! Without the shared heap (it could not be made) a heap keeps its own PC heap: SRV at 2k,
 //! UAV at 2k + 1.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Mutex;
 
@@ -89,6 +90,9 @@ struct Global {
     /// a CPU-only heap of `NULL_BLOCK` null views (even SRV, odd UAV) and its start: copied over
     /// every range of the shared heap that is not handed out (`fill_nulls`)
     nulls: Option<(ID3D12DescriptorHeap, u64)>,
+    retired: VecDeque<super::desc_recycle::RetiredRange<ID3D12Fence>>,
+    leases: super::desc_recycle::LeasePool,
+    smallest_failed: u32,
 }
 
 // D3D12 descriptor heaps and devices are free-threaded
@@ -353,6 +357,9 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             next: MIN_DYNAMIC,
             free: Vec::new(),
             nulls,
+            retired: VecDeque::new(),
+            leases: super::desc_recycle::LeasePool::default(),
+            smallest_failed: u32::MAX,
         });
     }
     true
@@ -405,8 +412,33 @@ fn pending_dynamic_len() -> usize {
     PENDING_DYNAMIC.lock().unwrap().len()
 }
 
+/// Flush quarantined view/sampler heap ranges whose queue fence marks have passed.
+pub unsafe fn drain_quarantined_heaps() {
+    if let Some(s) = GLOBAL.lock().unwrap().as_mut() {
+        if super::desc_recycle::drain_retired_ranges(
+            &mut s.retired,
+            &mut s.free,
+            &mut s.leases,
+            |f| super::real::fence_completed(f),
+        ) {
+            s.smallest_failed = u32::MAX;
+        }
+    }
+    if let Some(s) = GLOBAL_SAMPLER.lock().unwrap().as_mut() {
+        if super::desc_recycle::drain_retired_ranges(
+            &mut s.retired,
+            &mut s.free,
+            &mut s.leases,
+            |f| super::real::fence_completed(f),
+        ) {
+            s.smallest_failed = u32::MAX;
+        }
+    }
+}
+
 /// Retry fence-driven release of deferred dynamic descriptor ranges (CGBJ `settle_for_fence`).
 pub unsafe fn settle_for_fence() {
+    drain_quarantined_heaps();
     if !super::residency::defer_dynamic_slots() {
         return;
     }
@@ -554,6 +586,17 @@ pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -
 fn reserve_global(count: u32) -> Option<u32> {
     let mut g = GLOBAL.lock().unwrap();
     let s = g.as_mut()?;
+    if super::desc_recycle::drain_retired_ranges(
+        &mut s.retired,
+        &mut s.free,
+        &mut s.leases,
+        |f| unsafe { super::real::fence_completed(f) },
+    ) {
+        s.smallest_failed = u32::MAX;
+    }
+    if count >= s.smallest_failed {
+        return None;
+    }
     let (cap, mut next) = (s.cap, s.next);
     let r = take_range(&mut s.free, &mut next, cap, count);
     s.next = next;
@@ -565,6 +608,7 @@ fn reserve_global(count: u32) -> Option<u32> {
             crate::xlog_info!("console descriptor heaps: the shared heap is past {} % full: {used} of its {cap} descriptors in use, {placed} pages placed", FILL_MARKS[marks - 1]);
         }
     } else {
+        s.smallest_failed = s.smallest_failed.min(count);
         let n = NO_ROOM.fetch_add(1, Relaxed) + 1;
         if n.is_power_of_two() {
             crate::xlog_warn!(
@@ -625,24 +669,32 @@ pub fn release_global(first: u32, count: u32) {
             n.clear(first, first + count);
         }
     }
+    let dev = GLOBAL.lock().unwrap().as_ref().map(|s| s.dev.clone());
+    let Some(dev) = dev else { return };
+    let marks = unsafe { super::desc_recycle::signal_live_queues_for(&dev) };
     if let Some(s) = GLOBAL.lock().unwrap().as_mut() {
-        merge_release(&mut s.free, first, count);
+        if marks.as_ref().is_some_and(Vec::is_empty) {
+            if s.leases.release_or_defer(&mut s.free, first, count) {
+                s.smallest_failed = u32::MAX;
+            }
+        } else {
+            s.retired.push_back(super::desc_recycle::RetiredRange { first, count, marks });
+        }
+        if super::desc_recycle::drain_retired_ranges(
+            &mut s.retired,
+            &mut s.free,
+            &mut s.leases,
+            |f| unsafe { super::real::fence_completed(f) },
+        ) {
+            s.smallest_failed = u32::MAX;
+        }
     }
 }
 
 /// Add a released range to `free`, merging the ranges it touches: adjacent releases become
 /// one range, so first-fit (and the cursor-straddle in `take_range`) sees the whole run.
 fn merge_release(free: &mut Vec<(u32, u32)>, first: u32, count: u32) {
-    free.push((first, count));
-    free.sort_unstable();
-    let mut out: Vec<(u32, u32)> = Vec::with_capacity(free.len());
-    for (f, n) in free.drain(..) {
-        match out.last_mut() {
-            Some(last) if f <= last.0 + last.1 => last.1 = last.1.max(f + n - last.0),
-            _ => out.push((f, n)),
-        }
-    }
-    *free = out;
+    super::desc_recycle::merge_release(free, first, count);
 }
 
 /// The shader-visible PC heap lists bind for view descriptors (None: none shared).
@@ -1095,6 +1147,9 @@ struct GlobalSampler {
     cap: u32,
     next: u32,
     free: Vec<(u32, u32)>,
+    retired: VecDeque<super::desc_recycle::RetiredRange<ID3D12Fence>>,
+    leases: super::desc_recycle::LeasePool,
+    smallest_failed: u32,
 }
 
 unsafe impl Send for GlobalSampler {}
@@ -1147,6 +1202,9 @@ pub unsafe fn shared_sampler_heap(dev: &ID3D12Device) -> bool {
             // Reserve slot 0 as the immutable point-wrap zero sampler for empty/zeroed S# entries.
             next: 1,
             free: Vec::new(),
+            retired: VecDeque::new(),
+            leases: super::desc_recycle::LeasePool::default(),
+            smallest_failed: u32::MAX,
         });
     }
     true
@@ -1155,10 +1213,22 @@ pub unsafe fn shared_sampler_heap(dev: &ID3D12Device) -> bool {
 fn reserve_global_sampler(count: u32) -> Option<u32> {
     let mut g = GLOBAL_SAMPLER.lock().unwrap();
     let s = g.as_mut()?;
+    if super::desc_recycle::drain_retired_ranges(
+        &mut s.retired,
+        &mut s.free,
+        &mut s.leases,
+        |f| unsafe { super::real::fence_completed(f) },
+    ) {
+        s.smallest_failed = u32::MAX;
+    }
+    if count >= s.smallest_failed {
+        return None;
+    }
     let (cap, mut next) = (s.cap, s.next);
     let r = take_range(&mut s.free, &mut next, cap, count);
     s.next = next;
     if r.is_none() {
+        s.smallest_failed = s.smallest_failed.min(count);
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
             crate::xlog_warn!("console descriptor heaps: the shared sampler heap ({cap}) is full – overflowed sampler slots map to reserved slot 0");
@@ -1181,8 +1251,25 @@ fn release_global_sampler(first: u32, count: u32) {
     if count == 0 {
         return;
     }
+    let dev = GLOBAL_SAMPLER.lock().unwrap().as_ref().map(|s| s.dev.clone());
+    let Some(dev) = dev else { return };
+    let marks = unsafe { super::desc_recycle::signal_live_queues_for(&dev) };
     if let Some(s) = GLOBAL_SAMPLER.lock().unwrap().as_mut() {
-        merge_release(&mut s.free, first, count);
+        if marks.as_ref().is_some_and(Vec::is_empty) {
+            if s.leases.release_or_defer(&mut s.free, first, count) {
+                s.smallest_failed = u32::MAX;
+            }
+        } else {
+            s.retired.push_back(super::desc_recycle::RetiredRange { first, count, marks });
+        }
+        if super::desc_recycle::drain_retired_ranges(
+            &mut s.retired,
+            &mut s.free,
+            &mut s.leases,
+            |f| unsafe { super::real::fence_completed(f) },
+        ) {
+            s.smallest_failed = u32::MAX;
+        }
     }
 }
 
@@ -1359,6 +1446,7 @@ mod tests {
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
                 cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024,
                 next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32, free: Vec::new(), nulls: None,
+                retired: VecDeque::new(), leases: super::desc_recycle::LeasePool::default(), smallest_failed: u32::MAX,
             });
             let window = (&mut resource as *mut _ as usize, 0x10000);
             // the root-UAV slots past the windows there are: null views, not window 0 again
@@ -1594,6 +1682,7 @@ mod tests {
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
                 cpu: 0x10_0000, gpu: 0x20_0000, inc: 32, cap: MIN_DYNAMIC + 2 * PAGE_SLOTS,
                 next: MIN_DYNAMIC, free: Vec::new(), nulls: None,
+                retired: VecDeque::new(), leases: super::desc_recycle::LeasePool::default(), smallest_failed: u32::MAX,
             });
         }
         let rel = |p: u64| (p as usize - u.base()) as u32;
@@ -1730,6 +1819,7 @@ mod tests {
                 dev: ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void),
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
                 cpu: 0x1000, inc: 32, cap: 17, next: 1, free: Vec::new(),
+                retired: VecDeque::new(), leases: super::desc_recycle::LeasePool::default(), smallest_failed: u32::MAX,
             });
             assert_eq!(reserve_global_sampler(4), Some(1));
             assert_eq!(reserve_global_sampler(4), Some(5));
@@ -1789,11 +1879,13 @@ mod tests {
                 dev: dev.clone(),
                 heap: ID3D12DescriptorHeap::from_raw(&mut view_heap as *mut _ as *mut c_void),
                 cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024, next: 64, free: Vec::new(), nulls: None,
+                retired: VecDeque::new(), leases: super::desc_recycle::LeasePool::default(), smallest_failed: u32::MAX,
             });
             *GLOBAL_SAMPLER.lock().unwrap() = Some(GlobalSampler {
                 dev,
                 heap: ID3D12DescriptorHeap::from_raw(&mut sampler_heap as *mut _ as *mut c_void),
                 cpu: 0x4000, inc: 32, cap: 17, next: 1, free: Vec::new(),
+                retired: VecDeque::new(), leases: super::desc_recycle::LeasePool::default(), smallest_failed: u32::MAX,
             });
             if crate::gpu::uma::get().is_some() {
                 assert!(register(0xC100, 16, 0x9000, 0, 16, true, true, true));

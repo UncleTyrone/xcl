@@ -388,17 +388,17 @@ pub unsafe extern "system" fn ApuHeapGetState(state: *mut u32, _flags: u32) -> H
 // SHAPE contexts
 // ---------------------------------------------------------------------------------------
 
-/// AcpHalAllocateShapeContexts' argument: counts of the five kinds, then an array of each
+/// AcpHalAllocateShapeContexts: six SHAPE kinds (SRC, EQ/FV, filter, DMA, XMA, PCM).
 #[repr(C)]
 pub struct ShapeContexts {
-    counts: [u32; 5],
-    reserved: u32,
-    contexts: [*mut c_void; 5],
+    counts: [u32; 6],
+    arrays: [*mut c_void; 6],
+    apu: [u32; 6],
 }
 
-/// bytes of a context entry (the largest seen)
-const CONTEXT_BYTES: u32 = 64;
-static SHAPE: Mutex<[usize; 5]> = Mutex::new([0; 5]);
+/// Per-kind context bytes (DMA/XMA cleared like hardware; others sized generously).
+const CONTEXT_BYTES: [u32; 6] = [32, 256, 256, 16, 64, 256];
+static SHAPE: Mutex<[usize; 6]> = Mutex::new([0; 6]);
 
 unsafe fn allocate_shape_contexts_with<F>(c: *mut ShapeContexts, mut alloc_fn: F) -> HRESULT
 where
@@ -408,19 +408,21 @@ where
         return E_INVALIDARG;
     }
     let c = &mut *c;
-    let mut sizes = [0u32; 5];
-    for i in 0..5 {
+    let mut sizes = [0u32; 6];
+    for i in 0..6 {
         if c.counts[i] != 0 {
-            let Some(bytes) = c.counts[i].checked_mul(CONTEXT_BYTES) else {
-                c.contexts = [std::ptr::null_mut(); 5];
+            let Some(bytes) = c.counts[i].checked_mul(CONTEXT_BYTES[i]) else {
+                c.arrays = [std::ptr::null_mut(); 6];
+                c.apu = [0; 6];
                 return E_OUTOFMEMORY;
             };
             sizes[i] = bytes;
         }
     }
-    let mut new_arrays = [0usize; 5];
-    let mut new_ptrs = [std::ptr::null_mut(); 5];
-    for i in 0..5 {
+    let mut new_arrays = [0usize; 6];
+    let mut new_ptrs = [std::ptr::null_mut(); 6];
+    let mut new_apu = [0u32; 6];
+    for i in 0..6 {
         if sizes[i] == 0 {
             continue;
         }
@@ -428,6 +430,10 @@ where
             Ok(va) => {
                 new_arrays[i] = va as usize;
                 new_ptrs[i] = va;
+                let mut mapped = 0u32;
+                if ApuMapVirtualAddress(&mut mapped, va, sizes[i]) == S_OK {
+                    new_apu[i] = mapped;
+                }
             }
             Err(hr) => {
                 for &a in &new_arrays[..i] {
@@ -435,7 +441,8 @@ where
                         ApuFree(a as *mut c_void);
                     }
                 }
-                c.contexts = [std::ptr::null_mut(); 5];
+                c.arrays = [std::ptr::null_mut(); 6];
+                c.apu = [0; 6];
                 return hr;
             }
         }
@@ -443,7 +450,8 @@ where
     let old_arrays = {
         let mut arrays = SHAPE.lock().unwrap();
         let old = std::mem::replace(&mut *arrays, new_arrays);
-        c.contexts = new_ptrs;
+        c.arrays = new_ptrs;
+        c.apu = new_apu;
         old
     };
     for a in old_arrays.into_iter().filter(|&a| a != 0) {
@@ -1227,19 +1235,19 @@ mod tests {
         unsafe {
             // Overflow on counts[1] * CONTEXT_BYTES fails cleanly without allocating slot 0.
             let mut c = ShapeContexts {
-                counts: [4, u32::MAX / CONTEXT_BYTES + 1, 0, 0, 0],
-                reserved: 0,
-                contexts: [0x1234 as *mut c_void; 5],
+                counts: [4, u32::MAX / CONTEXT_BYTES[1] + 1, 0, 0, 0, 0],
+                arrays: [0x1234 as *mut c_void; 6],
+                apu: [0; 6],
             };
             assert_eq!(AcpHalAllocateShapeContexts(&mut c), E_OUTOFMEMORY);
-            assert!(c.contexts.iter().all(|p| p.is_null()));
+            assert!(c.arrays.iter().all(|p| p.is_null()));
 
             // Partial failure after slot 0 allocated via real ApuAlloc rolls back slot 0.
             let mut first_apu = 0u32;
             let mut c2 = ShapeContexts {
-                counts: [4, 4, 0, 0, 0],
-                reserved: 0,
-                contexts: [0x1234 as *mut c_void; 5],
+                counts: [4, 4, 0, 0, 0, 0],
+                arrays: [0x1234 as *mut c_void; 6],
+                apu: [0; 6],
             };
             let hr = allocate_shape_contexts_with(&mut c2, |idx, bytes| {
                 if idx == 0 {
@@ -1252,25 +1260,25 @@ mod tests {
                 }
             });
             assert_eq!(hr, E_OUTOFMEMORY);
-            assert!(c2.contexts.iter().all(|p| p.is_null()));
+            assert!(c2.arrays.iter().all(|p| p.is_null()));
             assert!(ApuMapApuAddress(first_apu).is_null(), "slot 0 must be freed on rollback");
 
             // Success followed by a failed replacement preserves the live allocation;
             // a subsequent successful replacement frees the prior allocation cleanly.
-            let mut c3 = ShapeContexts { counts: [2, 0, 0, 0, 0], reserved: 0, contexts: [std::ptr::null_mut(); 5] };
+            let mut c3 = ShapeContexts { counts: [2, 0, 0, 0, 0, 0], arrays: [std::ptr::null_mut(); 6], apu: [0; 6] };
             assert_eq!(AcpHalAllocateShapeContexts(&mut c3), S_OK);
-            let old_va = c3.contexts[0];
+            let old_va = c3.arrays[0];
             assert!(!old_va.is_null());
             let mut old_apu = 0u32;
             assert_eq!(ApuMapVirtualAddress(&mut old_apu, old_va, 128), S_OK);
 
-            let mut failed_replace = ShapeContexts { counts: [4, 0, 0, 0, 0], reserved: 0, contexts: [std::ptr::null_mut(); 5] };
+            let mut failed_replace = ShapeContexts { counts: [4, 0, 0, 0, 0, 0], arrays: [std::ptr::null_mut(); 6], apu: [0; 6] };
             assert_eq!(allocate_shape_contexts_with(&mut failed_replace, |_, _| Err(E_OUTOFMEMORY)), E_OUTOFMEMORY);
             assert_eq!(ApuMapApuAddress(old_apu), old_va, "failed replacement must preserve prior live allocation");
 
-            let mut c4 = ShapeContexts { counts: [3, 0, 0, 0, 0], reserved: 0, contexts: [std::ptr::null_mut(); 5] };
+            let mut c4 = ShapeContexts { counts: [3, 0, 0, 0, 0, 0], arrays: [std::ptr::null_mut(); 6], apu: [0; 6] };
             assert_eq!(AcpHalAllocateShapeContexts(&mut c4), S_OK);
-            assert!(!c4.contexts[0].is_null());
+            assert!(!c4.arrays[0].is_null());
             assert!(ApuMapApuAddress(old_apu).is_null(), "prior SHAPE context allocation must be freed on replace");
             assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
         }
