@@ -2803,9 +2803,11 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         };
         f(this, std::ptr::null_mut(), &null_buf, slot.pc_srv);
         super::console_heap::publish(&slot, false, 0);
+        super::heap_strides::note_view(slot.index, 0);
     } else {
         f(this, res, desc, slot.pc_srv);
         super::console_heap::publish(&slot, false, res as usize);
+        super::heap_strides::note_view(slot.index, res as usize);
     }
     super::console_heap::note_resource(&slot, res as usize);
     if res.is_null() || desc.as_ref().is_some_and(|v| v.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
@@ -3206,6 +3208,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     super::lut3d::slot_reused(slot.index, cpu, res as usize, || format!("an unordered access view of {res:p} (its companion view)"));
     super::console_heap::publish(&slot, true, if no_uav { 0 } else { res as usize });
     super::console_heap::note_resource(&slot, res as usize);
+    super::heap_strides::note_view(slot.index + 1, res as usize);
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
         // A null image UAV was already created and published at `slot.index + 1`. Create a
         // matching null companion SRV at `slot.index` and write a valid T# referencing

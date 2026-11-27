@@ -2,7 +2,7 @@
 #
 # Usage:
 #   . .\scripts\play-env-nvidia.ps1            # safe (rate-friendly; no RESIDENCY/frame-cap)
-#   . .\scripts\play-env-nvidia.ps1 -Full      # denser residency/heap/awake (may lower presents/2s)
+#   . .\scripts\play-env-nvidia.ps1 -Full      # denser residency/heap + 16ms frame; awake stays Auto
 #   . .\scripts\play-env-nvidia.ps1 -Dev       # play.ps1 non-safe: THIN=1 JOIN_PARTS=8
 #   cargo build --release -p xcl   (from src/nvidia-dev)
 
@@ -22,7 +22,8 @@ $xclEnv = @{
     XCL_CARD_STEPS              = '2'
     XCL_INDIRECT_BATCH          = '2'
     XCL_MAP_THREADS             = '1'
-    XCL_CARD_AWAKE              = '1'
+    # CARD_AWAKE/GPU_AWAKE=1 forces the AMD keep-awake compute heartbeat on NVIDIA and
+    # drops PresentX ~120→~113 on this tree; leave unset (Auto = AMD-only).
     XCL_SHOW_AFTER              = '1'
     XCL_AMBIENT_AIR             = '1.5'
     XCL_AMBIENT                 = 'constant:0.8'
@@ -54,7 +55,7 @@ if ($Full) {
     $xclEnv['XCL_HEAP_STRIDES'] = '1'
     $xclEnv['XCL_RESIDENCY'] = '1'
     $xclEnv['XCL_FRAME_INTERVAL_MS'] = '16'
-    $xclEnv['XCL_GPU_AWAKE'] = '1'
+    # Do not force XCL_GPU_AWAKE=1 here — see CARD_AWAKE note above.
 }
 
 # Opt-in land spine (Play-XCL.cmd does not set LAND; play-env-amd does):

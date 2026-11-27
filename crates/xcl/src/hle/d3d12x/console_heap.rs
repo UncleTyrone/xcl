@@ -624,11 +624,6 @@ pub fn release_global(first: u32, count: u32) {
         if let Some(n) = NAMES.get() {
             n.clear(first, first + count);
         }
-        if super::heap_strides::on() {
-            for i in first..first.saturating_add(count) {
-                super::heap_strides::write(i, 0);
-            }
-        }
     }
     if let Some(s) = GLOBAL.lock().unwrap().as_mut() {
         merge_release(&mut s.free, first, count);
@@ -875,7 +870,6 @@ pub unsafe fn publish(s: &Slot, uav: bool, res: usize) {
     let _w = SLOT_WRITES.lock().unwrap();
     copy_views(&dev, 1, dst, src);
     names().note(s.index + uav as u32, res);
-    super::heap_strides::note_view(s.index, res);
 }
 
 /// The PC resources the SRV and the UAV of view slot `s` name in the shared heap (0: not known,
@@ -933,9 +927,6 @@ pub unsafe fn publish_range(first: &Slot, n: u32, names: &[(usize, usize)]) {
                             fill_nulls(ndev, *cpu, *inc, i, i + 1, *at);
                         }
                         m.note(i, res);
-                        if !s.sampler {
-                            super::heap_strides::note_view(i, res);
-                        }
                     }
                 }
             }

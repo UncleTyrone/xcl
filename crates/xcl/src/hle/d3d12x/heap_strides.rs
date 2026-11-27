@@ -74,7 +74,7 @@ pub fn note_view(index: u32, res: usize) {
         write(index, 0);
         return;
     }
-  let Some(word) = stride_word_for_resource(res) else { return };
+    let Some(word) = stride_word_for_resource(res) else { return };
     write(index, word);
 }
 
@@ -91,7 +91,8 @@ pub fn write(index: u32, word: u32) {
         return;
     }
     t.cpu[index as usize] = word;
-    let Some(u) = crate::gpu::uma::get() else { return };
+    let u = crate::gpu::uma::get();
+    let Some(u) = u else { return };
     let p = (t.gpu as usize).wrapping_sub(u.base());
     if p + 4 <= u.size() {
         unsafe {
