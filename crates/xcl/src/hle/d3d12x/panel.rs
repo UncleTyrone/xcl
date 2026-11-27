@@ -84,6 +84,7 @@ pub(crate) fn on_frame(frame: u64) {
     let line = format!(
         "FPS {fps:.1}  DRAWS {d_draws:.0}  DISPATCH {d_disp:.0}  frame={frame}  {mem}"
     );
+    super::panel_gpu::set_overlay_text(&line);
     crate::xlog_info!("XCL PANEL {line}");
     if let Some(hwnd) = super::present::window_hwnd() {
         let title = format!("XCL | {line}");

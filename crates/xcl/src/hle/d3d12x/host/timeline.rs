@@ -173,6 +173,20 @@ pub(crate) fn sent() {
     push("submit", 'i', "");
 }
 
+/// Frame-record / wire event (when timeline and `XCL_RECORD` overlap).
+pub(crate) fn frame_record(name: &str, detail: impl Into<String>) {
+    if !on() {
+        return;
+    }
+    let d = detail.into();
+    let args = if d.is_empty() {
+        String::new()
+    } else {
+        format!("\"detail\":\"{}\"", d.replace('\\', "\\\\").replace('"', "\\\""))
+    };
+    push(name, 'i', args);
+}
+
 fn flush(file: &PathBuf) {
     use std::fmt::Write as _;
     let events = std::mem::take(&mut *EVENTS.lock().unwrap_or_else(|e| e.into_inner()));

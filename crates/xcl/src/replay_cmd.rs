@@ -21,6 +21,7 @@ pub fn run(folder: &Path, args: &[String]) -> i32 {
     let mut present = false;
     let mut contents = true;
     let mut json = false;
+    let mut show_notes = false;
     let mut listing = false;
     let mut edit = false;
     let mut diverge = false;
@@ -44,6 +45,7 @@ pub fn run(folder: &Path, args: &[String]) -> i32 {
             "--present" => present = true,
             "--no-contents" => contents = false,
             "--json" => json = true,
+            "--notes" => show_notes = true,
             "--listing" | "--list-ops" => listing = true,
             "--edit" => edit = true,
             "--skip-draws" => {
@@ -202,7 +204,8 @@ pub fn run(folder: &Path, args: &[String]) -> i32 {
         return 2;
     }
 
-    let offline_only = listing || edit || diverge || !points.is_empty() || compare_dir.is_some();
+    let offline_only =
+        listing || edit || diverge || show_notes || !points.is_empty() || compare_dir.is_some();
 
     if !offline_only || run_target.is_some() {
         match frame_replay_inspect(folder, json && !offline_only, frame_filter) {
@@ -217,6 +220,16 @@ pub fn run(folder: &Path, args: &[String]) -> i32 {
                     eprintln!("xcl replay: {e}");
                     return 3;
                 }
+            }
+        }
+    }
+
+    if show_notes {
+        match frame_notes(folder, frame_filter) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("xcl replay notes: {e}");
+                return 3;
             }
         }
     }
@@ -319,4 +332,29 @@ pub fn run(folder: &Path, args: &[String]) -> i32 {
         folder.display()
     );
     crate::launcher::run(&target, &title_args)
+}
+
+fn frame_notes(dir: &Path, frame_filter: Option<u64>) -> Result<String, String> {
+    let frames_dir = dir.join("frames");
+    if !frames_dir.is_dir() {
+        return Err("no frames/ directory".into());
+    }
+    let mut out = String::new();
+    let mut n = 0u64;
+    loop {
+        n += 1;
+        let notes = frames_dir.join(format!("frame_{n:04}.notes.txt"));
+        if !notes.is_file() {
+            break;
+        }
+        if frame_filter.is_some_and(|f| f != n) {
+            continue;
+        }
+        let text = std::fs::read_to_string(&notes).map_err(|e| e.to_string())?;
+        out.push_str(&format!("--- frame {n} ---\n{text}\n"));
+    }
+    if out.is_empty() {
+        out.push_str("no frames/frame_NNNN.notes.txt found (record with XCL_RECORD_WIRE)\n");
+    }
+    Ok(out)
 }

@@ -54,9 +54,10 @@ Usage:
                [--warm <hashes.txt|all>]
       Offline translator pass (forwards to `shaders --recomp`; --validate → --direct --validate).
       --warm hashes.txt|all: DXIL-cache-only warm (CGBJ translate --warm; XCL_WARM_SECONDS caps time).
-  xcl warm <file | folder | package.rpf> [--jobs N] [--used-only] [--limit N] [--again]
+  xcl warm <file | folder | package.rpf> [--jobs N] [--used-only] [--limit N] [--again] [--no-book]
       Precompile + build pipelines into DXIL / driver / .plib caches (`shaders --precompile --pipelines`).
       --limit caps how many; --again rebuilds even when warm-done.txt already lists them.
+      Enables XCL_PIPELINE_BOOK for pipeline-library warm unless --no-book.
   xcl replay <capture-dir> [--json] [--frame N] [--listing] [--wire] [--fences] [--present]
            [--no-execute] [--at N] [--run <game>] [-- args]
            [--edit] [--skip-draws] [--skip-dispatches] [--meta-only] [--lists A..B] [--out DIR]
@@ -218,9 +219,11 @@ fn translate_cmd(path: &std::path::Path, args: &[String]) -> i32 {
 /// `xcl warm`: precompile shaders and host pipelines into caches (.pso + .plib).
 fn warm_cmd(path: &std::path::Path, args: &[String]) -> i32 {
     let mut fwd = vec!["--precompile".to_string(), "--pipelines".to_string()];
+    let mut book = true;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--no-book" => book = false,
             "--used-only" | "--used" => fwd.push("--used-only".into()),
             "--again" => fwd.push("--again".into()),
             "--limit" => {
@@ -256,6 +259,9 @@ fn warm_cmd(path: &std::path::Path, args: &[String]) -> i32 {
             }
         }
         i += 1;
+    }
+    if book {
+        std::env::set_var("XCL_PIPELINE_BOOK", "1");
     }
     xcl::shaders::run(path, &fwd)
 }
@@ -317,7 +323,7 @@ fn run_picked_game() -> i32 {
     let Some(target) = target else { return 0 };
     let _ = std::fs::create_dir_all(xcl::launcher::data_root());
     let _ = std::fs::write(&last_file, target.to_string_lossy().as_bytes());
-    // which console XCL is to the game, unless the environment says (`XCL_DEVICE_TYPE`)
+    // Which console XCL is to the game, unless the environment says (`XCL_DEVICE_TYPE`).
     if std::env::var_os("XCL_DEVICE_TYPE").is_none() {
         let console_file = xcl::launcher::data_root().join("last-console.txt");
         let saved = std::fs::read_to_string(&console_file).ok();
@@ -327,7 +333,6 @@ fn run_picked_game() -> i32 {
         };
         let Some(console) = picked else { return 0 };
         let _ = std::fs::write(&console_file, console);
-        // (the menu runs before the game and before XCL starts any thread of its own)
         std::env::set_var("XCL_DEVICE_TYPE", console);
         println!("console: {}", console_name(console));
     }
@@ -476,6 +481,30 @@ fn pick_game_folder() -> Option<PathBuf> {
     }
 }
 
+/// The standard Windows open dialog (None: cancelled).
+fn pick_game_file() -> Option<PathBuf> {
+    use windows_sys::Win32::UI::Controls::Dialogs::*;
+    type GetOpenFileName = unsafe extern "system" fn(*mut OPENFILENAMEW) -> i32;
+    let f = unsafe { system_proc("comdlg32.dll", "GetOpenFileNameW") }?;
+    // pairs of (description, pattern), each ending in NUL, the list in one more
+    let filter: Vec<u16> = "Xbox game (*.exe, MicrosoftGame.config)\0*.exe;MicrosoftGame.config\0All files\0*.*\0\0".encode_utf16().collect();
+    let title = wide("XCL – choose a game");
+    let mut file = vec![0u16; 32768];
+    let mut ofn: OPENFILENAMEW = unsafe { std::mem::zeroed() };
+    ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    ofn.hwndOwner = unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() };
+    ofn.lpstrFilter = filter.as_ptr();
+    ofn.lpstrFile = file.as_mut_ptr();
+    ofn.nMaxFile = file.len() as u32;
+    ofn.lpstrTitle = title.as_ptr();
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER;
+    if unsafe { std::mem::transmute::<usize, GetOpenFileName>(f)(&mut ofn) } == 0 {
+        return None;
+    }
+    let n = file.iter().position(|&c| c == 0).unwrap_or(file.len());
+    Some(PathBuf::from(String::from_utf16_lossy(&file[..n])))
+}
+
 /// The device type a saved choice names: "lockhart" (Series S) or, for anything else and for
 /// no choice yet, "anaconda" (Series X), the names `XCL_DEVICE_TYPE` takes.
 fn console_of(saved: Option<&str>) -> &'static str {
@@ -489,10 +518,7 @@ fn console_name(console: &str) -> &'static str {
     if console == "lockhart" { "Xbox Series S" } else { "Xbox Series X" }
 }
 
-/// The second menu: which console XCL is to the game. A game asks which console it runs on and
-/// sizes its memory, its resolution and its detail by the answer; XCL keeps what it learns
-/// about a game's memory per console. `last` is the default. None: cancelled. Without a task
-/// dialog on this system: `last`, unasked.
+/// Second menu: which console XCL is to the game. Series X unless told. None: cancelled.
 fn console_menu(last: &'static str) -> Option<&'static str> {
     use windows_sys::Win32::UI::Controls::*;
     const X: i32 = 110;
@@ -526,34 +552,8 @@ fn console_menu(last: &'static str) -> Option<&'static str> {
     }
 }
 
-/// The standard Windows open dialog (None: cancelled).
-fn pick_game_file() -> Option<PathBuf> {
-    use windows_sys::Win32::UI::Controls::Dialogs::*;
-    type GetOpenFileName = unsafe extern "system" fn(*mut OPENFILENAMEW) -> i32;
-    let f = unsafe { system_proc("comdlg32.dll", "GetOpenFileNameW") }?;
-    // pairs of (description, pattern), each ending in NUL, the list in one more
-    let filter: Vec<u16> = "Xbox game (*.exe, MicrosoftGame.config)\0*.exe;MicrosoftGame.config\0All files\0*.*\0\0".encode_utf16().collect();
-    let title = wide("XCL – choose a game");
-    let mut file = vec![0u16; 32768];
-    let mut ofn: OPENFILENAMEW = unsafe { std::mem::zeroed() };
-    ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
-    ofn.hwndOwner = unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() };
-    ofn.lpstrFilter = filter.as_ptr();
-    ofn.lpstrFile = file.as_mut_ptr();
-    ofn.nMaxFile = file.len() as u32;
-    ofn.lpstrTitle = title.as_ptr();
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER;
-    if unsafe { std::mem::transmute::<usize, GetOpenFileName>(f)(&mut ofn) } == 0 {
-        return None;
-    }
-    let n = file.iter().position(|&c| c == 0).unwrap_or(file.len());
-    Some(PathBuf::from(String::from_utf16_lossy(&file[..n])))
-}
-
 #[cfg(test)]
 mod console_tests {
-    /// A saved choice names the Series S only as "lockhart"; no choice yet, or anything else,
-    /// is the Series X.
     #[test]
     fn the_saved_console_is_the_default_of_the_menu() {
         assert_eq!(super::console_of(None), "anaconda");

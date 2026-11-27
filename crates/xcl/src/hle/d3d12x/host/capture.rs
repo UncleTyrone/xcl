@@ -73,6 +73,18 @@ pub(crate) fn wanted(n: u64) -> bool {
     false
 }
 
+/// Sidecar JSON beside `frame-<n>.bmp` (timeline / record / panel summary).
+pub(crate) fn save_companion(n: u64, body: &str) {
+    let Some(dir) = folder() else { return };
+    if !wanted(n) {
+        return;
+    }
+    let path = dir.join(format!("frame-{n}.json"));
+    if std::fs::write(&path, body).is_ok() {
+        crate::xlog_info!("D3D12.X: XCL_CAPTURE companion {}", path.display());
+    }
+}
+
 /// Write a BMP already built by present into the capture folder as `frame-<n>.bmp`.
 pub(crate) fn save_bmp(n: u64, bmp: &[u8]) {
     let Some(dir) = folder() else { return };

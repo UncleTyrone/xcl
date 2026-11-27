@@ -1,4 +1,4 @@
-//! d3d12_xs.dll – D3D12.X.
+﻿//! d3d12_xs.dll – D3D12.X.
 //!
 //! Backends:
 //! * `real` (default): genuine PC D3D12 objects from the GPU driver with extended
@@ -10,30 +10,37 @@
 #![allow(non_snake_case)]
 
 mod alloc_pool;
-mod ambient;
 mod bake_upload;
-mod bvh_env;
+mod ambient;
 pub mod bind;
-pub(crate) mod clamp;
-mod culprit;
+mod bvh_env;
+mod bvh_want;
+mod capture;
 pub mod console_heap;
-mod desc_recycle;
 pub(crate) mod heap_strides;
 pub mod console_list;
+pub mod clamp;
+pub(crate) mod constants;
 mod depth_uav;
-pub(crate) mod descriptor_sites;
+mod format_alias;
 pub mod device_x;
 pub mod dxgi_device;
 mod cpu_writes;
 pub mod dred;
 mod fence_x;
 pub mod flight;
-mod format_alias;
+pub mod culprit;
+pub mod file_reads;
 pub mod frame;
+pub(crate) mod gfx_records;
+mod gpu_profile;
+mod gpu_times;
 pub mod guard;
 pub(crate) mod gpu_awake;
+mod indirect_guard;
 pub(crate) mod ask_env;
 pub(crate) mod card_rehash;
+pub(crate) mod card_steps;
 pub(crate) mod d3d12_boot;
 pub(crate) mod gpu_load;
 pub(crate) mod keep_env;
@@ -41,8 +48,6 @@ pub(crate) mod page_env;
 pub(crate) mod pipeline_env;
 pub(crate) mod pop_env;
 pub(crate) mod read_env;
-pub(crate) mod join;
-pub(crate) mod card_steps;
 pub(crate) mod land;
 pub(crate) mod safecopy;
 pub(crate) mod shadow;
@@ -66,6 +71,7 @@ pub(crate) mod window_env;
 pub(crate) mod library_env;
 pub(crate) mod relay;
 pub(crate) mod wide_back;
+pub(crate) mod join;
 mod frame_replay;
 mod frame_tools;
 mod frame_wire;
@@ -79,34 +85,43 @@ pub fn frame_replay_inspect(dir: &std::path::Path, json: bool, frame: Option<u64
 pub use frame_tools::{
     cli_diverge, cli_edit, cli_listing, cli_pixel, parse_point, parse_range, parse_wh, EditOpts,
 };
+
 mod late_release;
 mod late_wait;
 pub mod layout;
 pub mod list_x;
-mod pcores;
+mod look_stats;
+mod lut3d;
 pub mod null;
+mod placements;
+mod plaincopy;
 pub mod port;
 pub(crate) mod port_constants;
-pub(crate) mod port_cbv;
-pub(crate) mod port_journal;
 pub mod present;
-mod residency;
-mod session;
+mod submit;
+pub(crate) mod thin;
 pub mod pso_async;
 pub mod pso_library;
 pub mod real;
+mod scatter;
 mod shader_cache_session;
-pub(crate) mod submit;
+mod sharded;
 pub mod sparse;
-pub(crate) mod thin;
 mod standin;
+mod targets;
+mod watch;
 pub mod title_list;
+mod submit_cost;
+mod session;
 mod texture_policy;
 mod texture_pool;
+mod texture_upload;
 mod texture_upload_ahead;
+mod residency;
 pub mod title_textures;
-pub(crate) mod watch;
+pub mod view_want;
 pub mod vram;
+mod worker_pool;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
