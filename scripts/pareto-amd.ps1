@@ -26,7 +26,10 @@ $pareto = @{
     XCL_PORT_GUARD              = '1'
     XCL_PORT_JOURNAL            = '1'
     XCL_TEXTURE_BACK            = '1'
-    # CGBJ VICTORY_SHOW_AFTER — no amd-dev switch yet; omit until texture_policy lands.
+    XCL_SHOW_AFTER              = '1'
+    XCL_TEXTURE_NO_WAIT         = '1'
+    XCL_UPLOAD_AHEAD            = '1'
+    XCL_LEVELS_ON_DEMAND        = '1'
 }
 
 foreach ($k in $pareto.Keys) {

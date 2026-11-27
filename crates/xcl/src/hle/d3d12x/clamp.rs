@@ -7,6 +7,10 @@
 //!
 //! `XCL_INDIRECT_WINDOW` — `1`: consecutive single-record indirect mesh draws that step through one
 //! argument buffer are hoisted as one prelude draw-guard job (up to 64 records); off by default.
+//!
+//! `XCL_INDIRECT_REST` — unset/`0` (default): an oversized indirect record in a batched pass takes
+//! no budget and later records that fit still run (CGBJ `VICTORY_INDIRECT_REST=0`). `=1`: the bad
+//! record consumes the rest of the pass budget and following records run empty.
 
 use std::sync::OnceLock;
 
@@ -46,6 +50,18 @@ pub(crate) fn compute_dispatch_blocks_prelude() -> bool {
     indirect_batch() != 2
 }
 
+/// `XCL_INDIRECT_REST=1`: one oversized ExecuteIndirect record consumes the rest of its batch budget.
+/// Unset / `0` (default): later records in the same batch that fit still run (CGBJ `VICTORY_INDIRECT_REST=0`).
+pub(crate) fn indirect_rest() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_INDIRECT_REST").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// HLSL `REST` define for batched indirect clamp shaders (see CGBJ `indirect/batch.rs`).
+pub(crate) fn indirect_rest_hlsl() -> &'static str {
+    if indirect_rest() { "true" } else { "false" }
+}
+
 /// Log once when batch/window env is active (smoke aid; no performance claims).
 pub(crate) fn log_policy_once() {
     static DONE: OnceLock<()> = OnceLock::new();
@@ -62,6 +78,9 @@ pub(crate) fn log_policy_once() {
         crate::xlog_info!(
             "D3D12.X: consecutive single-record indirect mesh draws are clamped in windows of up to {WINDOW_MOST} (XCL_INDIRECT_WINDOW=1)"
         );
+    }
+    if indirect_rest() {
+        crate::xlog_info!("D3D12.X: XCL_INDIRECT_REST=1 (oversized indirect record takes batch remainder)");
     }
 }
 
@@ -120,5 +139,11 @@ mod tests {
         w.open(0, 0, 1, 100, 32, 0);
         assert!(w.continues(1, 132, 32, 0));
         assert!(!w.continues(1, 164, 16, 0));
+    }
+
+    #[test]
+    fn indirect_rest_default_off() {
+        assert!(!indirect_rest());
+        assert_eq!(indirect_rest_hlsl(), "false");
     }
 }

@@ -537,11 +537,8 @@ impl Levels {
     }
 }
 
-/// `XCL_TEXTURE_LEVEL_PAGES=1` (off by default): a sampled 2D texture of one slice on the
-/// shared pages gets the pages of a level when an upload first has texels for it. A retail game
-/// places its streamed textures at full size and maps memory under their levels as it loads
-/// them, the small ones first; with a page for every 64 KiB a texture covers most of the pages
-/// are for levels that are not loaded.
+/// `XCL_TEXTURE_LEVEL_PAGES=1` or `XCL_LEVELS_ON_DEMAND=1` (off by default): a sampled 2D
+/// texture gets level pages when an upload first has texels for that level.
 pub(super) fn level_pages() -> bool {
     #[cfg(test)]
     if LEVEL_PAGES_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
@@ -549,11 +546,32 @@ pub(super) fn level_pages() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("XCL_TEXTURE_LEVEL_PAGES").is_ok_and(|v| v.trim() == "1");
+        let by_pages = std::env::var("XCL_TEXTURE_LEVEL_PAGES").is_ok_and(|v| v.trim() == "1");
+        let on_demand = super::texture_policy::levels_on_demand() && levels_on_demand_capable();
+        let on = by_pages || on_demand;
         if on {
-            crate::xlog_info!("D3D12.X: XCL_TEXTURE_LEVEL_PAGES=1 - a sampled texture's levels get their video memory pages when an upload first has texels for them");
+            let via = if on_demand && !by_pages { "XCL_LEVELS_ON_DEMAND" } else { "XCL_TEXTURE_LEVEL_PAGES" };
+            crate::xlog_info!("D3D12.X: {via}=1 - a sampled texture's levels get their video memory pages when an upload first has texels for them");
         }
         on
+    })
+}
+
+fn levels_on_demand_capable() -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| {
+        let raw = super::real::device_raw();
+        if raw.is_null() {
+            return false;
+        }
+        let Some(dev) = (unsafe { ID3D12Device::from_raw_borrowed(&raw) }) else {
+            return false;
+        };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        let asked = unsafe {
+            dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, (&raw mut options).cast(), std::mem::size_of_val(&options) as u32)
+        };
+        asked.is_ok() && options.TiledResourcesTier.0 >= 2
     })
 }
 

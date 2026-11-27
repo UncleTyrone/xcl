@@ -11,6 +11,7 @@ use windows_sys::Win32::System::Memory::{
     PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
 };
 
+pub mod frame_rate;
 pub mod patch_insn;
 pub mod write_sites;
 
@@ -238,6 +239,7 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
     if is_main {
         crate::hle::d3d12x::descriptor_sites::install_on_main(base, size);
         unsafe { write_sites::apply_asked(&name, base, size) };
+        unsafe { frame_rate::apply_if_asked(base, size) };
     }
     Ok(module)
 }

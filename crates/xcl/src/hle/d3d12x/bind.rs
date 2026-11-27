@@ -2297,6 +2297,12 @@ fn uma_win_off(u: &crate::gpu::uma::Uma, p: usize, span: usize) -> Option<(u32, 
     Some((k as u32, off as u32))
 }
 
+/// HLSL prefix for indirect clamp shaders (`REST`, CGBJ batch budget policy).
+fn indirect_clamp_shader_source(body: &str) -> String {
+    super::clamp::log_policy_once();
+    format!("#define REST {}\n{body}", super::clamp::indirect_rest_hlsl())
+}
+
 fn can_hoist_prelude(this: *mut c_void) -> bool {
     super::clamp::log_policy_once();
     super::clamp::prelude_hoist_allowed()
@@ -2344,7 +2350,8 @@ unsafe fn prelude_pipeline(dev: &ID3D12Device, hlsl: &str, label: &str, cache: &
     if let Some(pair) = cache.lock().unwrap().as_ref().and_then(|m| m.get(&key).cloned()) {
         return Ok(pair);
     }
-    let dxil = crate::gpu::recomp::dxc::compile_cached(hlsl, "main", "cs_6_6")?.0;
+    let src = indirect_clamp_shader_source(hlsl);
+    let dxil = crate::gpu::recomp::dxc::compile_cached(&src, "main", "cs_6_6")?.0;
     let rs = prelude_root_signature(dev)?;
     let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
         pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
@@ -2411,7 +2418,8 @@ unsafe fn prelude_heap_pipeline(dev: &ID3D12Device, hlsl: &str, label: &str, cac
     if let Some(pair) = cache.lock().unwrap().as_ref().and_then(|m| m.get(&key).cloned()) {
         return Ok(pair);
     }
-    let dxil = crate::gpu::recomp::dxc::compile_cached(hlsl, "main", "cs_6_6")?.0;
+    let src = indirect_clamp_shader_source(hlsl);
+    let dxil = crate::gpu::recomp::dxc::compile_cached(&src, "main", "cs_6_6")?.0;
     let rs = prelude_heap_root_signature(dev)?;
     let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
         pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
@@ -3285,7 +3293,8 @@ unsafe fn heap_args_pipeline(dev: &ID3D12Device, hlsl: &str, label: &str, num_co
     if let Some(pair) = cache.lock().unwrap().as_ref().and_then(|m| m.get(&key).cloned()) {
         return Ok(pair);
     }
-    let dxil = crate::gpu::recomp::dxc::compile_cached(hlsl, "main", "cs_6_6")?.0;
+    let src = indirect_clamp_shader_source(hlsl);
+    let dxil = crate::gpu::recomp::dxc::compile_cached(&src, "main", "cs_6_6")?.0;
     let rs = heap_args_root_signature(dev, num_consts, uav_regs)?;
     let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
         pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
@@ -3344,7 +3353,8 @@ unsafe fn args_pipeline(dev: &ID3D12Device, hlsl: &str, label: &str, with_count:
     if let Some(pair) = cache.lock().unwrap().as_ref().and_then(|m| m.get(&key).cloned()) {
         return Ok(pair);
     }
-    let dxil = crate::gpu::recomp::dxc::compile_cached(hlsl, "main", "cs_6_6")?.0;
+    let src = indirect_clamp_shader_source(hlsl);
+    let dxil = crate::gpu::recomp::dxc::compile_cached(&src, "main", "cs_6_6")?.0;
     let rs = args_root_signature(dev, with_count)?;
     let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
         pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
@@ -3659,6 +3669,7 @@ fn note_skipped_indirect(this: *mut c_void, sig: usize) {
 /// translated pipeline, on XCL's ABI with the kept root arguments (signatures that change root
 /// arguments themselves cannot be – skipped, logged)
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
+    super::clamp::log_policy_once();
     if max == 0 {
         return;
     }
