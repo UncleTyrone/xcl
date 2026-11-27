@@ -52,6 +52,7 @@
 //! `ByteAddressBuffer` (`mem`); initial SGPRs (user data) come from `io`. Textures come next.
 
 pub mod cfg;
+pub mod shader_opt;
 pub mod dxc;
 pub mod dxil;
 pub mod lane_masks;
@@ -1495,7 +1496,9 @@ fn scalar_constant(d: &Decoded, code: u64) -> Option<u32> {
 /// `follow`: follow constants through branches when recording S# for MIMG (vertex/pixel always;
 /// compute when `follow` is true). At joins, predecessors that `s_cbranch_execz` straight to
 /// the merge are ignored when intersecting SGPR constants so a guarded sample after a live arm
-/// still resolves its immediate S# (transmission prefilter on Wave32).
+/// still resolves its immediate S# (transmission prefilter on Wave32). Buffer/UAV descriptor SGPRs
+/// need the fuller structured lane-guard join from CGBJ `resource.rs` (`only_edge` / `live`) for
+/// per-lane phis and nested joins; [`constant_srsrc`] covers the common execz-to-join case.
 pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, follow: bool) -> BTreeMap<u64, [u32; 4]> {
     fn execz_skip_target(block: &[Decoded]) -> Option<u64> {
         let last = block.last()?;
@@ -1620,6 +1623,154 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, foll
     out
 }
 
+/// Buffer / flat / UAV SRSRC words built from constants on every path (same join / `execz_skip`
+/// rules as [`constant_samplers`]: dead `s_cbranch_execz` edges at a merge do not clear the live
+/// arm's descriptor – transmission / alpha-prefilter CS patterns).
+pub(crate) fn constant_srsrc(insts: &[Decoded], leaders: &BTreeSet<u64>, follow: bool) -> BTreeMap<u64, [u32; 4]> {
+    fn execz_skip_target(block: &[Decoded]) -> Option<u64> {
+        let last = block.last()?;
+        (last.inst.name == "S_CBRANCH_EXECZ").then(|| rdna2::branch_target(last)).flatten()
+    }
+    type Known = std::collections::HashMap<u64, u32>;
+    fn run(block: &[Decoded], known: &mut Known, mut out: Option<&mut BTreeMap<u64, [u32; 4]>>) {
+        for d in block {
+            let f = |n: &str| rdna2::field_value(d.enc, &d.words, n);
+            if matches!(&*d.enc.name, "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL") {
+                if let (Some(out), Some(s)) = (
+                    out.as_deref_mut(),
+                    f("SRSRC").map(|v| v * rdna2::register_scale("SRSRC")),
+                ) {
+                    if let (Some(a), Some(b), Some(c), Some(e)) = (
+                        known.get(&s),
+                        known.get(&(s + 1)),
+                        known.get(&(s + 2)),
+                        known.get(&(s + 3)),
+                    ) {
+                        out.insert(d.pc, [*a, *b, *c, *e]);
+                    }
+                }
+            }
+            let set: Vec<(u64, u32)> = match d.inst.name {
+                "S_MOV_B32" => f("SDST")
+                    .zip(f("SSRC0").and_then(|c| scalar_constant(d, c)))
+                    .map(|(r, v)| vec![(r, v)])
+                    .unwrap_or_default(),
+                "S_MOVK_I32" => f("SDST")
+                    .zip(f("SIMM16"))
+                    .map(|(r, v)| vec![(r, v as u16 as i16 as i32 as u32)])
+                    .unwrap_or_default(),
+                "S_BREV_B32" => f("SDST")
+                    .zip(f("SSRC0").and_then(|c| scalar_constant(d, c)))
+                    .map(|(r, v)| vec![(r, v.reverse_bits())])
+                    .unwrap_or_default(),
+                "S_MOV_B64" => match (f("SDST"), f("SSRC0")) {
+                    (Some(r), Some(c @ 128..=208)) => {
+                        let v = scalar_constant(d, c).unwrap() as i32 as i64;
+                        vec![(r, v as u32), (r + 1, (v >> 32) as u32)]
+                    }
+                    (Some(r), Some(255)) => d.literal.map(|v| vec![(r, v), (r + 1, 0)]).unwrap_or_default(),
+                    _ => Vec::new(),
+                },
+                "S_BFM_B32" => match (
+                    f("SDST"),
+                    f("SSRC0").and_then(|c| scalar_constant(d, c)),
+                    f("SSRC1").and_then(|c| scalar_constant(d, c)),
+                ) {
+                    (Some(r), Some(a), Some(b)) => vec![(r, ((1u32 << (a & 31)) - 1) << (b & 31))],
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            for w in rdna2::sgpr_uses(d).1 {
+                known.remove(&w);
+            }
+            for (r, v) in set {
+                if r < 106 {
+                    known.insert(r, v);
+                }
+            }
+        }
+    }
+    let mut starts: Vec<usize> = insts
+        .iter()
+        .enumerate()
+        .filter(|(i, d)| *i == 0 || leaders.contains(&d.pc))
+        .map(|(i, _)| i)
+        .collect();
+    starts.push(insts.len());
+    let blocks: Vec<&[Decoded]> = starts
+        .windows(2)
+        .map(|w| &insts[w[0]..w[1]])
+        .filter(|b| !b.is_empty())
+        .collect();
+    let at: std::collections::HashMap<u64, usize> = blocks.iter().enumerate().map(|(k, b)| (b[0].pc, k)).collect();
+    let next: Option<Vec<Vec<usize>>> = blocks
+        .iter()
+        .enumerate()
+        .map(|(k, b)| {
+            let d = b.last().unwrap();
+            let after = (k + 1 < blocks.len()).then_some(k + 1);
+            Some(match (rdna2::branch_target(d), d.inst.name) {
+                (Some(t), n) if n.starts_with("S_CBRANCH") => after.into_iter().chain([*at.get(&t)?]).collect(),
+                (Some(t), "S_BRANCH" | "S_SETPC_B64") => vec![*at.get(&t)?],
+                (Some(_), _) => return None,
+                (None, "S_ENDPGM") => Vec::new(),
+                (None, _) if d.inst.flags & rdna2::F_TERMINATOR != 0 => return None,
+                _ => after.into_iter().collect(),
+            })
+        })
+        .collect();
+    let mut out = BTreeMap::new();
+    let Some(next) = next.filter(|_| follow) else {
+        for b in &blocks {
+            run(b, &mut Known::new(), Some(&mut out));
+        }
+        return out;
+    };
+    let mut start: Vec<Option<Known>> = vec![None; blocks.len()];
+    let mut work: Vec<usize> = Vec::new();
+    if !blocks.is_empty() {
+        start[0] = Some(Known::new());
+        work.push(0);
+    }
+    while let Some(k) = work.pop() {
+        let mut known = start[k].clone().unwrap_or_default();
+        run(blocks[k], &mut known, None);
+        for &n in &next[k] {
+            let skip =
+                execz_skip_target(blocks[k]).is_some_and(|t| t == blocks[n].first().map(|d| d.pc).unwrap_or(0));
+            let changed = match &mut start[n] {
+                slot @ None => {
+                    *slot = Some(known.clone());
+                    true
+                }
+                Some(have) => {
+                    let before = have.len();
+                    if skip {
+                        for (r, v) in &known {
+                            if have.get(r).is_some_and(|hv| hv != v) {
+                                have.remove(r);
+                            }
+                        }
+                    } else if have.is_empty() {
+                        have.extend(known.iter().map(|(&r, &v)| (r, v)));
+                    } else {
+                        have.retain(|r, v| known.get(r) == Some(v));
+                    }
+                    have.len() != before
+                }
+            };
+            if changed {
+                work.push(n);
+            }
+        }
+    }
+    for (k, b) in blocks.iter().enumerate() {
+        run(b, &mut start[k].clone().unwrap_or_default(), Some(&mut out));
+    }
+    out
+}
+
 /// Does the program require `globallycoherent` flat memory windows (`mem`, `mem1`…)?
 ///
 /// Compute work that coordinates across workgroups (e.g. bottom-up BVH builds: atomics,
@@ -1701,11 +1852,9 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     em.coherent_mem = matches!(opt.mode, Mode::Compute(_)) && needs_coherent_mem(&insts);
     em.configure_round_modes(&insts, branches == 0);
     em.writes_lds = emit::lds_order_wanted() && emit::writes_lds(&insts);
-    em.static_ss = constant_samplers(
-        &insts,
-        &leaders,
-        matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_) | Mode::Compute(_) | Mode::Kernel | Mode::Mesh(_)),
-    );
+    let follow_sgpr = matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_) | Mode::Compute(_) | Mode::Kernel | Mode::Mesh(_));
+    em.static_ss = constant_samplers(&insts, &leaders, follow_sgpr);
+    em.static_sr = constant_srsrc(&insts, &leaders, follow_sgpr);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
     // continues from the ES into the GS through s_setpc: left as it is); pixel shaders: they
     // skip the quad reads that give the helper lanes' bits
