@@ -617,19 +617,30 @@ pub fn init() -> Result<String, String> {
         // `XCL_DRED=1`: on a device removal the faulting address and the last GPU operations
         // (logged by `log_device_removed`); no debug layer needed. Opt-in: with it XDefiant
         // stalled in its first seconds twice.
-        if let Some(dred) = std::env::var_os("XCL_DRED") {
+        let dred = std::env::var_os("XCL_DRED").unwrap_or_else(|| std::ffi::OsString::from("faults"));
+        if dred != "0" {
             match crate::gpu::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings>(
                 &CLSID_D3D12DeviceRemovedExtendedData,
             ) {
                 Ok(d) => {
-                    // (`XCL_DRED=pagefault`: the faulting address and what was there only; the
-                    // breadcrumbs put a marker around every operation of every list, which is
-                    // what made a title stall)
-                    if dred != "pagefault" {
-                        d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                    }
-                    d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                    crate::xlog_info!("D3D12: DRED on ({})", if dred == "pagefault" { "page faults" } else { "page faults and the lists' last operations" });
+                    // `faults`: breadcrumbs only (no page-fault trace — full DRED was ~50 ms/frame).
+                    // `pagefault`: fault address only, no breadcrumbs.
+                    let mode = match dred.to_string_lossy().as_ref() {
+                        "pagefault" => {
+                            d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                            "page faults only"
+                        }
+                        "faults" => {
+                            d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                            "breadcrumbs only (faults)"
+                        }
+                        _ => {
+                            d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                            d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                            "page faults and breadcrumbs"
+                        }
+                    };
+                    crate::xlog_info!("D3D12: DRED on ({mode})");
                 }
                 Err(e) => {
                     crate::xlog_warn!("D3D12: DRED requested but unavailable: {e}");
@@ -649,7 +660,9 @@ pub fn init() -> Result<String, String> {
             for (adapter, desc) in list {
                 if let Ok(dev) = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0) {
                     device = Some(dev);
-                    name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
+                    let vram_mb = desc.DedicatedVideoMemory >> 20;
+                    name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), vram_mb);
+                    super::session::set_dedicated_vram_mb(vram_mb as u64);
                     break;
                 }
             }
@@ -861,8 +874,7 @@ pub unsafe fn adopt(obj: *mut c_void, kind: Kind) {
 
 /// `XCL_DRED` is set (`init` turns the report on with it).
 fn dred_on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("XCL_DRED").is_some())
+    super::dred::on()
 }
 
 /// With `XCL_DRED`: a resource, heap or pipeline the PC device made gets a name that says what
@@ -1772,6 +1784,23 @@ pub(super) unsafe fn place_at_title_address(this: *mut c_void, va: usize, desc: 
         }
         return Some(hr);
     }
+    let uav = d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+        || state & (D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32 | D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32) != 0;
+    if super::constants::read_only_placed(bytes as u64, uav) {
+        if let Some(dev) = ID3D12Device::from_raw_borrowed(&this) {
+            if let Some((buf, _data, _charge)) = super::constants::rebar_try_buffer(&dev, (delta + bytes) as u64) {
+                let raw = buf.as_raw() as usize;
+                *ppv = raw as *mut _;
+                UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(raw, (va, bytes, false));
+                if delta != 0 {
+                    BUFFER_DELTA.lock().unwrap().get_or_insert_with(HashMap::new).insert(raw, delta as u64);
+                }
+                super::constants::note_cbv(va as u64, bytes.min(64 * 1024) as u32);
+                std::mem::forget(buf);
+                return Some(S_OK);
+            }
+        }
+    }
     let heap = (*UMA_HEAPS.lock().unwrap().get(k)?)?;
     if !u.shadowed() {
         d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
@@ -2253,6 +2282,21 @@ fn note_buffer_view() {
     }
 }
 
+/// D3D12 rejects a constant view larger than 64 KiB; a larger SizeInBytes has removed the
+/// device on NVIDIA. Cap before writing the V# / forwarding to the PC.
+const CBV_SIZE_CAP: u32 = 64 * 1024;
+
+fn cap_cbv_size(size: u32) -> u32 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if size <= CBV_SIZE_CAP {
+        return size;
+    }
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        crate::xlog_warn!("D3D12.X: CreateConstantBufferView SizeInBytes capped at 64 KiB (was {size})");
+    }
+    CBV_SIZE_CAP
+}
+
 /// #17 CreateConstantBufferView: a V# of float4 rows at the buffer's console address
 /// (`desc::cbv_words`; unified memory, anything else gets an empty V#). No PC CBV: translated
 /// shaders read buffers through `mem`. One in a GPU view of the title's memory asks for its
@@ -2260,10 +2304,23 @@ fn note_buffer_view() {
 unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12_CONSTANT_BUFFER_VIEW_DESC, cpu: u64) {
     let Some(slot) = super::console_heap::slot(cpu).filter(|s| !s.sampler) else {
         let f: unsafe extern "system" fn(*mut c_void, *const D3D12_CONSTANT_BUFFER_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 17));
+        if let Some(d) = desc.as_ref() {
+            if d.SizeInBytes > CBV_SIZE_CAP {
+                let mut capped = *d;
+                capped.SizeInBytes = cap_cbv_size(d.SizeInBytes);
+                return f(this, &capped, cpu);
+            }
+        }
         return f(this, desc, cpu);
     };
     let (va, size) = desc.as_ref().map_or((0, 0), |d| (d.BufferLocation, d.SizeInBytes));
-    let words = cbv_at(crate::gpu::uma::get(), va, size).unwrap_or_else(|| {
+    let size = cap_cbv_size(size);
+    let words = if super::constants::direct_constants() {
+        super::constants::cbv_words(va, size)
+    } else {
+        cbv_at(crate::gpu::uma::get(), va, size)
+    }
+    .unwrap_or_else(|| {
         note_buffer_view();
         crate::gpu::desc::cbv_words(0, 0)
     });
@@ -2757,6 +2814,9 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
     }
     let rdesc = r.GetDesc();
+    let amb_idx = if slot.shared_srv != 0 { slot.index } else { 0 };
+    let amb_fmt = desc.as_ref().map(|v| v.Format.0).filter(|&f| f != 0).unwrap_or(rdesc.Format.0);
+    super::ambient::note_descriptor(slot.at, amb_idx, res as usize, amb_fmt, rdesc.Format.0, false);
     super::lut3d::viewed(res as usize, &rdesc, desc.as_ref(), slot.index, cpu);
     match srv_tsharp_from_desc(slot.index, &rdesc, desc.as_ref()) {
         Some(t) => super::console_heap::write(&slot, &t),
@@ -3166,6 +3226,10 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
         note_buffer_view();
         return super::console_heap::write(&slot, &[0; 8]);
     };
+    let amb_idx = slot.index;
+    let amb_fmt = desc.as_ref().map(|v| v.Format.0).filter(|&f| f != 0).unwrap_or(rd.Format.0);
+    let uav_res = if no_uav { 0 } else { res as usize };
+    super::ambient::note_descriptor(slot.at, amb_idx, uav_res, amb_fmt, rd.Format.0, true);
     // RDNA images have no SRV / UAV distinction: console shaders may read any image UAV slot
     // (`image_load`, `image_sample_*`, `image_get_resinfo` all index `ResourceDescriptorHeap[slot.index]`).
     let deny_srv = rd.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 != 0;
@@ -4422,6 +4486,30 @@ pub fn pso_root_signature(pso: usize) -> Option<usize> {
 static ABI_RS_SAMPLERS: Mutex<Option<HashMap<Vec<u32>, usize>>> = Mutex::new(None);
 
 /// The XCL ABI root signature with a pipeline's static samplers (the plain one without).
+static ABI_RS_MESH_LAUNCH: Mutex<Option<HashMap<Vec<u32>, (usize, [u32; 3])>>> = Mutex::new(None);
+
+/// XCL ABI graphics root signature with mesh-launch amplification bindings.
+unsafe fn abi_rs_for_mesh_launch(this: *mut c_void, samplers: &[crate::gpu::recomp::pso::StaticSampler]) -> Option<(*mut c_void, [u32; 3])> {
+    let key: Vec<u32> = samplers.iter().flat_map(|(w, c)| w.iter().copied().chain([*c as u32])).collect();
+    let mut g = ABI_RS_MESH_LAUNCH.lock().unwrap();
+    let map = g.get_or_insert_with(HashMap::new);
+    if let Some(&(rs, roots)) = map.get(&key) {
+        return Some((rs as *mut c_void, roots));
+    }
+    let dev = ID3D12Device::from_raw_borrowed(&this)?;
+    match crate::gpu::recomp::pso::abi_root_signature_mesh_launch(dev, samplers) {
+        Ok((rs, roots)) => {
+            let raw = rs.into_raw() as usize;
+            map.insert(key, (raw, roots));
+            Some((raw as *mut c_void, roots))
+        }
+        Err(e) => {
+            note_translation_error(format!("XCL ABI root signature with mesh launch: {e}"));
+            None
+        }
+    }
+}
+
 unsafe fn abi_rs_for(this: *mut c_void, samplers: &[crate::gpu::recomp::pso::StaticSampler]) -> Option<*mut c_void> {
     if samplers.is_empty() {
         return abi_rs_raw(this);
@@ -5065,6 +5153,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             if let Some(i) = crate::gpu::recomp::pso::compute_interface(cs) {
                 PSO_USER_SGPRS.insert(*ppv as usize, (i.user_sgprs, i.threads));
             }
+            super::ambient::note_compute_pso(*ppv as usize, cs);
             note_translated_compute(0, ppv);
             PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (record, 0));
             if super::gpu_profile::on() || super::gpu_times::enabled() {
@@ -5106,6 +5195,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if let Some(i) = crate::gpu::recomp::pso::compute_interface(cs) {
         PSO_USER_SGPRS.insert(*ppv as usize, (i.user_sgprs, i.threads));
     }
+    super::ambient::note_compute_pso(*ppv as usize, cs);
     note_translated_compute(hr, ppv);
     PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (record, 0));
     if super::gpu_profile::on() || super::gpu_times::enabled() {
@@ -6894,6 +6984,9 @@ pub(super) unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, 
     let _cost = crate::hle::api_cost::time(crate::hle::api_cost::Call::Pipeline);
     let hr = graphics_pso(this, desc, riid, ppv, false);
     note_pipeline_for_dump(this, desc, ppv, hr);
+    if hr >= 0 && !ppv.is_null() && !unsafe { (*ppv).is_null() } {
+        super::session::note_pipeline_create();
+    }
     hr
 }
 
@@ -6966,6 +7059,9 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
             super::capture::note_compute(*ppv as usize, cs);
         }
     }
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        super::session::note_pipeline_create();
+    }
     hr
 }
 
@@ -7018,6 +7114,38 @@ unsafe fn compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID,
 // console geometry stages in two passes (MS / NGG, legacy GS): see `pso::TwoPass`
 // ---------------------------------------------------------------------------------------
 
+/// Amplification mesh launch on a two-pass mesh pipeline (`mesh_launch`).
+pub struct MeshLaunch {
+    pub roots: [u32; 3],
+    _mesh_rs: usize,
+    device: usize,
+    plain_stream: Vec<u8>,
+    plain_pso: std::sync::OnceLock<usize>,
+}
+
+impl MeshLaunch {
+    /// The mesh pipeline without the amplification stage (count-buffer / multi-record indirect).
+    pub unsafe fn plain_pso(&self) -> Option<usize> {
+        let pso = *self.plain_pso.get_or_init(|| {
+            let device = self.device as *mut c_void;
+            let fs: PsoFn = std::mem::transmute(orig_fn(device, slot_of(device, "CreatePipelineState")));
+            let desc = [self.plain_stream.len(), self.plain_stream.as_ptr() as usize];
+            let mut out = std::ptr::null_mut();
+            let hr = finish_pso(device, fs, desc.as_ptr().cast(), &pc_iid(Kind::PipelineState), &mut out);
+            if hr >= 0 && !out.is_null() {
+                out as usize
+            } else {
+                0
+            }
+        });
+        (pso != 0).then_some(pso)
+    }
+}
+
+// SAFETY: plain handles are plain integers; the stream is immutable.
+unsafe impl Send for MeshLaunch {}
+unsafe impl Sync for MeshLaunch {}
+
 /// What XCL keeps for a mesh pipeline built from console MS / GS code: the title holds the
 /// mesh pipeline state (pass-through MS + PS); the draw first runs `compute` (the console
 /// program, one record per thread group into `res`), then the mesh pipeline over the records.
@@ -7032,6 +7160,7 @@ pub struct TwoPassPso {
     pub mesh_groups_per_record: u32,
     /// "MS" or "GS"
     pub kind: &'static str,
+    pub launch: Option<MeshLaunch>,
 }
 
 impl Drop for TwoPassPso {
@@ -7072,6 +7201,7 @@ pub(super) fn register_two_pass_for_test(pso: usize, kind: &'static str) {
                 record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 64, max_vertices: 64, max_primitives: 64 },
                 mesh_groups_per_record: 1,
                 kind,
+                launch: None,
             }),
         );
     }
@@ -7163,14 +7293,31 @@ unsafe fn payload_shader<'a>(p: &[u8]) -> Option<&'a [u8]> {
 }
 
 /// The passthrough mesh shader emits triangles for both translated MS and GS pipelines.
-fn two_pass_mesh_stream(rs: *mut c_void, ms: &[u8], ps: Option<&[u8]>) -> StreamOut {
+fn two_pass_mesh_stream(rs: *mut c_void, ms: &[u8], ps: Option<&[u8]>, as_shader: Option<&[u8]>) -> StreamOut {
     let mut out = StreamOut::default();
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
+    if let Some(asb) = as_shader {
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, asb);
+    }
     out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms);
     if let Some(ps) = ps {
         out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps);
     }
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+    out
+}
+
+/// A mesh pipeline stream with the amplification subobject removed.
+fn stream_without_as(stream: &StreamOut) -> StreamOut {
+    let Some(subs) = stream_subobjects(&stream.0) else { return StreamOut::default() };
+    let mut out = StreamOut::default();
+    for (ty, payload) in subs {
+        if ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32 {
+            continue;
+        }
+        let (_, palign) = super::null::subobject_payload(ty).unwrap_or((payload.len(), 4));
+        out.raw(ty, payload, palign == 8);
+    }
     out
 }
 
@@ -7215,7 +7362,7 @@ fn passthrough_mesh_stream_accepts_a_triangle_driver_blob() {
         reference.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms);
         reference.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
         let blob = build(&reference).GetCachedBlob().unwrap();
-        let mut translated = two_pass_mesh_stream(rs.as_raw(), ms, None);
+        let mut translated = two_pass_mesh_stream(rs.as_raw(), ms, None, None);
         let subobjects = stream_subobjects(&translated.0).unwrap();
         let topology = subobjects.iter().find(|(kind, _)| *kind == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY.0 as u32);
         assert_eq!(topology.map(|(_, payload)| *payload), Some(D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0.to_le_bytes().as_slice()));
@@ -7407,7 +7554,17 @@ mod two_pass_blob_tests {
 
 /// Build both PSOs. A draw executes the NGG compute pass first, then the passthrough mesh graphics pass.
 #[allow(clippy::too_many_arguments)]
-unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, ps_samplers: &[crate::gpu::recomp::pso::StaticSampler], kind: &'static str, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe fn finish_two_pass(
+    this: *mut c_void,
+    stream: &StreamOut,
+    tp: crate::gpu::recomp::pso::TwoPass,
+    mesh_rs: *mut c_void,
+    ps_samplers: &[crate::gpu::recomp::pso::StaticSampler],
+    kind: &'static str,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+    mut launch: Option<MeshLaunch>,
+) -> HRESULT {
     let Some(rs) = abi_rs_for(this, &tp.samplers) else { return E_INVALIDARG };
     if ppv.is_null() { return E_INVALIDARG }
     *ppv = std::ptr::null_mut();
@@ -7430,20 +7587,36 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     };
 
     let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
-    let mesh_result = build_two_pass_pso("passthrough mesh graphics pass", stream.shader_bytes(), mesh.as_ref(), &mut take_cold_slot, |blob, out| {
+    let build_mesh = |mesh_stream: &StreamOut, blob: Option<&[u8]>, out: *mut *mut c_void| {
         let mut cached_stream;
         let stream = if let Some(blob) = blob {
-            cached_stream = StreamOut(stream.0.clone(), stream.1);
+            cached_stream = StreamOut(mesh_stream.0.clone(), mesh_stream.1);
             cached_stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO, &D3D12_CACHED_PIPELINE_STATE {
                 pCachedBlob: blob.as_ptr().cast(), CachedBlobSizeInBytes: blob.len(),
             });
             &cached_stream
         } else {
-            stream
+            mesh_stream
         };
         let desc = [stream.0.len(), stream.0.as_ptr() as usize];
         finish_pso(this, fs, desc.as_ptr().cast(), riid, out)
+    };
+    let mut mesh_stream = StreamOut(stream.0.clone(), stream.1);
+    let plain_no_as = stream_without_as(stream);
+    let mut mesh_result = build_two_pass_pso("passthrough mesh graphics pass", mesh_stream.shader_bytes(), mesh.as_ref(), &mut take_cold_slot, |blob, out| {
+        build_mesh(&mesh_stream, blob, out)
     });
+    if matches!(mesh_result, Err(hr) if hr == E_INVALIDARG) && launch.is_some() {
+        static LAUNCH_FALLBACK: AtomicU64 = AtomicU64::new(0);
+        if LAUNCH_FALLBACK.fetch_add(1, Ordering::Relaxed) == 0 {
+            crate::xlog_warn!("D3D12.X: mesh pipeline with amplification refused (E_INVALIDARG); built without the launch stage");
+        }
+        launch = None;
+        mesh_stream = plain_no_as;
+        mesh_result = build_two_pass_pso("passthrough mesh graphics pass", mesh_stream.shader_bytes(), mesh.as_ref(), &mut take_cold_slot, |blob, out| {
+            build_mesh(&mesh_stream, blob, out)
+        });
+    }
     let (hr, mesh_pso, mesh_reused) = match mesh_result {
         Ok(result) => result,
         Err(hr) => {
@@ -7451,6 +7624,9 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
             return E_INVALIDARG;
         }
     };
+    if let Some(ref mut launch) = launch {
+        launch.plain_stream = mesh_stream.0.clone();
+    }
 
     let fc: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
     let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
@@ -7474,7 +7650,18 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
 
     *ppv = mesh_pso.into_raw();
     note_pso_rs(*ppv, mesh_rs);
-    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute.into_raw() as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
+    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(
+        *ppv as usize,
+        std::sync::Arc::new(TwoPassPso {
+            compute: compute.into_raw() as usize,
+            compute_rs: rs as usize,
+            mesh_rs: mesh_rs as usize,
+            record: tp.record,
+            mesh_groups_per_record: tp.mesh_groups_per_record,
+            kind,
+            launch,
+        }),
+    );
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 1000 == 0 || pso_trace() {
         crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (NGG compute {} B, blob reused: {cs_reused}; passthrough mesh graphics {} B, blob reused: {mesh_reused})", tp.cs.len(), tp.ms.len());
@@ -7531,35 +7718,6 @@ mod mesh_slot_tests {
         s.extend_from_slice(&sub(15, &vec![0u8; 36])); // RENDER_TARGET_FORMATS
         s.extend_from_slice(&sub(17, &[1, 0, 0, 0, 0, 0, 0, 0])); // SAMPLE_DESC
         s
-    }
-
-    /// `XCL_DUMP_TARGETS` notes a mesh pipeline's console MS (also from the AS slot) and its PS,
-    /// render target 0's blend and the formats; a stream with a PC mesh shader is not noted.
-    #[test]
-    fn a_dumped_target_knows_the_shaders_of_a_console_mesh_pipeline() {
-        let ms = sample(13, &[fssm(&CODE, &[(8, 13)])]);
-        let ps = b"DXBC-a-pixel-shader".to_vec();
-        // D3D12_RT_FORMAT_ARRAY: RTFormats[8], then NumRenderTargets; two targets,
-        // R8G8B8A8_UNORM_SRGB (29) and R10G10B10A2_UNORM (24)
-        let mut formats = vec![0u8; 36];
-        formats[..4].copy_from_slice(&29u32.to_le_bytes());
-        formats[4..8].copy_from_slice(&24u32.to_le_bytes());
-        formats[32..36].copy_from_slice(&2u32.to_le_bytes());
-        let mut stream = sub(0, &0u64.to_le_bytes()); // ROOT_SIGNATURE: null
-        stream.extend_from_slice(&sub(24, &bytecode(&ms))); // the MS in the AS slot
-        stream.extend_from_slice(&sub(2, &bytecode(&ps)));
-        stream.extend_from_slice(&sub(8, &vec![0u8; 328])); // BLEND
-        stream.extend_from_slice(&sub(15, &formats));
-        let subs = super::stream_subobjects(&stream).unwrap();
-        let m = unsafe { super::mesh_stream_for_dump(&subs) }.expect("a console mesh pipeline is noted");
-        assert_eq!(m.stages.iter().map(|s| s.0).collect::<Vec<_>>(), ["ms", "ps"]);
-        assert_eq!(m.stages[0].1, ms.as_slice(), "the MS, moved out of the AS slot");
-        assert_eq!(m.stages[1].1, ps.as_slice());
-        assert_eq!(m.formats.iter().map(|f| f.0).collect::<Vec<_>>(), [29, 24]);
-        // a PC mesh shader (not a console container) is left to the PC paths
-        let pc = b"DXBC-a-pc-mesh-shader".to_vec();
-        let stream = as_slot_ms_stream(&pc, &ps);
-        assert!(unsafe { super::mesh_stream_for_dump(&super::stream_subobjects(&stream).unwrap()) }.is_none());
     }
 
     /// The stand-in for a console MS alone in the AS slot is a mesh pipeline: the subobject is
@@ -7716,9 +7874,28 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
             return Some(E_INVALIDARG);
         }
     };
-    let Some(rs) = abi_rs_for(this, &ps_samplers) else { return Some(E_INVALIDARG) };
+    let want_launch = super::port::mesh_launch() && crate::gpu::recomp::mesh_launch::enabled();
+    let (mesh_rs, launch_roots, as_blob) = if want_launch {
+        match (abi_rs_for_mesh_launch(this, &ps_samplers), crate::gpu::recomp::mesh_launch::amplification_dxil()) {
+            (Some((rs, roots)), Ok(asb)) => (rs, Some(roots), Some(asb.to_vec())),
+            _ => (
+                abi_rs_for(this, &ps_samplers)?,
+                None,
+                None,
+            ),
+        }
+    } else {
+        (abi_rs_for(this, &ps_samplers)?, None, None)
+    };
+    let launch = launch_roots.map(|roots| MeshLaunch {
+        roots,
+        _mesh_rs: mesh_rs as usize,
+        device: this as usize,
+        plain_stream: Vec::new(),
+        plain_pso: std::sync::OnceLock::new(),
+    });
     // the title's state (blend, rasteriser, depth, formats …) with XCL's RS and shaders
-    let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref());
+    let mut out = two_pass_mesh_stream(mesh_rs, &tp.ms, ps.as_deref(), as_blob.as_deref());
     // Extract PC-mapped render target formats upfront so BLEND (type 8) can be sanitized for
     // integer RTVs regardless of subobject order in the stream.
     let mut rt_count = 0u32;
@@ -7758,7 +7935,7 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
             out.raw(*ty, payload, palign == 8);
         }
     }
-    let hr = finish_two_pass(this, &out, tp, rs, &ps_samplers, "MS", riid, ppv);
+    let hr = finish_two_pass(this, &out, tp, mesh_rs, &ps_samplers, "MS", riid, ppv, launch);
     if hr >= 0 {
         super::dred::label(*ppv as usize, &[("ms", Some(ms)), ("ps", console_ps)]);
         if super::gpu_times::enabled() {
@@ -7816,8 +7993,27 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
             return E_INVALIDARG;
         }
     };
-    let Some(rs) = abi_rs_for(this, &ps_samplers) else { return E_INVALIDARG };
-    let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref());
+    let want_launch = super::port::mesh_launch() && crate::gpu::recomp::mesh_launch::enabled();
+    let (mesh_rs, launch_roots, as_blob) = if want_launch {
+        match (abi_rs_for_mesh_launch(this, &ps_samplers), crate::gpu::recomp::mesh_launch::amplification_dxil()) {
+            (Some((rs, roots)), Ok(asb)) => (rs, Some(roots), Some(asb.to_vec())),
+            _ => {
+                let Some(rs) = abi_rs_for(this, &ps_samplers) else { return E_INVALIDARG };
+                (rs, None, None)
+            }
+        }
+    } else {
+        let Some(rs) = abi_rs_for(this, &ps_samplers) else { return E_INVALIDARG };
+        (rs, None, None)
+    };
+    let launch = launch_roots.map(|roots| MeshLaunch {
+        roots,
+        _mesh_rs: mesh_rs as usize,
+        device: this as usize,
+        plain_stream: Vec::new(),
+        plain_pso: std::sync::OnceLock::new(),
+    });
+    let mut out = two_pass_mesh_stream(mesh_rs, &tp.ms, ps.as_deref(), as_blob.as_deref());
     let mut rt = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: d.NumRenderTargets, RTFormats: d.RTVFormats };
     for f in rt.RTFormats.iter_mut() {
         *f = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_target_format(f.0 as u32) as i32);
@@ -7836,7 +8032,7 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     if d.Flags.0 != 0 {
         out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, &d.Flags);
     }
-    let hr = finish_two_pass(this, &out, tp, rs, &ps_samplers, "GS", riid, ppv);
+    let hr = finish_two_pass(this, &out, tp, mesh_rs, &ps_samplers, "GS", riid, ppv, launch);
     if hr >= 0 {
         super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("gs", Some(gs)), ("ps", shader_bytes(&d.PS))]);
         if super::gpu_times::enabled() {
@@ -8424,58 +8620,7 @@ pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void
     if super::capture::enabled() && hr >= 0 && !ppv.is_null() {
         super::capture::note_stream(*ppv as usize);
     }
-    note_mesh_stream_for_dump(desc, ppv, hr);
     hr
-}
-
-/// `XCL_DUMP_TARGETS`: a pipeline stream with a console mesh shader (`translated_mesh_stream`)
-/// is noted with its MS and PS, render target 0's blend and the formats, as a graphics desc is
-/// (`note_pipeline_for_dump`): without it a dumped target drawn by mesh pipelines lists them as
-/// "not known" and their pixel shaders are not written.
-unsafe fn note_mesh_stream_for_dump(desc: *const c_void, ppv: *mut *mut c_void, hr: HRESULT) {
-    if !super::targets::enabled() || hr < 0 || ppv.is_null() || (*ppv).is_null() || !crate::gpu::shader::readable(desc as usize, 16) {
-        return;
-    }
-    let (size, base) = (*(desc as *const usize), *((desc as usize + 8) as *const usize));
-    if !crate::gpu::shader::readable(base, size) {
-        return;
-    }
-    let subs = known_subobjects(std::slice::from_raw_parts(base as *const u8, size));
-    if let Some(m) = mesh_stream_for_dump(&subs) {
-        super::targets::note_pipeline(*ppv as usize, &m.stages, &m.blend, &m.formats, false);
-    }
-}
-
-/// What `note_mesh_stream_for_dump` notes of a stream's subobjects: its MS (also from the AS
-/// slot, `mesh_shader_slots`) and PS if the MS is a console one, render target 0's blend and
-/// the render target formats.
-struct MeshStreamForDump<'a> {
-    stages: Vec<(&'static str, &'a [u8])>,
-    blend: D3D12_RENDER_TARGET_BLEND_DESC,
-    formats: Vec<windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT>,
-}
-
-unsafe fn mesh_stream_for_dump<'a>(subs: &[(u32, &'a [u8])]) -> Option<MeshStreamForDump<'a>> {
-    let shader = |ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE| subs.iter().find(|s| s.0 == ty.0 as u32).and_then(|s| payload_shader(s.1));
-    let (ms, _) = mesh_shader_slots(shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS), shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS));
-    let ms = ms.filter(|ms| crate::gpu::recomp::pso::is_console(ms))?;
-    let mut stages = vec![("ms", ms)];
-    if let Some(ps) = shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) {
-        stages.push(("ps", ps));
-    }
-    let payload = |ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE| subs.iter().find(|s| s.0 == ty.0 as u32).map(|s| s.1);
-    let blend = payload(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND)
-        .filter(|p| p.len() >= std::mem::size_of::<D3D12_BLEND_DESC>())
-        .map(|p| std::ptr::read_unaligned(p.as_ptr() as *const D3D12_BLEND_DESC).RenderTarget[0])
-        .unwrap_or_default();
-    let formats = payload(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS)
-        .filter(|p| p.len() >= std::mem::size_of::<D3D12_RT_FORMAT_ARRAY>())
-        .map(|p| {
-            let rt = std::ptr::read_unaligned(p.as_ptr() as *const D3D12_RT_FORMAT_ARRAY);
-            rt.RTFormats[..rt.NumRenderTargets.min(8) as usize].to_vec()
-        })
-        .unwrap_or_default();
-    Some(MeshStreamForDump { stages, blend, formats })
 }
 
 unsafe fn pipeline_state(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
@@ -8675,6 +8820,7 @@ unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
 }
 
 unsafe extern "system" fn cl_draw_instanced(this: *mut c_void, vcount: u32, icount: u32, sv: u32, si: u32) {
+    super::list_x::note_shader_pass(this);
     super::list_x::prepare_draw(this);
     type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32);
     let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "DrawInstanced")));
@@ -8682,6 +8828,7 @@ unsafe extern "system" fn cl_draw_instanced(this: *mut c_void, vcount: u32, icou
 }
 
 unsafe extern "system" fn cl_draw_indexed_instanced(this: *mut c_void, icount: u32, inst: u32, si: u32, bv: i32, sinst: u32) {
+    super::list_x::note_shader_pass(this);
     super::list_x::prepare_draw(this);
     type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32);
     let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "DrawIndexedInstanced")));
@@ -8698,6 +8845,7 @@ unsafe extern "system" fn cl_execute_indirect(
     cnt_buf: *mut c_void,
     cnt_off: u64,
 ) {
+    super::list_x::note_shader_pass(this);
     super::list_x::prepare_draw(this);
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, u64, *mut c_void, u64);
     let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "ExecuteIndirect")));
@@ -9118,53 +9266,70 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         stop_if_device_removed();
         return;
     }
-    super::capture::submit(this, std::slice::from_raw_parts(lists, n as usize));
-    // from here to the end: XCL's uploads and tile mappings before the lists, then the driver's
-    // own work in the submission. Where that takes long, it is not the title's time
-    // (`pso_async::title_held`)
-    let _in_pc = super::pso_async::pc_call();
-    // (not while a stop for a driver error is being handled: `watch`)
-    super::watch::wait_while_held();
-    // the dispatches title lists put off to the submit (their pipelines were being built) are
-    // recorded first, as `kickoff_x` does: the GPU-view tiles they ask for are mapped by this
-    // submit's refresh, and their waits for the builds are not the submit's cost (the put-off line)
-    for &l in std::slice::from_raw_parts(lists, n as usize) {
-        if super::console_list::pc_list(l).is_none() {
-            super::list_x::record_deferred(l);
-        }
+    let slice = std::slice::from_raw_parts(lists, n as usize);
+    // Internal XCL submits re-enter here without title translation.
+    if super::title_textures::is_own_work() {
+        f(this, n, lists);
+        stop_if_device_removed();
+        return;
     }
-    // textures in title memory the CPU wrote since: uploaded again first
+    execute_command_lists_body(this, slice);
+}
+
+/// Title `ExecuteCommandLists` after refresh / translate join.
+unsafe fn execute_command_lists_body(this: *mut c_void, lists: &[*mut c_void]) {
+    super::title_textures::before_title_execute(this);
+    super::capture::submit(this, lists);
+    let _in_pc = super::pso_async::pc_call();
+    super::watch::wait_while_held();
     let submit_t0 = std::time::Instant::now();
-    super::title_textures::refresh_for(this, std::slice::from_raw_parts(lists, n as usize));
+    super::submit::begin_refresh();
+    super::title_textures::refresh_for(this, lists);
     let t_lists = std::time::Instant::now();
     super::submit_cost::call(t_lists - submit_t0);
-    // console-shaped lists run as the PC lists they were translated into (split title lists expand
-    // into all of their recorded PC segments in exact chronological order)
-    let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
-    for &l in std::slice::from_raw_parts(lists, n as usize) {
-        if let Some(pc) = super::console_list::pc_list(l) {
-            mapped.push(pc);
-        } else if !super::title_list::push_segments(l, &mut mapped) {
-            mapped.push(l);
-        }
+    let mapped = super::thin::map_lists(lists);
+    if super::submit::run_async_mapped(this, mapped.clone()) {
+        super::submit::end_refresh();
+        super::session::note_submit_draw_work(super::watch::recent_work_count() as u64);
+        super::title_textures::submitted(&mapped);
+        super::title_textures::after_execute(this, &mapped);
+        super::present::note_execute(this, &mapped);
+        stop_if_device_removed();
+        super::submit_cost::done(submit_t0);
+        return;
     }
-    super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::gpu_profile::note_queue(this);
     let t_exec = std::time::Instant::now();
     super::submit_cost::lists(t_exec - t_lists);
-    super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
-        // a list still on the GPU from its previous submit: that one first (the PC does not take
-        // a list again before then)
+    execute_mapped_lists(this, &mapped);
+    super::submit::end_refresh();
+    super::session::note_submit_draw_work(super::watch::recent_work_count() as u64);
+    let t_end = std::time::Instant::now();
+    super::submit_cost::exec(t_end - t_exec);
+    super::title_textures::submitted(&mapped);
+    super::title_textures::after_execute(this, &mapped);
+    super::present::note_execute(this, &mapped);
+    stop_if_device_removed();
+    super::submit_cost::end(t_end.elapsed());
+    super::submit_cost::done(submit_t0);
+}
+
+/// Run already-translated PC command lists (join complete; safe for async worker).
+pub(super) unsafe fn execute_mapped_lists(this: *mut c_void, mapped: &[*mut c_void]) {
+    type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+    let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12CommandQueue", "ExecuteCommandLists")));
+    super::list_x::note_queue_for_lists(this as usize, mapped);
+    let submit_chunk = |chunk: &[*mut c_void]| {
         let t = std::time::Instant::now();
         if super::alloc_pool::note_resubmits(this, chunk) > 0 {
             super::alloc_pool::wait_for_previous_submits(chunk);
         }
         super::submit_cost::previous(t.elapsed());
         let t = std::time::Instant::now();
-        {
+        super::submit::driver_execute(|| {
             let _in_driver = super::watch::in_driver(super::watch::Call::Execute);
             f(this, chunk.len() as u32, chunk.as_ptr());
-        }
+        });
         super::gpu_times::executed(this, chunk);
         let t1 = std::time::Instant::now();
         super::submit_cost::driver(t1 - t);
@@ -9175,15 +9340,19 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         super::list_x::cpu_writes_after(this, chunk);
         super::list_x::note_submitted(this);
         super::submit_cost::after(t1.elapsed());
-    });
-    let t_end = std::time::Instant::now();
-    super::submit_cost::exec(t_end - t_exec);
-    // the next uploads into textures kept in step start from the states these lists leave
-    super::title_textures::submitted(&mapped);
-    super::present::note_execute(this, &mapped);
-    stop_if_device_removed();
-    super::submit_cost::end(t_end.elapsed());
-    super::submit_cost::done(submit_t0);
+        if super::port::submit_serial() {
+            super::session::serial_wait_after_submit(this);
+        }
+    };
+    if super::port::submit_serial() {
+        super::list_x::execute_with_waits_on(this, mapped, |chunk| {
+            for &one in chunk {
+                submit_chunk(&[one]);
+            }
+        });
+    } else {
+        super::list_x::execute_with_waits_on(this, mapped, submit_chunk);
+    }
 }
 
 /// Wait (up to 10 s) until the GPU has finished the work submitted to the queues console code
@@ -9424,6 +9593,7 @@ pub fn log_device_removed() {
         return;
     }
     crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
+    crate::xlog_error!("{}", super::session::removal_summary_line());
     // (to rule the system's memory in or out: a removal with no fault of the GPU's had 30 GB of
     // commit left)
     let (commit, limit) = crate::host::system_commit();
@@ -10803,12 +10973,12 @@ mod mesh_stream_tests {
         unsafe {
             // Case 1: driver returns S_OK but leaves *ppv == null
             let mut out: *mut c_void = std::ptr::null_mut();
-            let hr = finish_two_pass(this, &stream, make_tp(), 0x1234_5678 as *mut c_void, &[], "MS", &iid, &mut out);
+            let hr = finish_two_pass(this, &stream, make_tp(), 0x1234_5678 as *mut c_void, &[], "MS", &iid, &mut out, None);
             assert_eq!(hr, E_INVALIDARG);
             assert!(out.is_null());
 
             // Case 2: caller passes ppv == null
-            let hr = finish_two_pass(this, &stream, make_tp(), 0x1234_5678 as *mut c_void, &[], "MS", &iid, std::ptr::null_mut());
+            let hr = finish_two_pass(this, &stream, make_tp(), 0x1234_5678 as *mut c_void, &[], "MS", &iid, std::ptr::null_mut(), None);
             assert_eq!(hr, E_INVALIDARG);
         }
     }

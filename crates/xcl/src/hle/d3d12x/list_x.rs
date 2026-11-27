@@ -3888,7 +3888,9 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         return warn(&ERR, "KickoffX", format_args!("Close failed ({close_hr:#x})"));
     }
     if let Some(wrapper) = super::title_list::wrapper_of(this) {
-        record_deferred(wrapper);
+        if !super::thin::enabled() {
+            record_deferred(wrapper);
+        }
     }
     super::capture::kickoff(this, queue);
 
