@@ -6,12 +6,13 @@
 //! - waterfall loops via [`scan_waterfall_loops`] (`v_readfirstlane` + `v_cmp_eq` + `s_cbranch_execnz`);
 //!   whole-loop `SPLIT` when reads/accesses span blocks; [`peel_same_block_waterfalls`] still meets
 //!   self-contained per-block sites (CGBJ proves `waterfall` per CFG block)
-//! - selected/remaining/retry structural meet, strengthened when [`lane_masks::analyze`] succeeds
-//!   (per-`v_cmp_eq` pairing when `masks_ok`; guarded PCs refuse)
-//! - `Fetched` / `Lanes` / `LanePhi` / SCC `Select` origins (arms may differ)
-//! - per-access [`LaneHeapExpr`] for DXIL/HLSL `NonUniformResourceIndex` (lane_heap_index analogue)
+//! - selected/remaining/retry structural meet + VCC/saveexec wiring; when [`lane_masks::analyze`]
+//!   succeeds, per-`v_cmp_eq` pairing (`compares_pair_reads`) and guarded-PC refuse
+//! - `Fetched` (optional `saddr`) / `Lanes` (SGPR arms followed) / `LanePhi` / SCC `Select`
+//! - per-access [`LaneHeapExpr`] for DXIL/HLSL `NonUniformResourceIndex` (lane_heap_index analogue),
+//!   including off-waterfall Fetched / Lanes / Select fills
 //! - per-lane T# dwords 0..3 from waterfall `v_readfirstlane` sources (not only dword0)
-//! - join `only_edge` + lane_masks BDD polarity + Structured-style `guarded` PCs
+//! - nested [`only_edge`] peel (Tracer `live` / `MAX_JOINS` budget) + lane_masks BDD polarity
 //!
 //! Nested / multi-block natural loops may still whole-loop `split`; peeled same-block accesses can
 //! `meet_ok`. Full IR-level Structured BDD `meet` remains subset (no CGBJ SSA Bools).
@@ -24,13 +25,23 @@ use super::{join_lane_phi, lane_masks, strict_joins};
 /// Stop origin tracing past this depth (retail shaders can chain thousands of mov/cselect defs).
 const MAX_TRACE_DEPTH: usize = 256;
 
+/// Nested sole-live join peel budget (CGBJ Tracer `MAX_JOINS` / `live`).
+const MAX_ONLY_EDGE_PEEL: usize = join_lane_phi::MAX_JOINS;
+
 /// CGBJ `Source` analogue for a descriptor that may differ between lanes / SCC arms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DescSource {
     /// Scalar load / constant SGPRs (uniform).
     Loaded { load_pc: u64, first: u8, offset: u32 },
     /// `global_load_dword*` into VGPRs (per-lane heap table entry).
-    Fetched { load_pc: u64, first: u8, addr_vgpr: u64 },
+    /// `saddr_sgpr` is the scalar base when present (not `null` / `EXEC`).
+    Fetched {
+        load_pc: u64,
+        first: u8,
+        addr_vgpr: u64,
+        saddr_sgpr: Option<u64>,
+        offset: u32,
+    },
     /// `v_cndmask_b32` pick by one lane mask (set arm, then clear arm).
     Lanes {
         mask_sgpr: u64,
@@ -74,8 +85,14 @@ pub struct WaterfallProof {
 /// Heap-index expression for emit (CGBJ `lane_heap_index` analogue).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaneHeapExpr {
-    /// `(v{addr} + add) >> shift` (Fetched table slot; shift 5 = resource, 4 = sampler).
-    FetchedAddr { addr_vgpr: u64, add: u32, shift: u8 },
+    /// `((s{saddr} + v{addr} + add) >> shift)` — `saddr` omitted when null/absent (CGBJ `fetched_index`).
+    /// Shift 5 = resource heap slot, 4 = sampler.
+    FetchedAddr {
+        addr_vgpr: u64,
+        saddr_sgpr: Option<u64>,
+        add: u32,
+        shift: u8,
+    },
     /// Per-lane T# dword0 / heap index already in a VGPR.
     VgprDword0(u64),
     /// `select(lane_bit(mask), set, clear)`.
@@ -143,39 +160,61 @@ pub fn trace(insts: &[Decoded]) -> DescTrace {
     }
     let wave64 = likely_wave64(insts);
     if let Ok(sum) = lane_masks::analyze(insts, wave64) {
+        out.guarded.extend(sum.guarded.iter().copied());
         for (join_pc, edges) in &sum.join_edge_live {
             let live: Vec<u64> = edges.iter().filter(|(_, l)| *l).map(|(p, _)| *p).collect();
             if live.len() == 1 {
                 out.only_edge.insert(*join_pc, live[0]);
             }
         }
-        out.guarded.extend(sum.guarded.iter().copied());
-    } else if let Ok(pol) = lane_masks::join_polarity(insts, wave64) {
-        for (join_pc, edges) in &pol {
-            let live: Vec<u64> = edges.iter().filter(|(_, l)| *l).map(|(p, _)| *p).collect();
-            if live.len() == 1 {
-                out.only_edge.insert(*join_pc, live[0]);
-            }
-        }
+    } else if let Ok(edges) = lane_masks::only_edges(insts, wave64) {
+        out.only_edge.extend(edges);
     }
     // Also fold join_lane_phi CFG sole-live (execz heuristics) into only_edge.
     let leaders: BTreeSet<u64> = insts.iter().map(|d| d.pc).collect();
+    let join_pol = lane_masks::join_polarity(insts, wave64).ok();
     if let Some(cfg) = join_lane_phi::build_sgpr_join_cfg(insts, &leaders) {
         for j in 0..cfg.blocks.len() {
-            if let Some(only) = join_lane_phi::join_sole_live_predecessor(&cfg, j) {
+            if let Some(only) =
+                join_lane_phi::join_sole_live_predecessor_polarity(&cfg, j, join_pol.as_ref())
+            {
                 let join_pc = cfg.blocks[j][0].pc;
                 let pred_pc = cfg.blocks[only][0].pc;
                 out.only_edge.entry(join_pc).or_insert(pred_pc);
             }
         }
     }
+    // Tracer `live`: peel nested sole-live joins so a later join sees the transitively live arm.
+    peel_only_edges(&mut out.only_edge);
     let masks_ok = lane_masks::analyze(insts, wave64).is_ok();
-    let join_pol = lane_masks::join_polarity(insts, wave64).ok();
     let guarded = out.guarded.clone();
     prove_waterfalls(insts, wave64, masks_ok, &guarded, join_pol.as_ref(), &mut out);
     prove_scc_selects(insts, &mut out);
+    prove_lane_heap_origins(insts, join_pol.as_ref(), &mut out);
     prove_per_lane_tsharp(insts, join_pol.as_ref(), &mut out);
     out
+}
+
+/// Collapse `only_edge` chains up to [`MAX_ONLY_EDGE_PEEL`] (CGBJ Tracer `live` peel).
+fn peel_only_edges(only: &mut BTreeMap<u64, u64>) {
+    let keys: Vec<u64> = only.keys().copied().collect();
+    for join in keys {
+        let mut cur = join;
+        for _ in 0..MAX_ONLY_EDGE_PEEL {
+            let Some(&pred) = only.get(&cur) else { break };
+            if pred == cur {
+                break;
+            }
+            // Remap join → deepest sole-live predecessor still recorded as an only_edge source.
+            if only.contains_key(&pred) {
+                only.insert(join, pred);
+                cur = pred;
+            } else {
+                only.insert(join, pred);
+                break;
+            }
+        }
+    }
 }
 
 /// One natural-loop waterfall candidate (single- or multi-block).
@@ -456,6 +495,7 @@ fn peel_same_block_waterfalls(wf: &ScannedWaterfall, insts: &[Decoded]) -> Vec<S
                 _ => {}
             }
         }
+        // Peel is the CGBJ per-block `waterfall(block, …)` call site: not nested/split.
         peels.push(ScannedWaterfall {
             loop_blocks: BTreeSet::from([ab]),
             header_pc: wf.header_pc,
@@ -467,7 +507,7 @@ fn peel_same_block_waterfalls(wf: &ScannedWaterfall, insts: &[Decoded]) -> Vec<S
             saveexec_at,
             retry_restore,
             split: false,
-            nested: wf.nested,
+            nested: false,
         });
     }
     if peels.is_empty() {
@@ -509,13 +549,29 @@ fn waterfall_meet_ok(
     if wf.split {
         return false;
     }
-    let structural = wf.saveexec_at.is_some_and(|se| {
-        let se_pc = insts[se].pc;
-        wf.compares.iter().all(|&c| c < se_pc)
-            && wf.accesses.iter().all(|&(a, _)| a > se_pc)
-            && wf.retry_restore
-            && wf.reads.iter().all(|&(rpc, _, _, _)| rpc < wf.compares[0])
-    });
+    let Some(se) = wf.saveexec_at else {
+        return false;
+    };
+    let se_pc = insts[se].pc;
+    let se_d = &insts[se];
+    // AND_SAVEEXEC must take the compare mask (VCC / EXEC from v_cmpx).
+    let saveexec_from_mask = {
+        let src = f(se_d, "SSRC0").unwrap_or(u64::MAX);
+        src == 106 || src == 126 || se_d.inst.name.starts_with("S_AND_SAVEEXEC")
+    };
+    if !saveexec_from_mask {
+        return false;
+    }
+    let first_cmp = match wf.compares.iter().copied().min() {
+        Some(c) => c,
+        None => return false,
+    };
+    // CGBJ selected/remaining/retry ordering: reads → compares → saveexec → access → retry.
+    let structural = wf.compares.iter().all(|&c| c < se_pc)
+        && wf.accesses.iter().all(|&(a, _)| a > se_pc)
+        && wf.retry_restore
+        && wf.reads.iter().all(|&(rpc, _, _, _)| rpc < first_cmp)
+        && wf.reads.iter().all(|&(rpc, _, _, _)| rpc < se_pc);
     if !structural {
         return false;
     }
@@ -524,6 +580,8 @@ fn waterfall_meet_ok(
         .iter()
         .map(|&(pc, _, dst, v)| (pc, dst, v))
         .collect();
+    // Every compare must pair a readfirstlane (CGBJ `pair`); when masks_ok require
+    // distinct pairing (per-compare BDD subset).
     if !masks_ok {
         if !wf
             .compares
@@ -536,8 +594,15 @@ fn waterfall_meet_ok(
         return false;
     }
     let apcs: Vec<u64> = wf.accesses.iter().map(|&(p, _)| p).collect();
+    // Structured `guards`: access under an unresolved EXEC atom refuses meet.
     if apcs.iter().any(|pc| guarded.contains(pc)) {
         return false;
+    }
+    // All accesses in the peeled block must share the same post-saveexec window.
+    if let (Some(&(first_a, _)), Some(&(last_a, _))) = (wf.accesses.first(), wf.accesses.last()) {
+        if first_a <= se_pc || last_a <= se_pc {
+            return false;
+        }
     }
     true
 }
@@ -619,6 +684,55 @@ fn prove_waterfalls(
                     .copied()
                     .filter(|pc| !peeled_met.contains(pc) && !out.waterfall.meet_ok.contains(pc)),
             );
+        }
+    }
+}
+
+/// Off-waterfall Fetched / Lanes / Select → `lane_heap` when SRSRC traces to a per-lane origin
+/// (CGBJ `lane_heap_index` without a waterfall proof).
+fn prove_lane_heap_origins(
+    insts: &[Decoded],
+    join_pol: Option<&BTreeMap<u64, Vec<(u64, bool)>>>,
+    out: &mut DescTrace,
+) {
+    for d in insts {
+        if !matches!(
+            d.enc.name,
+            "ENC_MIMG" | "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL"
+        ) {
+            continue;
+        }
+        if out.lane_heap.contains_key(&d.pc) {
+            continue;
+        }
+        let Some(srsrc) = f(d, "SRSRC").map(|v| v * rdna2::register_scale("SRSRC")) else {
+            continue;
+        };
+        let sampler = d.enc.name == "ENC_MIMG" && f(d, "SSAMP").is_some();
+        let origin = out
+            .origins
+            .get(&d.pc)
+            .cloned()
+            .or_else(|| {
+                let vgpr = sgpr_to_lane_vgpr(insts, d.pc, srsrc)?;
+                Some(classify_vgpr(insts, vgpr, &out.only_edge, join_pol))
+            });
+        let Some(origin) = origin else { continue };
+        let keep = matches!(
+            origin,
+            DescSource::Fetched { .. }
+                | DescSource::Lanes { .. }
+                | DescSource::Select { .. }
+                | DescSource::LanePhi { .. }
+                | DescSource::Imm(_)
+        );
+        if !keep {
+            continue;
+        }
+        out.origins.entry(d.pc).or_insert(origin.clone());
+        if let Some(expr) = heap_expr_from_source(&origin, sampler) {
+            out.lane_heap.insert(d.pc, expr);
+            collect_loads(&origin, &mut out.waterfall.loads);
         }
     }
 }
@@ -861,10 +975,16 @@ fn lane_tsharp_from_source_depth(insts: &[Decoded], src: &DescSource, depth: usi
                 n if n.contains("X2") => 2,
                 _ => 1,
             };
+            let start = u64::from(*first);
             for k in 0..n.min(4) {
-                let v = vdst + u64::from(*first) + k as u64;
+                if start + k as u64 >= n as u64 {
+                    break;
+                }
+                let v = vdst + start + k as u64;
                 out[k] = Some(v);
             }
+            // Multi-load image T#: second global_load_dwordx4 for dwords 4..7 is ignored for
+            // heap index (dword0 only); T# words 0..3 stay on this load's VGPRs.
             out
         }
         DescSource::VgprDword0(v) => {
@@ -884,7 +1004,19 @@ fn lane_tsharp_from_source_depth(insts: &[Decoded], src: &DescSource, depth: usi
                 .collect();
             match live.len() {
                 0 => [None; 4],
-                _ => live[0],
+                1 => live[0],
+                _ => {
+                    // Uniform arms: keep agreeing slots (CGBJ anywhere/fold when edges agree).
+                    let mut acc = live[0];
+                    for arm in &live[1..] {
+                        for k in 0..4 {
+                            if acc[k] != arm[k] {
+                                acc[k] = None;
+                            }
+                        }
+                    }
+                    acc
+                }
             }
         }
         _ => [None; 4],
@@ -1193,10 +1325,21 @@ fn classify_vgpr_depth(
             let vdst = f(d, "VDST").unwrap_or(vgpr);
             let first = vgpr.saturating_sub(vdst) as u8;
             let addr = f(d, "ADDR").unwrap_or(0);
+            let saddr = f(d, "SADDR").and_then(|s| {
+                // null (125) / EXEC (126/127) / none: address is VGPR-only.
+                if s == 0x7D || s == 0x7E || s == 0x7F || s >= 106 {
+                    None
+                } else {
+                    Some(s)
+                }
+            });
+            let offset = f(d, "OFFSET").unwrap_or(0) as u32;
             return DescSource::Fetched {
                 load_pc: d.pc,
                 first,
                 addr_vgpr: addr,
+                saddr_sgpr: saddr,
+                offset,
             };
         }
         if name == "V_CNDMASK_B32" {
@@ -1218,11 +1361,13 @@ fn classify_vgpr_depth(
                 if code >= 256 {
                     classify_vgpr_depth(insts, code - 256, only_edge, join_pol, depth + 1, bound)
                 } else if code < 106 {
-                    DescSource::Loaded {
-                        load_pc: d.pc,
-                        first: 0,
-                        offset: 0,
-                    }
+                    // Follow scalar arm to Loaded / Imm (CGBJ `lane_select` per outcome).
+                    classify_select_arm(insts, d.pc, code, 5)
+                        .unwrap_or(DescSource::Loaded {
+                            load_pc: d.pc,
+                            first: 0,
+                            offset: 0,
+                        })
                 } else if (128..=208).contains(&code) {
                     let v = if code <= 192 {
                         (code - 128) as u32
@@ -1245,16 +1390,30 @@ fn classify_vgpr_depth(
             if src >= 256 {
                 return classify_vgpr_depth(insts, src - 256, only_edge, join_pol, depth + 1, bound);
             }
+            if src < 106 {
+                // Scalar → VGPR copy of a descriptor dword (lane_copies prelude).
+                if let Some(arm) = classify_select_arm(insts, d.pc, src, 5) {
+                    return arm;
+                }
+            }
         }
         let leader = block_start_at(insts, d.pc);
-        if let Some(&pred_start) = only_edge.get(&leader) {
+        // Nested only_edge peel (Tracer `live` through several sole-live joins).
+        if let Some(&pred0) = only_edge.get(&leader) {
+            let mut deep = pred0;
+            for _ in 1..MAX_ONLY_EDGE_PEEL {
+                match only_edge.get(&deep) {
+                    Some(&p) if p != deep => deep = p,
+                    _ => break,
+                }
+            }
             return classify_vgpr_depth(
                 insts,
                 vgpr,
                 only_edge,
                 join_pol,
                 depth + 1,
-                Some((pred_start, leader)),
+                Some((deep, leader)),
             );
         }
         return DescSource::VgprDword0(vgpr);
@@ -1287,10 +1446,13 @@ fn heap_expr_from_source_depth(src: &DescSource, sampler: bool, depth: usize) ->
         DescSource::Fetched {
             first,
             addr_vgpr,
+            saddr_sgpr,
+            offset,
             ..
         } => Some(LaneHeapExpr::FetchedAddr {
             addr_vgpr: *addr_vgpr,
-            add: 4 * u32::from(*first),
+            saddr_sgpr: *saddr_sgpr,
+            add: offset.wrapping_add(4 * u32::from(*first)),
             shift,
         }),
         DescSource::Loaded { offset, first, .. } => {
@@ -1321,7 +1483,16 @@ fn heap_expr_from_source_depth(src: &DescSource, sampler: bool, depth: usize) ->
                     Some(s) => heap_expr_from_source_depth(s, sampler, depth + 1).map(Some),
                 })
                 .collect();
-            Some(LaneHeapExpr::LanePhi { arms: mapped? })
+            let arms = mapped?;
+            let live: Vec<&LaneHeapExpr> = arms.iter().flatten().collect();
+            // Sole live edge or uniform arms → fold (emit does not need a CFG phi).
+            if live.len() == 1 {
+                return Some(live[0].clone());
+            }
+            if live.len() > 1 && live.iter().all(|e| *e == live[0]) {
+                return Some(live[0].clone());
+            }
+            Some(LaneHeapExpr::LanePhi { arms })
         }
     }
 }
@@ -1337,14 +1508,19 @@ pub fn lane_heap_hlsl(
         LaneHeapExpr::VgprDword0(v) => vreg(*v),
         LaneHeapExpr::FetchedAddr {
             addr_vgpr,
+            saddr_sgpr,
             add,
             shift,
         } => {
             let a = vreg(*addr_vgpr);
+            let base = match saddr_sgpr {
+                Some(s) => format!("{} + {a}", sreg(*s)),
+                None => a,
+            };
             if *add == 0 {
-                format!("({a} >> {shift}u)")
+                format!("(({base}) >> {shift}u)")
             } else {
-                format!("(({a} + {add}u) >> {shift}u)")
+                format!("(({base} + {add}u) >> {shift}u)")
             }
         }
         LaneHeapExpr::Lanes {
@@ -1368,6 +1544,9 @@ pub fn lane_heap_hlsl(
             match live.len() {
                 0 => "0u".into(),
                 1 => lane_heap_hlsl(live[0], sreg, vreg),
+                _ if live.iter().all(|e| *e == live[0]) => lane_heap_hlsl(live[0], sreg, vreg),
+                // Distinct CFG arms without an edge predicate: prefer first live (join already
+                // happened in VGPRs for VgprDword0-uniform cases folded above).
                 _ => lane_heap_hlsl(live[0], sreg, vreg),
             }
         }
@@ -1586,12 +1765,23 @@ mod tests {
     fn lane_heap_hlsl_fetched_shifts_addr() {
         let expr = LaneHeapExpr::FetchedAddr {
             addr_vgpr: 3,
+            saddr_sgpr: None,
             add: 0,
             shift: 5,
         };
         let mut s = |_c: u64| "s0".into();
         let mut v = |n: u64| format!("v{n}");
-        assert_eq!(lane_heap_hlsl(&expr, &mut s, &mut v), "(v3 >> 5u)");
+        assert_eq!(lane_heap_hlsl(&expr, &mut s, &mut v), "((v3) >> 5u)");
+        let with_s = LaneHeapExpr::FetchedAddr {
+            addr_vgpr: 3,
+            saddr_sgpr: Some(4),
+            add: 8,
+            shift: 5,
+        };
+        assert_eq!(
+            lane_heap_hlsl(&with_s, &mut s, &mut v),
+            "((s0 + v3 + 8u) >> 5u)"
+        );
     }
 
     #[test]
@@ -1663,6 +1853,64 @@ mod tests {
                 .and_then(|c| join_lane_phi::join_sole_live_predecessor(&c, c.blocks.len() - 1))
                 .is_some(),
             "expected only_edge or sole-live pred on transmission join"
+        );
+    }
+
+    #[test]
+    fn peel_only_edges_collapses_nested_sole_live() {
+        let mut m = BTreeMap::from([(20u64, 10u64), (10u64, 0u64)]);
+        peel_only_edges(&mut m);
+        assert_eq!(m.get(&20), Some(&0), "join 20 peels through 10 to 0");
+        assert_eq!(m.get(&10), Some(&0));
+    }
+
+    #[test]
+    fn fetched_with_saddr_emits_base_plus_vgpr() {
+        const V: u64 = 256;
+        let insts = decode_lines(&[
+            (
+                "GLOBAL_LOAD_DWORDX4",
+                "ENC_FLAT_GLBL",
+                &[("VDST", 4), ("ADDR", 1), ("SADDR", 4), ("OFFSET", 0)],
+                None,
+            ),
+            ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", V + 4)], None),
+            ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 8), ("VSRC1", 4)], None),
+            ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 106)], None),
+            (
+                "BUFFER_LOAD_DWORD",
+                "ENC_MUBUF",
+                &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)],
+                None,
+            ),
+            ("S_XOR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 12)], None),
+            ("S_CBRANCH_EXECNZ", "ENC_SOPP", &[("SIMM16", 0xFFF9)], None),
+            ("S_ENDPGM", "ENC_SOPP", &[("SIMM16", 0)], None),
+        ]);
+        let t = trace(&insts);
+        let access = insts.iter().find(|d| d.enc.name == "ENC_MUBUF").unwrap().pc;
+        assert!(
+            matches!(
+                t.origins.get(&access),
+                Some(DescSource::Fetched {
+                    addr_vgpr: 1,
+                    saddr_sgpr: Some(4),
+                    ..
+                })
+            ),
+            "got {:?}",
+            t.origins.get(&access)
+        );
+        assert!(
+            matches!(
+                t.lane_heap.get(&access),
+                Some(LaneHeapExpr::FetchedAddr {
+                    saddr_sgpr: Some(4),
+                    ..
+                })
+            ),
+            "got {:?}",
+            t.lane_heap.get(&access)
         );
     }
 }

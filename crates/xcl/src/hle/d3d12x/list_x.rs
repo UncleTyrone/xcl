@@ -653,18 +653,26 @@ pub(super) fn note_frame_draw(
     instances: u32,
     first: u32,
     base: i32,
+    first_instance: u32,
 ) {
     if !super::frame_replay::list_ops_recording() {
         return;
     }
     use super::frame_wire::list_op;
-    let mut bytes = Vec::with_capacity(18);
-    bytes.push(list_op::DRAW);
+    let mut bytes = Vec::with_capacity(22);
+    if first_instance != 0 {
+        bytes.push(list_op::DRAW_EX);
+    } else {
+        bytes.push(list_op::DRAW);
+    }
     bytes.push(u8::from(indexed));
     bytes.extend_from_slice(&count.to_le_bytes());
     bytes.extend_from_slice(&instances.to_le_bytes());
     bytes.extend_from_slice(&first.to_le_bytes());
     bytes.extend_from_slice(&base.to_le_bytes());
+    if first_instance != 0 {
+        bytes.extend_from_slice(&first_instance.to_le_bytes());
+    }
     super::frame_replay::append_list_op(list as usize, &bytes);
 }
 
@@ -678,6 +686,43 @@ pub(super) fn note_frame_dispatch(list: *mut c_void, x: u32, y: u32, z: u32) {
     bytes.extend_from_slice(&x.to_le_bytes());
     bytes.extend_from_slice(&y.to_le_bytes());
     bytes.extend_from_slice(&z.to_le_bytes());
+    super::frame_replay::append_list_op(list as usize, &bytes);
+}
+
+pub(super) fn note_frame_dispatch_mesh(list: *mut c_void, x: u32, y: u32, z: u32) {
+    if !super::frame_replay::list_ops_recording() {
+        return;
+    }
+    use super::frame_wire::list_op;
+    let mut bytes = Vec::with_capacity(13);
+    bytes.push(list_op::DISPATCH_MESH);
+    bytes.extend_from_slice(&x.to_le_bytes());
+    bytes.extend_from_slice(&y.to_le_bytes());
+    bytes.extend_from_slice(&z.to_le_bytes());
+    super::frame_replay::append_list_op(list as usize, &bytes);
+}
+
+pub(super) fn note_frame_indirect(
+    list: *mut c_void,
+    sig: u64,
+    max: u32,
+    args: u64,
+    args_off: u64,
+    count: u64,
+    count_off: u64,
+) {
+    if !super::frame_replay::list_ops_recording() {
+        return;
+    }
+    use super::frame_wire::list_op;
+    let mut bytes = Vec::with_capacity(45);
+    bytes.push(list_op::INDIRECT);
+    bytes.extend_from_slice(&sig.to_le_bytes());
+    bytes.extend_from_slice(&max.to_le_bytes());
+    bytes.extend_from_slice(&args.to_le_bytes());
+    bytes.extend_from_slice(&args_off.to_le_bytes());
+    bytes.extend_from_slice(&count.to_le_bytes());
+    bytes.extend_from_slice(&count_off.to_le_bytes());
     super::frame_replay::append_list_op(list as usize, &bytes);
 }
 

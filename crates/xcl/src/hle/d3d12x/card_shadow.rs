@@ -1,13 +1,23 @@
-//! CPU-side card staging metadata for large buffer shadows (GPL-2 rewrite).
+//! Card staging metadata + optional D3D12 twin buffers for large shadows (GPL-2 rewrite).
 //!
 //! Tracks 64 KiB dirty runs on the host-held card view and send generations for relay
-//! flights. Behavioral depth mirrors CGBJ card dirty/sent journals (study only — not a paste):
-//! joined runs, sent-by-order, `near` skip for relay merge, and piece merge under writes.
+//! flights. When a live D3D12 device is available, also allocates an UPLOAD staging buffer
+//! (CPU side) and a DEFAULT UAV "before" twin (card side) matching CGBJ `Card::{staging,before}`
+//! roles — study only, not a paste. On-card hash/compare CSOs remain with `card_steps` / land.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use windows::core::Interface;
+use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+use super::real;
 use super::shadow::PIECE;
+
+static TWIN_BYTES: AtomicU64 = AtomicU64::new(0);
+static TWIN_MADE: AtomicU64 = AtomicU64::new(0);
+static BEFORE_MADE: AtomicU64 = AtomicU64::new(0);
 
 static SEND_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -95,22 +105,173 @@ pub(crate) fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool
     differs != 0
 }
 
+/// D3D12 host staging + optional card-side "before" twin (CGBJ `Card` role).
+pub(crate) struct CardTwin {
+    pub(crate) staging: ID3D12Resource,
+    pub(crate) staging_gpu: u64,
+    pub(crate) size: u64,
+    before: Mutex<Option<ID3D12Resource>>,
+}
+
+impl CardTwin {
+    pub(crate) fn before_clone(&self) -> Option<ID3D12Resource> {
+        self.before.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
 /// Per-shadow card side when [`session::card_buffers_room`] admits the buffer.
 pub(crate) struct CardSide {
     pub(crate) size: u64,
     dirty: Mutex<Vec<(usize, usize)>>,
     sent: Mutex<SentRuns>,
     touched: AtomicBool,
+    /// Optional D3D12 staging (+ lazy before twin). Absent when no device / Create refused.
+    twin: Option<CardTwin>,
+}
+
+fn buf_desc(size: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
+    D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Alignment: 0,
+        Width: size.max(1).next_multiple_of(PIECE as u64),
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: flags,
+    }
+}
+
+/// UPLOAD heap staging buffer for the CPU's card side.
+pub(crate) fn try_alloc_staging(size: u64) -> Option<(ID3D12Resource, u64)> {
+    let raw = real::device_raw();
+    if raw.is_null() || size == 0 {
+        return None;
+    }
+    let device = unsafe { ID3D12Device::from_raw_borrowed(&raw)? };
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_UPLOAD,
+        CreationNodeMask: 1,
+        VisibleNodeMask: 1,
+        ..Default::default()
+    };
+    let mut buf: Option<ID3D12Resource> = None;
+    unsafe {
+        device
+            .CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &buf_desc(size, D3D12_RESOURCE_FLAG_NONE),
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut buf,
+            )
+            .ok()?;
+    }
+    let buf = buf?;
+    let gpu = unsafe { buf.GetGPUVirtualAddress() };
+    Some((buf, gpu))
+}
+
+/// DEFAULT UAV buffer for the card-side "before" twin.
+pub(crate) fn try_alloc_before(size: u64) -> Option<ID3D12Resource> {
+    let raw = real::device_raw();
+    if raw.is_null() || size == 0 {
+        return None;
+    }
+    let device = unsafe { ID3D12Device::from_raw_borrowed(&raw)? };
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        CreationNodeMask: 1,
+        VisibleNodeMask: 1,
+        ..Default::default()
+    };
+    let mut buf: Option<ID3D12Resource> = None;
+    unsafe {
+        device
+            .CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &buf_desc(size, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                None,
+                &mut buf,
+            )
+            .ok()?;
+    }
+    buf
 }
 
 impl CardSide {
     pub(crate) fn new(len: u64) -> Self {
+        let size = len.max(1).next_multiple_of(PIECE as u64);
+        let twin = try_alloc_staging(size).map(|(staging, staging_gpu)| {
+            TWIN_MADE.fetch_add(1, Ordering::Relaxed);
+            TWIN_BYTES.fetch_add(size, Ordering::Relaxed);
+            let n = TWIN_MADE.load(Ordering::Relaxed);
+            if n <= 8 || n.is_power_of_two() {
+                crate::xlog_info!(
+                    "D3D12.X: card staging twin {} KiB ({} live twin bytes)",
+                    size >> 10,
+                    TWIN_BYTES.load(Ordering::Relaxed)
+                );
+            }
+            CardTwin {
+                staging,
+                staging_gpu,
+                size,
+                before: Mutex::default(),
+            }
+        });
         Self {
             size: len,
             dirty: Mutex::default(),
             sent: Mutex::default(),
             touched: AtomicBool::new(false),
+            twin,
         }
+    }
+
+    /// CPU staging + optional before twin + committed size (CGBJ `card_sides`).
+    pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
+        let twin = self.twin.as_ref()?;
+        Some((&twin.staging, twin.before_clone(), twin.size))
+    }
+
+    pub(crate) fn has_twin(&self) -> bool {
+        self.twin.is_some()
+    }
+
+    pub(crate) fn staging_gpu(&self) -> Option<u64> {
+        self.twin.as_ref().map(|t| t.staging_gpu)
+    }
+
+    /// Lazy-make the DEFAULT "before" twin with `make` (or [`try_alloc_before`]).
+    /// Returns whether one was created now.
+    pub(crate) fn card_make_before(
+        &self,
+        make: impl FnOnce(u64) -> Option<ID3D12Resource>,
+    ) -> bool {
+        let Some(twin) = &self.twin else {
+            return false;
+        };
+        let mut before = twin.before.lock().unwrap_or_else(|e| e.into_inner());
+        if before.is_some() {
+            return false;
+        }
+        *before = make(twin.size);
+        if before.is_some() {
+            BEFORE_MADE.fetch_add(1, Ordering::Relaxed);
+            TWIN_BYTES.fetch_add(twin.size, Ordering::Relaxed);
+        }
+        before.is_some()
+    }
+
+    /// Ensure a before twin exists (allocates DEFAULT UAV when missing).
+    pub(crate) fn ensure_before(&self) -> bool {
+        self.card_make_before(try_alloc_before)
     }
 
     pub(crate) fn note_dirty(&self, off: usize, len: usize) {

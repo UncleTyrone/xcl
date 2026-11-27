@@ -2774,7 +2774,15 @@ pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices:
             super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
             list.DrawInstanced(vertices, instances, first_vertex, first_instance);
         }
-        super::list_x::note_frame_draw(this, false, vertices, instances, first_vertex, 0);
+        super::list_x::note_frame_draw(
+            this,
+            false,
+            vertices,
+            instances,
+            first_vertex,
+            0,
+            first_instance,
+        );
         super::gpu_profile::end(this, t);
     }
 }
@@ -2817,7 +2825,15 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
     let this = list.as_raw();
     let t = super::gpu_profile::begin(this, with(this, |s| s.pso), super::gpu_profile::Kind::Draw, [indices, instances, 0]);
     list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
-    super::list_x::note_frame_draw(this, true, indices, instances, first_index, base_vertex);
+    super::list_x::note_frame_draw(
+        this,
+        true,
+        indices,
+        instances,
+        first_index,
+        base_vertex,
+        first_instance,
+    );
     super::gpu_profile::end(this, t);
 }
 

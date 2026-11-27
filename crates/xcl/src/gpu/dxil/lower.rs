@@ -722,10 +722,15 @@ impl Lw {
             E::VgprDword0(v) => self.vreg(*v),
             E::FetchedAddr {
                 addr_vgpr,
+                saddr_sgpr,
                 add,
                 shift,
             } => {
                 let mut a = self.vreg(*addr_vgpr);
+                if let Some(s) = *saddr_sgpr {
+                    let base = self.sreg(s);
+                    a = self.add(base, a);
+                }
                 if *add != 0 {
                     let k = self.c(*add);
                     a = self.add(a, k);
@@ -757,6 +762,8 @@ impl Lw {
                 let live: Vec<_> = arms.iter().flatten().collect();
                 match live.len() {
                     0 => self.c(0),
+                    1 => self.lane_heap_index(live[0]),
+                    _ if live.iter().all(|e| *e == live[0]) => self.lane_heap_index(live[0]),
                     _ => self.lane_heap_index(live[0]),
                 }
             }

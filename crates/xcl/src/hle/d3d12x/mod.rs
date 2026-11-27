@@ -51,6 +51,7 @@ pub(crate) mod pop_env;
 pub(crate) mod read_env;
 pub(crate) mod land;
 pub(crate) mod card_shadow;
+pub(crate) mod inplace;
 pub(crate) mod safecopy;
 pub(crate) mod shadow;
 pub(crate) mod root_env;
