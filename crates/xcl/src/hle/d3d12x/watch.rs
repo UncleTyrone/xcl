@@ -27,8 +27,9 @@
 //! `XCL_GPU_WATCH=0`: no watch thread (the ring is still written, the stop file still read).
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------------------
@@ -542,6 +543,30 @@ static LANDED_BLOCKS: AtomicU64 = AtomicU64::new(0);
 /// Landing wrote title bytes in block `block` (`XCL_LAND_BESIDE` path).
 pub(crate) fn note_landed_block(_block: usize) {
     LANDED_BLOCKS.fetch_add(1, Ordering::Relaxed);
+}
+
+static CURRENT_LAND: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
+static CURRENT_GEN: AtomicU64 = AtomicU64::new(1);
+
+/// `XCL_LAND_TAKEN`: mark a 64 KiB block as already holding the card's bytes after a beside land.
+pub(crate) fn mark_landed_current(block: usize) {
+    let gen = CURRENT_GEN.load(Ordering::Relaxed);
+    CURRENT_LAND.lock().unwrap_or_else(|e| e.into_inner()).insert(block, gen);
+}
+
+pub(crate) fn landed_is_current(block: usize) -> bool {
+    let gen = CURRENT_GEN.load(Ordering::Relaxed);
+    CURRENT_LAND
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&block)
+        .copied()
+        == Some(gen)
+}
+
+pub(crate) fn invalidate_landed_current() {
+    CURRENT_GEN.fetch_add(1, Ordering::Relaxed);
+    CURRENT_LAND.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 #[cfg(test)]

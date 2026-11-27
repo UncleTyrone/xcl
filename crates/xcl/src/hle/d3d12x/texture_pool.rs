@@ -56,6 +56,10 @@ pub fn tick(memory: Option<(u64, u64)>) {
     let _keep_spare = memory
         .filter(|(budget, used)| *budget > 0 && u128::from(*used) * 100 < u128::from(*budget) * room as u128)
         .is_some();
+    let (p, b) = super::present::counters();
+    let frames = p.max(b);
+    let low = super::residency::critical_commit() || pressure || super::vram::commit_low();
+    crate::gpu::texture::trim_idle_staging(frames, low);
     let cap = if super::residency::critical_commit() {
         16 << 20
     } else if pressure {
@@ -64,6 +68,7 @@ pub fn tick(memory: Option<(u64, u64)>) {
         512 << 20
     };
     super::texture_upload::reclaim_under_cap(cap);
+    note_live_bytes(crate::gpu::texture::staging_live_bytes());
 }
 
 /// Cap in bytes for retained free upload jobs (`texture_upload::FREE`).

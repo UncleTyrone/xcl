@@ -596,6 +596,86 @@ pub(super) fn frame_bound_heaps(list: *mut c_void) -> Vec<usize> {
     heaps
 }
 
+/// Structured list payload for `XCLFRAME` `ListPayload` (VICFRAME `List.commands` role).
+pub(super) fn frame_list_payload(list: *mut c_void) -> Vec<u8> {
+    use super::frame_wire::list_op;
+    let mut out = Vec::with_capacity(128);
+    out.extend_from_slice(list_op::SNAP_MAGIC);
+    out.push(list_op::SNAP_VER);
+    let (pso, rs) = super::bind::frame_bind_ids(list);
+    out.push(list_op::BIND_IDS);
+    out.extend_from_slice(&(pso as u64).to_le_bytes());
+    out.extend_from_slice(&(rs as u64).to_le_bytes());
+    let mut heaps = frame_bound_heaps(list);
+    heaps.sort_unstable();
+    heaps.dedup();
+    out.push(list_op::HEAPS);
+    out.extend_from_slice(&(heaps.len() as u32).to_le_bytes());
+    for h in heaps {
+        out.extend_from_slice(&(h as u64).to_le_bytes());
+    }
+    let mut vas = frame_touch_vas(list);
+    vas.sort_unstable();
+    vas.dedup();
+    for va in vas {
+        out.push(list_op::TOUCH_VA);
+        out.extend_from_slice(&va.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+    }
+    let mut ranges = Vec::new();
+    {
+        let g = recording(list as usize).lock().unwrap();
+        if let Some(st) = g.as_ref().and_then(|m| m.get(&(list as usize))) {
+            ranges = st.written_ranges.clone();
+        }
+    }
+    for (va, end) in ranges.into_iter().take(64) {
+        out.push(list_op::WRITTEN);
+        out.extend_from_slice(&va.to_le_bytes());
+        out.extend_from_slice(&end.to_le_bytes());
+    }
+    out
+}
+
+pub(super) fn note_frame_draw(
+    list: *mut c_void,
+    indexed: bool,
+    count: u32,
+    instances: u32,
+    first: u32,
+    base: i32,
+) {
+    if !super::frame_replay::list_ops_recording() {
+        return;
+    }
+    use super::frame_wire::list_op;
+    let mut bytes = Vec::with_capacity(18);
+    bytes.push(list_op::DRAW);
+    bytes.push(u8::from(indexed));
+    bytes.extend_from_slice(&count.to_le_bytes());
+    bytes.extend_from_slice(&instances.to_le_bytes());
+    bytes.extend_from_slice(&first.to_le_bytes());
+    bytes.extend_from_slice(&base.to_le_bytes());
+    super::frame_replay::append_list_op(list as usize, &bytes);
+}
+
+pub(super) fn note_frame_dispatch(list: *mut c_void, x: u32, y: u32, z: u32) {
+    if !super::frame_replay::list_ops_recording() {
+        return;
+    }
+    use super::frame_wire::list_op;
+    let mut bytes = Vec::with_capacity(13);
+    bytes.push(list_op::DISPATCH);
+    bytes.extend_from_slice(&x.to_le_bytes());
+    bytes.extend_from_slice(&y.to_le_bytes());
+    bytes.extend_from_slice(&z.to_le_bytes());
+    super::frame_replay::append_list_op(list as usize, &bytes);
+}
+
+pub(super) fn take_frame_ops(list: *mut c_void) -> Vec<u8> {
+    super::frame_replay::take_list_ops(list as usize)
+}
+
 /// (tests) The view heaps XCL counts as bound on `list`; forgetting the list with `forget`.
 #[cfg(test)]
 pub(super) fn bound_heaps(list: *mut c_void, forget: bool) -> Vec<usize> {
@@ -1512,6 +1592,7 @@ pub(super) fn note_internal_wait(queue: usize, what: &'static str, fence: &ID3D1
     let mut g = INTERNAL_WAITS.lock().unwrap();
     let waits = g.get_or_insert_with(HashMap::new).entry(queue).or_default();
     waits.retain(|w| unsafe { super::real::fence_completed(&w.fence) } < w.value);
+    super::flight::event(what, queue as u64, value, unsafe { super::real::fence_completed(fence) });
     waits.push(InternalWait { what, va: 0, fence: fence.clone(), value, at: Instant::now() });
 }
 
@@ -1533,6 +1614,60 @@ fn internal_waits_summary() -> String {
         return "none".into();
     }
     unmet.into_iter().map(|(q, s)| format!("q{}: {s}", queue_id(q))).collect::<Vec<_>>().join(", ")
+}
+
+/// What the queues wait for on the GPU now – the title's `Wait*BitValueX` not met yet, its
+/// fences, XCL's own queue waits – into the log when a queue stops (`flight`).
+/// At most 8 times, 3 s apart.
+pub(super) fn log_pending_waits(why: &str) {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    static TIMES: AtomicU64 = AtomicU64::new(0);
+    {
+        let mut l = LAST.lock().unwrap();
+        if l.is_some_and(|t| t.elapsed() < Duration::from_secs(3)) {
+            return;
+        }
+        *l = Some(Instant::now());
+    }
+    if !once(&TIMES, 8) {
+        return;
+    }
+    let mut armed = Vec::new();
+    if let Some(graph) = SYNC_GRAPH.lock().unwrap().as_mut() {
+        for (&va, cell) in graph.cells.iter_mut() {
+            if cell.armed_waits.is_empty() {
+                continue;
+            }
+            let completed = unsafe { prune_completed_waits(cell) };
+            if completed == u64::MAX {
+                continue;
+            }
+            let producer = cell.submitted_queue.or(cell.recorded_last_queue);
+            let signals: Vec<String> = cell.submitted_signals.iter().map(|s| format!("{:#x} on {:#x} at #{}", s.val, s.queue, s.seq)).collect();
+            for aw in &cell.armed_waits {
+                armed.push(format!(
+                    "{va:#x} >= {:#x} for {} ms (waiter {:#x}/ty{} at #{}{}, producer {:x?}/ty{:?}, recorded {:#x}, submitted {:#x}, completed {completed:#x}, CPU-signalled {:#x}, signals [{}])",
+                    aw.val,
+                    aw.armed_at.elapsed().as_millis(),
+                    aw.waiting_queue,
+                    aw.waiting_queue_ty,
+                    aw.wait_seq,
+                    if aw.after_write64 { ", after a Write64 of its list" } else { "" },
+                    producer,
+                    cell.recorded_list_type.map(|t| t.0),
+                    cell.recorded_max,
+                    cell.submitted_max,
+                    cell.cpu_signaled_max,
+                    signals.join(", ")
+                ));
+            }
+        }
+    }
+    let ids = QUEUE_IDS.lock().unwrap().iter().enumerate().map(|(i, q)| format!("q{i} {q:#x}")).collect::<Vec<_>>().join(", ");
+    crate::xlog_warn!("D3D12.X: GPU waits as {why}: the title's value waits unmet: {}", if armed.is_empty() { "none".to_string() } else { armed.join("; ") });
+    crate::xlog_warn!("D3D12.X: GPU waits as {why}: pending title ID3D12Fences: {}", super::fence_x::pending_summary());
+    crate::xlog_warn!("D3D12.X: GPU waits as {why}: XCL's own queue waits unmet: {} (queues: {ids})", internal_waits_summary());
+    crate::xlog_warn!("D3D12.X: GPU waits as {why}: queues behind: {}", progress_summary());
 }
 
 /// Diagnostic (`XCL_SYNC_TRACE=1`): the last sync events in the order XCL made them.
@@ -2010,6 +2145,7 @@ fn wake_sync_watchdog() {
                 if PRINTED.fetch_add(1, Ordering::Relaxed) < 3 {
                     crate::xlog_warn!("D3D12.X: wait edges at that time-out: {}", edges_summary());
                 }
+                super::culprit::on_watchdog_release();
             }
         });
     });

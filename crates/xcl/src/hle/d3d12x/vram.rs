@@ -735,6 +735,7 @@ impl Pages {
             }
             let coord = D3D12_TILED_RESOURCE_COORDINATE { Subresource: sub, ..Default::default() };
             let region = D3D12_TILE_REGION_SIZE { NumTiles: num_tiles, UseBox: false.into(), ..Default::default() };
+            let flight_t = std::time::Instant::now();
             self.queue.UpdateTileMappings(
                 res,
                 1,
@@ -747,9 +748,11 @@ impl Pages {
                 Some(self.scratch_counts.as_ptr()),
                 D3D12_TILE_MAPPING_FLAG_NONE,
             );
+            super::flight::tile_map("vram", windows::core::Interface::as_raw(&self.queue) as usize, num_tiles as u64, flight_t.elapsed());
         }
         self.value += 1;
         let _ = self.queue.Signal(&self.fence, self.value);
+        super::flight::signaled("vram pages", windows::core::Interface::as_raw(&self.queue) as usize, &self.fence, self.value);
     }
 
     /// Unmap every tile of `res` (`D3D12_TILE_RANGE_FLAG_NULL`) so its unshared tiles can return
@@ -767,6 +770,7 @@ impl Pages {
         let coord = D3D12_TILED_RESOURCE_COORDINATE { Subresource: sub, ..Default::default() };
         let region = D3D12_TILE_REGION_SIZE { NumTiles: total, UseBox: false.into(), ..Default::default() };
         let flag = D3D12_TILE_RANGE_FLAG_NULL;
+        let flight_t = std::time::Instant::now();
         self.queue.UpdateTileMappings(
             res,
             1,
@@ -779,8 +783,10 @@ impl Pages {
             Some(&total),
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
+        super::flight::tile_map("vram", windows::core::Interface::as_raw(&self.queue) as usize, total as u64, flight_t.elapsed());
         self.value += 1;
         let _ = self.queue.Signal(&self.fence, self.value);
+        super::flight::signaled("vram pages", windows::core::Interface::as_raw(&self.queue) as usize, &self.fence, self.value);
     }
 
     fn release_tiles(&mut self, used: Vec<usize>, used_extra: Vec<(usize, usize)>, now: std::time::Instant, immediate_cool: bool) {

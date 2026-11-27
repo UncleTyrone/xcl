@@ -398,6 +398,14 @@ static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 pub fn activity() -> (u64, u64) {
     (COUNTS[DRAWS].load(Ordering::Relaxed), COUNTS[DISPATCHES].load(Ordering::Relaxed))
 }
+
+/// Skipped console draws and dispatches (bind/heap failures), for descriptor telemetry.
+pub fn skipped_counts() -> (u64, u64) {
+    (
+        COUNTS[DRAWS_SKIPPED].load(Ordering::Relaxed),
+        COUNTS[DISPATCHES_SKIPPED].load(Ordering::Relaxed),
+    )
+}
 const DRAWS: usize = 0;
 const DRAWS_SKIPPED: usize = 1;
 const DRAWS_PC: usize = 2;
@@ -1725,6 +1733,15 @@ fn two_pass_io(layout: Option<&Layout>, args: &[u8], table_at: u64, compute_pass
     io
 }
 
+/// Twelve bytes for the amplification shader's list budget UAV (dwords 0, 1, 2).
+unsafe fn mesh_launch_budget(this: *mut c_void) -> Result<u64, String> {
+    let u = crate::gpu::uma::get().ok_or("no unified memory")?;
+    let bytes = 16usize;
+    let p = with(this, |s| s.arena.take(u, bytes, 256, &mut s.uma)).ok_or("unified memory is full")?;
+    std::ptr::write_bytes(p as *mut u8, 0, bytes);
+    super::real::uma_va_of(p as usize).map(|v| v as u64).ok_or("mesh launch budget has no GPU address".into())
+}
+
 unsafe fn bind_two_pass_stage(
     this: *mut c_void,
     list: &ID3D12GraphicsCommandList,
@@ -2050,6 +2067,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
     let tp = match draw_pipeline(raw_pso, pso) {
         DrawPipeline::TwoPass(tp) => Some(tp),
         DrawPipeline::StandIn => {
+            super::session::note_draw_pipeline_not_ready();
             mesh_work(this, super::targets::STANDIN);
             count(DRAWS_SKIPPED);
             return;
@@ -2089,6 +2107,16 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
                 bind_two_pass_stage(this, list, pso, &tp, va, compute)?;
                 if compute {
                     list.Dispatch(n, 1, 1);
+                } else if let Some(launch) = tp.launch.as_ref() {
+                    let budget = mesh_launch_budget(this)?;
+                    if !crate::gpu::recomp::mesh_launch::record(
+                        list,
+                        launch.roots,
+                        budget,
+                        crate::gpu::recomp::mesh_launch::Launch::Direct(n * tp.mesh_groups_per_record),
+                    ) {
+                        return Err("mesh launch refused".into());
+                    }
                 } else {
                     pc_dm(this, n * tp.mesh_groups_per_record, 1, 1);
                 }
@@ -2128,7 +2156,11 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
     mesh_work(this, super::targets::PC);
     count(DRAWS_PC);
     super::watch::note(raw_pso, super::watch::PC_MESH, [x, y, z]);
-    pc_dm(this, x, y, z);
+    let groups = [x.min(65_535), y.min(65_535), z.min(65_535)];
+    if groups != [x, y, z] {
+        super::session::note_group_clamp("DispatchMesh", [x, y, z], groups);
+    }
+    pc_dm(this, groups[0], groups[1], groups[2]);
 }
 
 /// `XCL_DUMP_TARGETS`: a DispatchMesh (the two passes of a translated mesh pipeline count as the
@@ -2173,9 +2205,22 @@ fn constants_order_active(commands_at: Option<(usize, usize)>, count_at: Option<
     }) || count_at.is_some()
 }
 
-/// Execute-time indirect refresh when constants-order is on (no amd prelude batch state on this tree).
-fn prepare_constants_order_indirect(_this: *mut c_void) {
-    let _ = (_this, super::port::constants_order_alone(), super::clamp::indirect_batch());
+/// Execute-time indirect refresh when constants-order is on.
+///
+/// NVIDIA has no amd-style prelude batch (`prelude_*` / `window_clamp`); the equivalent is
+/// flushing deferred two-pass draws so constant writes land before this EI, then marking the
+/// argument scratch dirty so the next rewrite re-establishes INDIRECT_ARGUMENT order via
+/// [`fresh_indirect_arguments`]. With `constants_order_alone` or a non-shared batch, also drop
+/// open record regions so a later mesh pass cannot read stale prelude-like state.
+fn prepare_constants_order_indirect(this: *mut c_void) {
+    // SAFETY: same as other ExecuteIndirect / draw prepare paths that flush deferred work.
+    unsafe { flush_two_pass(this, RunEnd::Draw) };
+    with(this, |s| {
+        s.scratch_in_args = false;
+        if super::port::constants_order_alone() || super::clamp::indirect_batch() != 1 {
+            s.record_open = None;
+        }
+    });
 }
 
 pub(super) unsafe fn prepare_deferred_indirect_execute(
@@ -2236,6 +2281,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // Object"; a retail title's world then hung the GPU, 0x887a0006). Skipped, like a draw or
         // dispatch of such a pipeline.
         DrawPipeline::StandIn => {
+            super::session::note_draw_pipeline_not_ready();
             ei_work(this, sig, super::targets::STANDIN);
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -2261,6 +2307,71 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             }
             return;
         };
+        if let Some(launch) = tp.launch.as_ref() {
+            if max == 1 && count_buf == 0 && args != 0 {
+                if !args_off.is_multiple_of(4) {
+                    ei_work(this, sig, super::targets::SKIPPED);
+                    count(DRAWS_SKIPPED);
+                    return;
+                }
+                flush_two_pass(this, RunEnd::Draw);
+                let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+                super::gpu_times::before(this, pso, super::gpu_times::Kind::Mesh(tp.kind), [1, 0, 0], true);
+                let run = (|| -> Result<(), String> {
+                    let record_bytes = tp.record.record_dwords() as u64 * 4;
+                    let (res_buf, res_va, region, records) = records_for(this, indirect_record_need(record_bytes, tp.mesh_groups_per_record), two_pass_batch())?;
+                    let (src, src_len) = match commands_at {
+                        Some((p, n)) if msig.byte_stride as usize <= n => (p, n),
+                        _ => return Err("its arguments are not in a console buffer in unified memory".into()),
+                    };
+                    let mesh_off = msig.mesh_offset as usize;
+                    if mesh_off + 12 > msig.byte_stride as usize {
+                        return Err("mesh launch record is outside the indirect command".into());
+                    }
+                    let cmd = unsafe { std::slice::from_raw_parts(src as *const u8, src_len.min(msig.byte_stride as usize)) };
+                    let groups = u32::from_le_bytes(cmd[mesh_off..mesh_off + 4].try_into().unwrap());
+                    if groups == 0 {
+                        return Ok(());
+                    }
+                    let cap = record_groups(region, record_bytes, tp.mesh_groups_per_record);
+                    let record_va = super::real::uma_va_of(src + mesh_off)
+                        .ok_or("mesh launch record has no GPU address")? as u64;
+                    let budget = mesh_launch_budget(this)?;
+                    let plan = two_pass_plan(1, records, with(this, |s| s.record_open));
+                    run_two_pass_plan(this, list, &plan, &res_buf, res_va, region, |_, compute, va| {
+                        bind_two_pass_stage(this, list, pso, &tp, va, compute)?;
+                        if compute {
+                            list.Dispatch(groups.min(cap), 1, 1);
+                        } else if !crate::gpu::recomp::mesh_launch::record(
+                            list,
+                            launch.roots,
+                            budget,
+                            crate::gpu::recomp::mesh_launch::Launch::Record(record_va),
+                        ) {
+                            return Err("mesh launch refused (no budget)".into());
+                        }
+                        Ok(())
+                    })
+                })();
+                super::gpu_times::after(this);
+                match run {
+                    Ok(()) => {
+                        mesh_work(this, super::targets::RAN);
+                        super::watch::note(raw_pso, super::watch::INDIRECT_MESH, [1, 0, 0]);
+                        count(DRAWS);
+                    }
+                    Err(e) => {
+                        mesh_work(this, super::targets::SKIPPED);
+                        count(DRAWS_SKIPPED);
+                        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                            crate::xlog_warn!("D3D12.X: mesh launch ExecuteIndirect skipped: {e}");
+                        }
+                    }
+                }
+                return;
+            }
+        }
         // (XCL_TWO_PASS_BATCH=2: one command whose arguments and count are in unified memory
         // deferred; anything else as without, after the deferred draws before it)
         if two_pass_defer() && max == 1 && args != 0 {
@@ -2280,6 +2391,11 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         {
             let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
             super::gpu_times::before(this, pso, super::gpu_times::Kind::Mesh(tp.kind), [max, 0, 0], true);
+            let mesh_pso = if max > 1 || count_buf != 0 {
+                tp.launch.as_ref().and_then(|l| l.plain_pso()).unwrap_or(pso)
+            } else {
+                pso
+            };
             let run = (|| -> Result<(), String> {
                 if max == 0 || args == 0 {
                     return Ok(());
@@ -2306,7 +2422,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 let (scaled, at) = make_scaled_args_buffer(this, list, src, count, max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap, batch)?;
                 let plan = two_pass_plan(max, records, with(this, |s| s.record_open));
                 let passes = run_two_pass_plan(this, list, &plan, &res_buf, res_va, region, |k, compute, va| {
-                    bind_two_pass_stage(this, list, pso, &tp, va, compute)?;
+                    bind_two_pass_stage(this, list, if compute { pso } else { mesh_pso }, &tp, va, compute)?;
                     let (s, first) = if compute { (msig.companion_dispatch, at) } else { (sig, at + commands as u64) };
                     pc(this, s, 1, scaled.as_raw() as usize, first + k as u64 * msig.byte_stride as u64, 0, 0);
                     Ok(())
@@ -2650,6 +2766,7 @@ pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices:
             super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
             list.DrawInstanced(vertices, instances, first_vertex, first_instance);
         }
+        super::list_x::note_frame_draw(this, false, vertices, instances, first_vertex, 0);
         super::gpu_profile::end(this, t);
     }
 }
@@ -2692,6 +2809,7 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
     let this = list.as_raw();
     let t = super::gpu_profile::begin(this, with(this, |s| s.pso), super::gpu_profile::Kind::Draw, [indices, instances, 0]);
     list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
+    super::list_x::note_frame_draw(this, true, indices, instances, first_index, base_vertex);
     super::gpu_profile::end(this, t);
 }
 
@@ -3222,7 +3340,11 @@ pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, f
     let done = translated_dispatch(this, list, pso, groups[0], groups[1], groups[2]);
     with(this, |s| s.limits = [0; 3]);
     match done {
-        Ok(()) => count(DISPATCHES),
+        Ok(()) => {
+            count(DISPATCHES);
+            super::list_x::note_shader_pass(this);
+            super::list_x::note_frame_dispatch(this, groups[0], groups[1], groups[2]);
+        }
         Err(e) => {
             count(DISPATCHES_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -3385,8 +3507,14 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     // (one span for a split program's whole chain of dispatches, cut into slabs from the folded
     // groups; the span names the console's)
     let t = super::gpu_profile::begin(this, pso, super::gpu_profile::Kind::Dispatch, [x, y, z]);
+    let mark = super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, folded);
     let ran = super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), folded);
+    super::culprit::after_dispatch(list, mark);
     super::gpu_profile::end(this, t);
+    if super::ambient::has_compute_psos() {
+        let (layout, args, view_heap) = with(this, |s| (s.layout.clone(), s.args.clone(), s.heaps[0]));
+        super::ambient::after_compute_dispatch(this, pso, [x, y, z], layout.as_deref(), &args, view_heap);
+    }
     ran
 }
 
@@ -3417,13 +3545,10 @@ pub(super) fn dispatch_loop_budget_wanted() -> bool {
 pub(super) fn fold(x: u32, y: u32, z: u32) -> (u32, [u32; 3]) {
     let (limit, groups) = fold_counts(x, y, z);
     if limit == 0 && groups != [x, y, z] {
-        static N: AtomicU64 = AtomicU64::new(0);
-        if N.fetch_add(1, Ordering::Relaxed) < 4 {
-            if left_out([x, y, z], groups) {
-                crate::xlog_warn!("D3D12.X: a dispatch of {x}x{y}x{z} groups is left out: more groups than a dispatch may have (XCL_INDIRECT_MAX_GROUPS)");
-            } else {
-                crate::xlog_warn!("D3D12.X: a dispatch of {x}x{y}x{z} groups cannot be folded – clamped to 65535 a dimension");
-            }
+        if left_out([x, y, z], groups) {
+            super::session::note_group_clamp("Dispatch", [x, y, z], groups);
+        } else {
+            super::session::note_group_clamp("Dispatch", [x, y, z], groups);
         }
     }
     (limit, groups)
@@ -5330,7 +5455,7 @@ void main(uint t : SV_GroupIndex) {
     fn dummy_draw() -> DeferredDraw {
         DeferredDraw {
             snap: snap(0, None),
-            _tp: Arc::new(super::super::real::TwoPassPso { compute: 0, compute_rs: 0, mesh_rs: 0, record: Default::default(), mesh_groups_per_record: 1, kind: "MS" }),
+            _tp: Arc::new(super::super::real::TwoPassPso { compute: 0, compute_rs: 0, mesh_rs: 0, record: Default::default(), mesh_groups_per_record: 1, kind: "MS", launch: None }),
             _mesh_pso: None,
             _block: None,
             raw_pso: 0,
@@ -5498,7 +5623,7 @@ void main(uint t : SV_GroupIndex) {
         let list = 0x7500_0031usize as *mut c_void;
         let draw = || DeferredDraw {
             snap: snap(0, None),
-            _tp: Arc::new(super::super::real::TwoPassPso { compute: 0, compute_rs: 0, mesh_rs: 0, record: Default::default(), mesh_groups_per_record: 1, kind: "MS" }),
+            _tp: Arc::new(super::super::real::TwoPassPso { compute: 0, compute_rs: 0, mesh_rs: 0, record: Default::default(), mesh_groups_per_record: 1, kind: "MS", launch: None }),
             _mesh_pso: None,
             _block: None,
             raw_pso: 0,
@@ -5749,7 +5874,7 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
             let this = &*fake as *const FakeList as *mut c_void;
             let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this).unwrap();
             // no root signatures: the bind stops before it records anything else
-            let tp = super::super::real::TwoPassPso { compute: 0, compute_rs: 0, mesh_rs: 0, record: Default::default(), mesh_groups_per_record: 1, kind: "MS" };
+            let tp = super::super::real::TwoPassPso { compute: 0, compute_rs: 0, mesh_rs: 0, record: Default::default(), mesh_groups_per_record: 1, kind: "MS", launch: None };
             for compute_pass in [true, false] {
                 super::super::list_x::set_descriptor_heaps_x(this, 0, std::ptr::null());
                 assert!(super::super::list_x::bound_heaps(this, false).is_empty());

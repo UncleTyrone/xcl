@@ -419,6 +419,11 @@ pub unsafe fn settle_for_fence() {
     }
 }
 
+/// CGBJ `release_tables` name: same fence-driven dynamic descriptor recycle as [`settle_for_fence`].
+pub unsafe fn release_tables() {
+    settle_for_fence();
+}
+
 /// Ranges held until the submit fence that recorded them has completed.
 pub unsafe fn drain_completed_dynamic_slots() {
     if !super::residency::defer_dynamic_slots() {
@@ -1618,6 +1623,7 @@ mod tests {
         assert_eq!(NO_ROOM.load(Relaxed), 17, "every page that found no room, each time");
         assert_eq!((PAGES_PLACED.load(Relaxed), FILL_SAID.load(Relaxed)), (1, FILL_MARKS.len()), "one page placed; the heap is past every mark");
         // a 2D T# copied into a slot without a place names the null views
+        let base = MIN_DYNAMIC;
         write(&placed, &[base + 4, 0x0470_0000, 0, 9 << 28, 0, 0, 0, 0]);
         copy_words(&placed, &s);
         assert_eq!(words_at(rel(a + (k * SLOT) as u64)).unwrap()[..4], [0, 0x0470_0000, 0, 9 << 28]);

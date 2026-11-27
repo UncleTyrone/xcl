@@ -10,6 +10,9 @@
 //! and the binding to the console API that creates textures in title memory (and tells when
 //! the title rewrote one) – that comes with the game executable.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+
 use super::desc::{self, Image, ImageType};
 use super::fence;
 use super::tiling::{self, Chain, PipeConfig};
@@ -31,13 +34,35 @@ pub fn console_pipes() -> PipeConfig {
     }
 }
 
-/// Bytes held in shared staging / upload buffers (nvidia tree: no pooled staging yet).
-pub fn staging_live_bytes() -> u64 {
-    0
+/// Live bytes retained in nvidia `hle::d3d12x::texture_upload` FREE jobs (updated from HLE).
+static LIVE_STAGING: AtomicU64 = AtomicU64::new(0);
+static RECLAIM: OnceLock<Mutex<Option<Box<dyn Fn(bool) + Send>>>> = OnceLock::new();
+
+fn reclaim_slot() -> &'static Mutex<Option<Box<dyn Fn(bool) + Send>>> {
+    RECLAIM.get_or_init(|| Mutex::new(None))
 }
 
-/// Reclaim idle upload staging buffers under pressure (no-op until pooled staging lands).
-pub fn trim_idle_staging(_frame: u64, _low_commit: bool) {}
+/// Install reclaim callback from `hle::d3d12x::texture_upload` (layer bridge).
+pub fn install_staging_reclaim(f: impl Fn(bool) + Send + 'static) {
+    *reclaim_slot().lock().unwrap() = Some(Box::new(f));
+}
+
+/// Update live staging telemetry (called when FREE jobs change).
+pub fn note_staging_live_bytes(bytes: u64) {
+    LIVE_STAGING.store(bytes, Ordering::Relaxed);
+}
+
+/// Bytes held in retained texture upload staging buffers.
+pub fn staging_live_bytes() -> u64 {
+    LIVE_STAGING.load(Ordering::Relaxed)
+}
+
+/// Reclaim idle upload staging buffers under pressure (FREE-job pool on nvidia).
+pub fn trim_idle_staging(_frame: u64, low_commit: bool) {
+    if let Some(f) = reclaim_slot().lock().unwrap().as_ref() {
+        f(low_commit);
+    }
+}
 
 /// Linear data of one subresource: `depth` slices (3D, else 1) of `rows` rows of `row_bytes`
 /// (elements: pixels or 4×4 blocks).

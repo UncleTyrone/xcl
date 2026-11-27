@@ -127,6 +127,7 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
             crate::xlog_error!("page events so far: {}", crate::hle::kernelx::pagelog::counts());
         }
         crate::boot_diag::write_crash_snapshots();
+        crate::hle::d3d12x::flight::dump("crash");
         crate::report::write_final(Some(msg));
         crate::log::flush();
     }

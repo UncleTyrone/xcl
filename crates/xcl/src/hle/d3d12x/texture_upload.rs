@@ -40,6 +40,8 @@ pub(super) struct Item {
     pub known: Option<Known>,
     /// where its pages are read, for a texture in a GPU view whose pages the title mapped
     pub pages: Option<Arc<PageMap>>,
+    /// the texture's first upload (`Entry::pending`): title memory is read even under remap pressure
+    pub first: bool,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -292,7 +294,7 @@ pub(super) unsafe fn changed(textures: &[Written], trust: bool) -> (Vec<Change>,
         let look = |g: usize| {
             let group = &pages[groups[g].clone()];
             let (first, last) = (&group[0], &group[group.len() - 1]);
-            read(textures[first.texture].pages, first.at, last.at + last.len - first.at, |b| {
+            read(textures[first.texture].pages, first.at, last.at + last.len - first.at, true, |b| {
                 for p in group {
                     let h = content_hash(&b[p.at - first.at..][..p.len]);
                     // SAFETY: see `Page`
@@ -378,8 +380,11 @@ impl PageMap {
 
 /// `f` with the `len` bytes of the title's memory at `at`: where they are in the window that stays
 /// committed, else a copy of them (the title may decommit a page meanwhile on another thread), with
-/// zeros for pages that cannot be read. With `pages`, they are read where its table says.
-unsafe fn read<R>(pages: Option<&PageMap>, at: usize, len: usize, f: impl FnOnce(&[u8]) -> R) -> R {
+/// zeros for pages that cannot be read. With `pages`, they are read where its table says. When
+/// `first`, a failed remap wait still walks committed pages (`copy_readable`); otherwise
+/// [`texture_policy::texture_no_wait`] uses [`title_textures::copy_or_zeros`].
+unsafe fn read<R>(pages: Option<&PageMap>, at: usize, len: usize, first: bool, f: impl FnOnce(&[u8]) -> R) -> R {
+    let loose = !first && super::texture_policy::texture_no_wait();
     if let Some(m) = pages {
         if len > READ {
             let mut v = vec![0u8; len];
@@ -406,7 +411,11 @@ unsafe fn read<R>(pages: Option<&PageMap>, at: usize, len: usize, f: impl FnOnce
         if s.len() < len {
             s.resize(READ.max(len), 0);
         }
-        super::title_textures::copy_readable(at, &mut s[..len]);
+        if loose {
+            super::title_textures::copy_or_zeros(at, &mut s[..len]);
+        } else {
+            super::title_textures::copy_readable(at, &mut s[..len]);
+        }
         f(&s[..len])
     })
 }
@@ -640,7 +649,7 @@ unsafe fn fill_hashed(items: &[Item], pieces: &[Piece], ptr: *mut u8, bytes: u64
                     let p = &pieces[*piece];
                     let (it, c) = (&items[p.item], &items[p.item].tex.texels().unwrap().chain);
                     let from = it.src + p.slice * c.slice_bytes + c.block_at(p.level, bx.start, *by);
-                    read(it.pages.as_deref(), from, bx.len() * c.layout.block_bytes, |b| {
+                    read(it.pages.as_deref(), from, bx.len() * c.layout.block_bytes, it.first, |b| {
                         note(p.item, from, b);
                         c.detile_blocks(b, p.level, p.slice, *by, bx.clone(), p.rect, to.0.add(p.at as usize), p.footprint.RowPitch as usize);
                     });
@@ -649,7 +658,7 @@ unsafe fn fill_hashed(items: &[Item], pieces: &[Piece], ptr: *mut u8, bytes: u64
                     let first = &pieces[range.start];
                     let (it, c) = (&items[first.item], &items[first.item].tex.texels().unwrap().chain);
                     let from = it.src + first.slice * c.slice_bytes;
-                    read(it.pages.as_deref(), from, c.layout.block_bytes, |b| {
+                    read(it.pages.as_deref(), from, c.layout.block_bytes, it.first, |b| {
                         note(first.item, from, b);
                         for p in &pieces[range.clone()] {
                             c.detile_blocks(b, p.level, p.slice, 0, 0..1, p.rect, to.0.add(p.at as usize), p.footprint.RowPitch as usize);
@@ -662,7 +671,7 @@ unsafe fn fill_hashed(items: &[Item], pieces: &[Piece], ptr: *mut u8, bytes: u64
                     let (l, e) = (&c.levels[p.level], c.layout.elem_log2);
                     let (stride, row) = (l.pitch << e, (p.rect.x1 - p.rect.x0) << e);
                     let from = it.src + p.slice * c.slice_bytes + l.offset + y.start * stride + (p.rect.x0 << e);
-                    read(it.pages.as_deref(), from, y.len() * stride - (p.rect.x0 << e), |b| {
+                    read(it.pages.as_deref(), from, y.len() * stride - (p.rect.x0 << e), it.first, |b| {
                         note(p.item, from, b);
                         for (n, y) in y.clone().enumerate() {
                             let dst = to.0.add(p.at as usize + (y - p.rect.y0) * p.footprint.RowPitch as usize);
@@ -674,7 +683,7 @@ unsafe fn fill_hashed(items: &[Item], pieces: &[Piece], ptr: *mut u8, bytes: u64
                     let first = &pieces[range.start];
                     let it = &items[first.item];
                     let s = it.tex.texels().unwrap();
-                    read(it.pages.as_deref(), it.src, s.size() as usize, |b| {
+                    read(it.pages.as_deref(), it.src, s.size() as usize, it.first, |b| {
                         note(first.item, it.src, b);
                         for p in &pieces[range.clone()] {
                             let (l, row) = (&s.chain.levels[p.level], p.rect.x1 * s.bpe as usize);
@@ -787,6 +796,35 @@ fn capacity(bytes: u64) -> Option<u64> {
 
 const FREE_BYTES: u64 = 512 << 20;
 
+/// Drop largest retained jobs until cached bytes are at or below `cap`.
+pub(super) fn reclaim_under_cap(cap: u64) {
+    ensure_gpu_texture_bridge();
+    let mut g = FREE.lock().unwrap();
+    while g.iter().map(|j| j.bytes).sum::<u64>() > cap {
+        let Some(i) = g.iter().enumerate().max_by_key(|(_, j)| j.bytes).map(|(i, _)| i) else { break };
+        g.swap_remove(i);
+    }
+    let live = g.iter().map(|j| j.bytes).sum();
+    super::texture_pool::note_live_bytes(live);
+    crate::gpu::texture::note_staging_live_bytes(live);
+}
+
+fn ensure_gpu_texture_bridge() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        crate::gpu::texture::install_staging_reclaim(|low| {
+            let cap = if low {
+                16 << 20
+            } else if super::texture_pool::on() {
+                super::texture_pool::free_cap_bytes()
+            } else {
+                FREE_BYTES
+            };
+            reclaim_under_cap(cap);
+        });
+    });
+}
+
 /// A job whose buffer takes `bytes` bytes.
 unsafe fn take(dev: &ID3D12Device, bytes: u64) -> Result<Job, String> {
     let key = dev.as_raw() as usize;
@@ -797,6 +835,11 @@ unsafe fn take(dev: &ID3D12Device, bytes: u64) -> Result<Job, String> {
             return Ok(g.swap_remove(i));
         }
     }
+    let bake = super::bake_upload::active();
+    if !super::texture_pool::growth_allowed(bake) {
+        super::residency::note_staging_deferred();
+        return Err("texture upload: staging growth deferred (commit headroom)".into());
+    }
     let e = |x: windows::core::Error| format!("texture upload: {x}");
     let cap = capacity(bytes).ok_or("texture upload buffer size overflow")?;
     let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
@@ -804,7 +847,7 @@ unsafe fn take(dev: &ID3D12Device, bytes: u64) -> Result<Job, String> {
     list.Close().map_err(e)?;
     let _ = list.SetName(windows::core::w!("xcl texture upload list"));
     let mut buf: Option<ID3D12Resource> = None;
-    dev.CreateCommittedResource(
+    if let Err(err) = dev.CreateCommittedResource(
         &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
         D3D12_HEAP_FLAG_NONE,
         &D3D12_RESOURCE_DESC {
@@ -820,8 +863,11 @@ unsafe fn take(dev: &ID3D12Device, bytes: u64) -> Result<Job, String> {
         D3D12_RESOURCE_STATE_GENERIC_READ,
         None,
         &mut buf,
-    )
-    .map_err(e)?;
+    ) {
+        super::texture_pool::note_growth_failed();
+        super::residency::allocation_error_hresult(err.code().0);
+        return Err(e(err));
+    }
     let buf = buf.ok_or("texture upload buffer")?;
     let mut p: *mut c_void = std::ptr::null_mut();
     buf.Map(0, None, Some(&mut p)).map_err(e)?;
@@ -830,13 +876,17 @@ unsafe fn take(dev: &ID3D12Device, bytes: u64) -> Result<Job, String> {
 
 /// The GPU is done with `job`.
 pub(super) fn give_back(job: Job) {
+    ensure_gpu_texture_bridge();
     let mut g = FREE.lock().unwrap();
     g.push(job);
-    // (the biggest goes first: one burst does not keep its buffers for good)
-    while g.iter().map(|j| j.bytes).sum::<u64>() > FREE_BYTES {
+    let cap = if super::texture_pool::on() { super::texture_pool::free_cap_bytes() } else { FREE_BYTES };
+    while g.iter().map(|j| j.bytes).sum::<u64>() > cap {
         let Some(i) = g.iter().enumerate().max_by_key(|(_, j)| j.bytes).map(|(i, _)| i) else { break };
         g.swap_remove(i);
     }
+    let live = g.iter().map(|j| j.bytes).sum();
+    super::texture_pool::note_live_bytes(live);
+    crate::gpu::texture::note_staging_live_bytes(live);
 }
 
 /// Upload `items` on `queue` (a DIRECT one): the ones that could not be (with why), and the job to
@@ -1021,7 +1071,7 @@ mod tests {
                 let want = super::super::title_textures::subresources(mem.as_ptr() as usize, &m.tex);
                 for round in 0..5 {
                     let changed = (round > 0).then(|| some_ranges(size, n * 11 + round));
-                    let items = [Item { res: m.res.clone(), src: mem.as_ptr() as usize, tex: Arc::clone(&m.tex), states: vec![D3D12_RESOURCE_STATE_COMMON], changed: changed.clone(), known: None, pages: None }];
+                    let items = [Item { res: m.res.clone(), src: mem.as_ptr() as usize, tex: Arc::clone(&m.tex), states: vec![D3D12_RESOURCE_STATE_COMMON], changed: changed.clone(), known: None, pages: None, first: false }];
                     let (mut pieces, mut bytes) = (Vec::new(), 0u64);
                     plan_item(&dev, 0, &items[0], &mut bytes, &mut pieces).unwrap_or_else(|e| panic!("{kind:?}: {e}"));
                     if round == 0 {
@@ -1074,7 +1124,7 @@ mod tests {
                 let s = m.tex.texels().unwrap();
                 let size = m.tex.size() as usize;
                 let first = random_bytes(size, n as u64 * 31 + 3);
-                let item = |mem: &[u8], changed| Item { res: m.res.clone(), src: mem.as_ptr() as usize, tex: Arc::clone(&m.tex), states: vec![D3D12_RESOURCE_STATE_COMMON], changed, known: None, pages: None };
+                let item = |mem: &[u8], changed| Item { res: m.res.clone(), src: mem.as_ptr() as usize, tex: Arc::clone(&m.tex), states: vec![D3D12_RESOURCE_STATE_COMMON], changed, known: None, pages: None, first: false };
                 let (_, all) = run(&[item(&first, None)]);
                 let mut want = super::super::title_textures::subresources(first.as_ptr() as usize, &m.tex);
                 assert!(read_back(&dev, &queue, &m.res, want.len()) == want.iter().map(|w| w.data.clone()).collect::<Vec<_>>(), "{kind:?}: all of it");
@@ -1164,7 +1214,7 @@ mod tests {
             let pages: Vec<usize> = (0..size / PAGE).map(|k| src + k * PAGE).collect();
             let look = |of: &[usize]| changed(&[Written { src, size, dirty: of, known: &known, pages: None }], true).0.remove(0);
             let upload = |changed: Option<Vec<(usize, usize)>>| {
-                let it = [Item { res: m.res.clone(), src, tex: Arc::clone(&m.tex), states: vec![D3D12_RESOURCE_STATE_COMMON], changed, known: Some(Arc::clone(&known)), pages: None }];
+                let it = [Item { res: m.res.clone(), src, tex: Arc::clone(&m.tex), states: vec![D3D12_RESOURCE_STATE_COMMON], changed, known: Some(Arc::clone(&known)), pages: None, first: false }];
                 let (mut p, mut bytes) = (Vec::new(), 0u64);
                 plan_item(&dev, 0, &it[0], &mut bytes, &mut p).unwrap();
                 let mut buf = vec![0u8; bytes as usize];
@@ -1265,8 +1315,8 @@ mod tests {
             VirtualAlloc((p + PAGE) as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE);
             std::ptr::write_bytes((p + PAGE) as *mut u8, 0x77, PAGE);
             // (what an earlier read left in the scratch memory does not show)
-            read(None, p + PAGE, PAGE, |b| assert!(b.iter().all(|&x| x == 0x77)));
-            read(None, p, 4 * PAGE, |b| {
+            read(None, p + PAGE, PAGE, true, |b| assert!(b.iter().all(|&x| x == 0x77)));
+            read(None, p, 4 * PAGE, true, |b| {
                 assert_eq!(b.len(), 4 * PAGE);
                 assert!(b[..PAGE].iter().all(|&x| x == 0) && b[PAGE..2 * PAGE].iter().all(|&x| x == 0x77) && b[2 * PAGE..].iter().all(|&x| x == 0));
             });
@@ -1299,13 +1349,13 @@ mod tests {
                 3 => 0x33,
                 _ => 0,
             };
-            read(Some(&m), first + 0x8000, 5 * VIEW - 0x8000, |got| {
+            read(Some(&m), first + 0x8000, 5 * VIEW - 0x8000, true, |got| {
                 assert_eq!(got.len(), 5 * VIEW - 0x8000);
                 assert!(got.iter().enumerate().all(|(k, &x)| x == want(k + 0x8000)), "each page from where it is kept");
             });
-            read(Some(&m), first + VIEW - 0x1000, 0x2000, |got| assert!(got[..0x1000].iter().all(|&x| x == 0x11) && got[0x1000..].iter().all(|&x| x == 0x22)));
+            read(Some(&m), first + VIEW - 0x1000, 0x2000, true, |got| assert!(got[..0x1000].iter().all(|&x| x == 0x11) && got[0x1000..].iter().all(|&x| x == 0x22)));
             // past the table: nothing
-            read(Some(&m), first + 5 * VIEW, PAGE, |got| assert!(got.iter().all(|&x| x == 0)));
+            read(Some(&m), first + 5 * VIEW, PAGE, true, |got| assert!(got.iter().all(|&x| x == 0)));
             // the written pages compared through the table
             let (src, size) = (first, 4 * VIEW);
             let known: Known = Default::default();

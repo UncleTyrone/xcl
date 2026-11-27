@@ -529,10 +529,8 @@ pub fn device_raw() -> *mut c_void {
     DEVICE.load(Ordering::Acquire) as *mut c_void
 }
 
-/// The process's video memory on the device's adapter: (local, non-local) bytes in use, and
-/// the local budget – what Windows lets the process have of the card now, with what the other
-/// programs hold taken off. Past it Windows moves the process's memory off the card.
-pub fn video_memory() -> Option<(u64, u64, u64)> {
+/// Adapter video-memory query results (local + non-local) for flight / residency dumps.
+pub fn video_budget() -> Option<(windows::Win32::Graphics::Dxgi::DXGI_QUERY_VIDEO_MEMORY_INFO, windows::Win32::Graphics::Dxgi::DXGI_QUERY_VIDEO_MEMORY_INFO)> {
     use windows::Win32::Graphics::Dxgi::*;
     let raw = device_raw();
     let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }?;
@@ -544,8 +542,16 @@ pub fn video_memory() -> Option<(u64, u64, u64)> {
         let mut non_local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
         adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local).ok()?;
         adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut non_local).ok()?;
-        Some((local.CurrentUsage, non_local.CurrentUsage, local.Budget))
+        Some((local, non_local))
     }
+}
+
+/// The process's video memory on the device's adapter: (local, non-local) bytes in use, and
+/// the local budget – what Windows lets the process have of the card now, with what the other
+/// programs hold taken off. Past it Windows moves the process's memory off the card.
+pub fn video_memory() -> Option<(u64, u64, u64)> {
+    let (local, non_local) = video_budget()?;
+    Some((local.CurrentUsage, non_local.CurrentUsage, local.Budget))
 }
 
 /// How far `used` is past `budget` (bytes; None: within it, or no budget known).
@@ -7073,6 +7079,9 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
             super::capture::note_compute(*ppv as usize, cs);
         }
     }
+    if hr >= 0 && !ppv.is_null() {
+        super::culprit::note_compute(*ppv as usize, desc);
+    }
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         super::session::note_pipeline_create();
     }
@@ -9628,6 +9637,8 @@ pub fn log_device_removed() {
         return;
     }
     crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
+    super::flight::dump("device removed");
+    super::culprit::on_device_removed();
     crate::xlog_error!("{}", super::session::removal_summary_line());
     // (to rule the system's memory in or out: a removal with no fault of the GPU's had 30 GB of
     // commit left)

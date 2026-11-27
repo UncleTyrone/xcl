@@ -22,7 +22,7 @@
 //!
 //! Nothing translates with this yet: `xcl shaders --recomp` reports its counts.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::x64_masks;
 use crate::gpu::rdna2::{self, Decoded, F_CONDITIONAL, F_INDIRECT, F_TERMINATOR};
@@ -275,6 +275,11 @@ pub struct Summary {
     /// blocks the entry reaches: every block after its forward predecessors)
     pub blocks: Vec<Block>,
     pub order: Vec<usize>,
+    /// Join polarity from BDD edge reach (CGBJ Tracer `meet` analogue, subset): for each join
+    /// block start PC with ≥2 predecessors, `(pred_block_start_pc, edge_live)` where `edge_live`
+    /// is false when the edge's reach fact is FALSE (no lane can take that edge under the
+    /// analyzed path conditions). Used by LanePhi-inspired `only_edge` / dead-pred merge.
+    pub join_edge_live: BTreeMap<u64, Vec<(u64, bool)>>,
 }
 
 /// Whether `d` reads SCC as a non-branch input (either implicitly via `OPR_SSRC_SPECIAL_SCC`
@@ -937,8 +942,27 @@ impl<'a> Lanes<'a> {
             })
             .collect();
         sum.order = self.order.clone();
+        // Join-edge polarity: which predecessor edges into a multi-pred block are reachable.
+        for b in 0..self.blocks.len() {
+            if self.preds[b].len() < 2 {
+                continue;
+            }
+            let join_pc = self.insts[self.blocks[b].0].pc;
+            let mut edges = Vec::with_capacity(self.preds[b].len());
+            for &(p, k) in &self.preds[b] {
+                let pred_pc = self.insts[self.blocks[p].0].pc;
+                let live = outs[p].get(k).is_some_and(|(fact, _)| *fact != FALSE);
+                edges.push((pred_pc, live));
+            }
+            sum.join_edge_live.insert(join_pc, edges);
+        }
         Ok(sum)
     }
+}
+
+/// Join-edge liveness keyed by block-start PC (see [`Summary::join_edge_live`]).
+pub fn join_polarity(insts: &[Decoded], wave64: bool) -> R<BTreeMap<u64, Vec<(u64, bool)>>> {
+    Ok(analyze(insts, wave64)?.join_edge_live)
 }
 
 /// Analyses a decoded program (far jumps resolved) that starts with every lane in EXEC.

@@ -28,7 +28,8 @@ pub mod dxgi_device;
 mod cpu_writes;
 pub mod dred;
 mod fence_x;
-mod flight;
+pub mod flight;
+pub mod culprit;
 pub mod file_reads;
 pub mod frame;
 pub(crate) mod gfx_records;
@@ -48,6 +49,7 @@ pub(crate) mod pipeline_env;
 pub(crate) mod pop_env;
 pub(crate) mod read_env;
 pub(crate) mod land;
+pub(crate) mod safecopy;
 pub(crate) mod root_env;
 pub(crate) mod send_env;
 pub(crate) mod texture_env;
@@ -67,6 +69,12 @@ pub(crate) mod wide_back;
 pub(crate) mod join;
 mod frame_replay;
 mod frame_wire;
+
+/// Offline `xcl replay <dir>` inspect (no GPU). See [`frame_replay::cli_inspect`].
+pub fn frame_replay_inspect(dir: &std::path::Path, json: bool, frame: Option<u64>) -> Result<String, String> {
+    frame_replay::cli_inspect(dir, json, frame)
+}
+
 mod late_release;
 mod late_wait;
 pub mod layout;
@@ -77,6 +85,7 @@ pub mod null;
 mod placements;
 mod plaincopy;
 pub mod port;
+pub(crate) mod port_constants;
 pub mod present;
 mod submit;
 pub(crate) mod thin;
