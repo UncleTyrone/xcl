@@ -7662,7 +7662,9 @@ pub(super) unsafe fn execute_mapped_lists(this: *mut c_void, mapped: &[*mut c_vo
         if super::alloc_pool::note_resubmits(this, chunk) > 0 {
             super::submit::pause_refresh(|| super::alloc_pool::wait_for_previous_submits(chunk));
         }
+        let span = super::host::before_submit();
         super::submit::driver_execute(|| f(this, chunk.len() as u32, chunk.as_ptr()));
+        super::host::after_submit(span);
         super::list_x::copy_scratch_submitted(this, chunk);
         super::alloc_pool::executed(this, chunk);
         let w64 = super::list_x::chunk_write64_signals(chunk);

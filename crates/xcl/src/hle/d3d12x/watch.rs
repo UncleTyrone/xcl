@@ -175,6 +175,12 @@ pub(crate) fn view_fault_begin(view: usize) -> Option<(BlockClaims, std::time::D
     port6_count(P6_FAULT_WAIT_NS, waited.as_nanos() as u64);
     let claims = claim_blocks(&[block]);
     port6_count(P6_FAULTS, 1);
+    super::faultbook::note(
+        super::faultbook::What::Fault,
+        block,
+        1,
+        waited.as_nanos() as u64,
+    );
     Some((claims, waited))
 }
 

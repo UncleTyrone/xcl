@@ -24,11 +24,17 @@ Usage:
   xcl run <game folder | file.exe> [-- game arguments]
       Runs the game. The game folder is only read; writes, game saves and logs go to
       %LOCALAPPDATA%\\XCL\\<title>\\ (or %XCL_DATA_ROOT%\\<title>\\).
-  xcl inspect <file.exe|file.dll> [--json]
+  xcl inspect <file.exe|file.dll> [--json] [--imports] [--exports]
       Analysis without running: imports and what XCL has for them (HLE / Windows / stub).
+      --imports lists every import; --exports lists export names.
+  xcl census <path...> [--strict] [--missing]
+      Walk PE images under paths; aggregate import coverage (HLE / host / stub).
+      --strict treats Windows pass-through as uncovered; --missing lists stub imports.
   xcl disasm <file> [--offset N] [--length N] [--all] [--hex] [--fssm FILE]
       Disassembler for console GPU code (RDNA2) – e.g. for shaders saved in <data>\\shaders\\.
       Console containers (XDAT/XBCH/FSSM) are unpacked; --fssm saves the unpacked FSSM.
+  xcl shader-info <file | folder | package.rpf> [...]
+      Alias of `shaders` without --recomp (container / stage survey).
   xcl shaders <file | folder | package.rpf> [--top N] [--json] [--recomp] [--compile N]
       Shader corpus statistics: formats, stages, RDNA2 instruction histogram (priorities
       for the recompiler). RPF9 packages are scanned for shader records.
@@ -44,16 +50,24 @@ Usage:
       --direct [--sample N] [--seed S] [--validate] [--compare]: direct DXIL translator
       coverage over a seeded sample (default 200 programs, 0 = all); also
       --timeout, --max-bytes, --threads, --json, --hash H, --dump DIR.
-  xcl pso-precompile <game folder | shaders.rpf> [--threads N] [--records FILE] [--used]
-      Before a run: translates the game's compute programs (its shaders.rpf) and has the
-      driver compile their pipelines, the ones an earlier run used first, biggest first.
-      Fills the caches the run reads (DXIL, driver blobs); what is cached is skipped.
-      --records FILE / --used: only the programs of these record hashes / pipeline keys.
-      Run it with the run's XCL_DIRECT_DXIL / XCL_HEAP_WINDOWS: they change the keys.
+  xcl translate <file | folder | package.rpf> [--validate] [--pipelines] [--list] [--jobs N]
+      Offline translator pass (forwards to `shaders --recomp`; --validate → --direct --validate).
+  xcl warm <file | folder | package.rpf> [--jobs N] [--used-only]
+      Precompile + build pipelines into the DXIL / driver caches (`shaders --precompile --pipelines`).
+  xcl replay <capture-dir> [--json] [--frame N] [--listing] [--wire] [--fences] [--present]
+           [--no-execute] [--at N] [--run <game>] [-- args]
+           [--edit] [--skip-draws] [--skip-dispatches] [--meta-only] [--lists A..B] [--out DIR]
+           [--pixel x,y] [--of WxH] [--compare DIR] [--diverge] [--against DIR]
+      Inspect an XCL_RECORD / XCLFRAME capture (list payloads, contents.bin, planes).
+      Offline edit / pixel / diverge tooling rewrites or compares wire blobs (no GPU).
+      With --run, set XCL_REPLAY (+ optional PresentX re-issue) and start the title
+      (same-process only — not a cross-process VICFRAME player).
   xcl rpf <package.rpf> [--top N] [--find NAME] [--extract NAME --out DIR]
       Lists or extracts readable inline records. Archives larger than 1 GB use a
       bounded-memory header probe; --probe requests it explicitly and --full overrides it.
       Use --probe only for header summaries, without --find, --extract, --out or --full.
+  xcl config
+      Show resolved data / cache / game / config paths and XCL_DEVICE_TYPE.
   xcl --version
 ";
 
@@ -61,6 +75,14 @@ fn main() {
     // keep the TLS callback from being discarded by the linker
     unsafe { std::ptr::read_volatile(&XCL_TLS_CALLBACK) };
 
+    // Recorder child started by `XCL_AUDIO_CAPTURE` (process-loopback WAV).
+    if xcl::hle::audio_capture::child() {
+        return;
+    }
+
+    if std::env::var_os("XCL_LOG_CONSOLE").is_some() {
+        std::process::exit(xcl::log_window::console_main());
+    }
     if let Some(boot) = std::env::var_os("XCL_HOST") {
         std::env::remove_var("XCL_HOST");
         std::process::exit(xcl::host::host_main(&PathBuf::from(boot)));
@@ -77,12 +99,28 @@ fn main() {
         }
         Some("inspect") if args.len() >= 2 => {
             let json = args.iter().any(|a| a == "--json");
-            xcl::inspect::run(&PathBuf::from(&args[1]), json)
+            let imports = args.iter().any(|a| a == "--imports");
+            let exports = args.iter().any(|a| a == "--exports");
+            xcl::inspect::run_opts(&PathBuf::from(&args[1]), json, imports, exports)
+        }
+        Some("census") if args.len() >= 2 => {
+            let strict = args.iter().any(|a| a == "--strict");
+            let missing = args.iter().any(|a| a == "--missing");
+            let paths: Vec<PathBuf> = args[1..]
+                .iter()
+                .filter(|a| !a.starts_with('-'))
+                .map(PathBuf::from)
+                .collect();
+            xcl::census::run(&paths, strict, missing)
         }
         Some("disasm") if args.len() >= 2 => xcl::disasm::run(&PathBuf::from(&args[1]), &args[2..]),
+        Some("shader-info") if args.len() >= 2 => xcl::shaders::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("shaders") if args.len() >= 2 => xcl::shaders::run(&PathBuf::from(&args[1]), &args[2..]),
-        Some("pso-precompile") if args.len() >= 2 => xcl::shaders::pso_precompile(&PathBuf::from(&args[1]), &args[2..]),
+        Some("translate") if args.len() >= 2 => translate_cmd(&PathBuf::from(&args[1]), &args[2..]),
+        Some("warm") if args.len() >= 2 => warm_cmd(&PathBuf::from(&args[1]), &args[2..]),
+        Some("replay") if args.len() >= 2 => xcl::replay_cmd::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("rpf") if args.len() >= 2 => xcl::rpf::run(&PathBuf::from(&args[1]), &args[2..]),
+        Some("config") => show_config(),
         Some("--version") | Some("-V") => {
             println!("xcl {}", env!("CARGO_PKG_VERSION"));
             0
@@ -100,14 +138,122 @@ fn main() {
     std::process::exit(code);
 }
 
+/// `xcl translate`: forward to `shaders --recomp` (and optional validate / pipelines).
+fn translate_cmd(path: &std::path::Path, args: &[String]) -> i32 {
+    let mut validate = false;
+    let mut pipelines = false;
+    let mut list = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--validate" => validate = true,
+            "--pipelines" => pipelines = true,
+            "--list" | "--json" => list = true,
+            "--jobs" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    std::env::set_var("XCL_DXC_THREADS", v);
+                    std::env::set_var("XCL_PIPELINE_THREADS", v);
+                } else {
+                    eprintln!("xcl translate: --jobs needs a value");
+                    return 2;
+                }
+            }
+            other if other.starts_with('-') => {
+                eprintln!("xcl translate: unknown option {other} (pass extras via `xcl shaders`)");
+                return 2;
+            }
+            other => {
+                eprintln!("xcl translate: unexpected argument {other}");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+    // Pipeline warming is the precompile path; otherwise survey via --recomp.
+    let mut fwd = if pipelines {
+        vec!["--precompile".into(), "--pipelines".into()]
+    } else {
+        vec!["--recomp".into()]
+    };
+    if validate {
+        fwd.push("--direct".into());
+        fwd.push("--validate".into());
+    }
+    if list {
+        fwd.push("--json".into());
+    }
+    xcl::shaders::run(path, &fwd)
+}
+
+/// `xcl warm`: precompile shaders and host pipelines into caches.
+fn warm_cmd(path: &std::path::Path, args: &[String]) -> i32 {
+    let mut fwd = vec!["--precompile".to_string(), "--pipelines".to_string()];
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--used-only" | "--used" => fwd.push("--used-only".into()),
+            "--jobs" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    std::env::set_var("XCL_PIPELINE_THREADS", v);
+                    std::env::set_var("XCL_DXC_THREADS", v);
+                } else {
+                    eprintln!("xcl warm: --jobs needs a value");
+                    return 2;
+                }
+            }
+            other if other.starts_with('-') => {
+                eprintln!("xcl warm: unknown option {other}");
+                return 2;
+            }
+            other => {
+                eprintln!("xcl warm: unexpected argument {other}");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+    xcl::shaders::run(path, &fwd)
+}
+
+fn show_config() -> i32 {
+    let root = xcl::launcher::data_root();
+    let game = xcl::launcher::game_dir_override();
+    let data = xcl::launcher::data_dir_override();
+    let cfg = xcl::launcher::config_path_override();
+    let cache = match (&data, game.as_ref()) {
+        (Some(d), _) => xcl::launcher::cache_dir_for(d),
+        (None, Some(g)) => xcl::launcher::cache_dir_for(&root.join(g.file_name().unwrap_or_default())),
+        _ => xcl::launcher::cache_dir_for(&root.join("(title)")),
+    };
+    let status = |p: &Option<PathBuf>| match p {
+        Some(p) if p.exists() => format!("{}", p.display()),
+        Some(p) => format!("{}  (does not exist)", p.display()),
+        None => "(not set)".to_owned(),
+    };
+    println!("data_root     : {}", root.display());
+    println!("XCL_GAME_DIR  : {}", status(&game));
+    println!("XCL_DATA_DIR  : {}", status(&data));
+    println!("XCL_CACHE_DIR : {}", cache.display());
+    println!("XCL_CONFIG    : {}", status(&cfg));
+    println!(
+        "XCL_DEVICE_TYPE: {}",
+        std::env::var("XCL_DEVICE_TYPE").unwrap_or_else(|_| "(unset → anaconda / Series X)".into())
+    );
+    println!("XCL_DATA_ROOT : {}", std::env::var("XCL_DATA_ROOT").unwrap_or_else(|_| "(unset)".into()));
+    0
+}
+
 /// xcl.exe opened from Explorer: the console is its own (from a terminal, the shell shares it).
 fn started_by_double_click() -> bool {
     let mut ids = [0u32; 4];
     unsafe { windows_sys::Win32::System::Console::GetConsoleProcessList(ids.as_mut_ptr(), ids.len() as u32) == 1 }
 }
 
-/// No command line: a small menu (choose a game / run the last one again), then the game runs
-/// in this console. On an error the console stays open until Enter, so the message can be read.
+/// No command line: a small menu (add a game folder / choose a game / run the last one again),
+/// then the game runs in this console. On an error the console stays open until Enter, so the
+/// message can be read.
 fn run_picked_game() -> i32 {
     let last_file = xcl::launcher::data_root().join("last-game.txt");
     let last = std::fs::read_to_string(&last_file).ok().map(|s| PathBuf::from(s.trim())).filter(|p| p.exists());
@@ -117,6 +263,7 @@ fn run_picked_game() -> i32 {
             Choice::Again => last.clone(),
             Choice::Cancel => None,
             Choice::Choose | Choice::NoMenu => pick_game_file(),
+            Choice::Folder => pick_game_folder(),
         };
         // MicrosoftGame.config stands for its folder: XCL picks the exe the config names
         picked.map(|file| match file.file_name() {
@@ -216,28 +363,32 @@ impl Drop for Ui {
 
 enum Choice {
     Choose,
+    Folder,
     Again,
     Cancel,
     /// no task dialog on this system: straight to the file dialog
     NoMenu,
 }
 
-/// The menu: a task dialog with "Choose a game…" and, after a first run, "Run again".
+/// The menu: a task dialog with "Add a game folder…", "Choose a game…", and, after a first run, "Run again".
 fn menu(last: Option<&std::path::Path>) -> Choice {
     use windows_sys::Win32::UI::Controls::*;
     const CHOOSE: i32 = 100;
     const AGAIN: i32 = 101;
+    const FOLDER: i32 = 102;
     type TaskDialogIndirect = unsafe extern "system" fn(*const TASKDIALOGCONFIG, *mut i32, *mut i32, *mut i32) -> i32;
     let Some(f) = (unsafe { system_proc("comctl32.dll", "TaskDialogIndirect") }) else { return Choice::NoMenu };
     let title = wide("XCL");
     let heading = wide("Run an Xbox Series game");
-    let content = wide("XCL runs the game from its unpacked files. Choose the game's exe or its MicrosoftGame.config.");
+    let content = wide("XCL runs the game from its unpacked files. Choose the game's folder, its exe or its MicrosoftGame.config.");
+    let folder = wide("Add a game folder…\nThe folder with the game's unpacked files");
     let again = last.map(|p| wide(&format!("Run again\n{}", p.display())));
     let choose = wide("Choose a game…\nThe game's exe or MicrosoftGame.config");
     let mut buttons = Vec::new();
     if let Some(a) = &again {
         buttons.push(TASKDIALOG_BUTTON { nButtonID: AGAIN, pszButtonText: a.as_ptr() });
     }
+    buttons.push(TASKDIALOG_BUTTON { nButtonID: FOLDER, pszButtonText: folder.as_ptr() });
     buttons.push(TASKDIALOG_BUTTON { nButtonID: CHOOSE, pszButtonText: choose.as_ptr() });
     let mut c: TASKDIALOGCONFIG = unsafe { std::mem::zeroed() };
     c.cbSize = std::mem::size_of::<TASKDIALOGCONFIG>() as u32;
@@ -249,14 +400,35 @@ fn menu(last: Option<&std::path::Path>) -> Choice {
     c.pszContent = content.as_ptr();
     c.cButtons = buttons.len() as u32;
     c.pButtons = buttons.as_ptr();
-    c.nDefaultButton = if again.is_some() { AGAIN } else { CHOOSE };
+    c.nDefaultButton = if again.is_some() { AGAIN } else { FOLDER };
     let mut pressed = 0i32;
     let hr = unsafe { std::mem::transmute::<usize, TaskDialogIndirect>(f)(&c, &mut pressed, std::ptr::null_mut(), std::ptr::null_mut()) };
     match (hr, pressed) {
         (h, _) if h < 0 => Choice::NoMenu,
         (_, CHOOSE) => Choice::Choose,
         (_, AGAIN) => Choice::Again,
+        (_, FOLDER) => Choice::Folder,
         _ => Choice::Cancel,
+    }
+}
+
+/// The standard Windows folder picker (None: cancelled). COM only, through ole32 – no dialog
+/// library is imported for it.
+fn pick_game_folder() -> Option<PathBuf> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, SIGDN_FILESYSPATH};
+    unsafe {
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let options = dialog.GetOptions().ok()?;
+        dialog.SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM).ok()?;
+        let _ = dialog.SetTitle(windows::core::w!("XCL – choose the game's folder"));
+        let owner = HWND(windows_sys::Win32::System::Console::GetConsoleWindow() as _);
+        dialog.Show(Some(owner)).ok()?;
+        let name = dialog.GetResult().ok()?.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let path = name.to_string().ok().map(PathBuf::from);
+        CoTaskMemFree(Some(name.0 as _));
+        path
     }
 }
 
@@ -344,4 +516,3 @@ mod console_tests {
         assert_eq!(super::console_name("anaconda"), "Xbox Series X");
     }
 }
-
