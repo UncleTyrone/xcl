@@ -1,10 +1,17 @@
 //! Binary frame wire (`XCLFRAME`) — GPL-2 stand-in for CGBJ `VICFRAME` capture blobs.
 //!
 //! Opt-in via `XCL_RECORD_WIRE=1` while `XCL_RECORD` is set: each recorded present also writes
-//! `frames/frame_NNNN.bin` (magic + version + little-endian event stream). Not a byte-compatible
-//! CGBJ `VICFRAME` file; same operator role for submit/signal/present with a practical metadata
-//! subset for validation (heaps, bind ids, title GPU addresses, list meta/payloads, title-memory
-//! samples and content chunks).
+//! `frames/frame_NNNN.bin` (magic + version + little-endian event stream). **Not** byte-compatible
+//! with CGBJ `VICFRAME` (intentional GPL-2 format); same **operator role** for
+//! submit / signal / present / heap snap / list meta+payload / contents / present sidecars.
+//!
+//! ## Behavioral MATCH vs byte-VICFRAME
+//!
+//! Product parity is semantic (what an operator can diagnose and re-issue same-process), not a
+//! byte-identical codec. Full VICFRAME `Cmd` enum + `DescriptorHeap.runs: Vec<(u32,u32,Slot)>`
+//! slot-run codecs exist only to **rebuild** descriptor tables offline for a cross-process
+//! player — already **IMPOSSIBLE** (§2.8). Same-process `XCL_REPLAY_*` uses live COM heaps, so
+//! omitting slot-run bytes is an evidenced gap that does not block MATCH for the product path.
 //!
 //! ## Cross-process replay (why it stays same-process)
 //!
@@ -20,7 +27,7 @@
 //!
 //! Same stream as version 4, plus:
 //! - **`HeapSnap` / `HeapEntry`** — optional GPU/CPU descriptor-heap start handles
-//!   (VICFRAME `DescriptorHeap` id/kind/count role without full slot-run codecs).
+//!   (VICFRAME `DescriptorHeap` id/kind/count/starts role; slot-run digression above).
 //! - **`Present` plane tail** — per-plane `width` / `height` / `format` from `GetDesc` when known
 //!   (VICFRAME `Present` picture meta). Texel bytes live in sidecar `frames/frame_NNNN.present.bin`
 //!   (JSONL carries `pitch` / `file_off` / `hash`; wire v5 layout unchanged).
@@ -200,8 +207,9 @@ pub mod tag {
 
 /// Descriptor heap metadata (pointer id + creation sizes; no descriptor bytes).
 ///
-/// v5 adds GPU/CPU heap-start handles (0 when unknown) — VICFRAME `DescriptorHeap` spine without
-/// slot-run codecs.
+/// v5 adds GPU/CPU heap-start handles (0 when unknown) — VICFRAME `DescriptorHeap` spine.
+/// Slot-run `runs: Vec<(u32,u32,Slot)>` omitted: only meaningful for offline rebuild (§2.8
+/// IMPOSSIBLE); same-process replay binds live heaps.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeapEntry {
     pub ptr: usize,

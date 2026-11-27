@@ -125,6 +125,8 @@ pub struct DescTrace {
     pub origins: BTreeMap<u64, DescSource>,
     /// Join PC → sole live predecessor block-start PC when BDD polarity + heuristics agree.
     pub only_edge: BTreeMap<u64, u64>,
+    /// Join PC → predecessor block-start PCs whose BDD reach is dead (CGBJ dead-edge subset).
+    pub dead_edges: BTreeMap<u64, Vec<u64>>,
     /// Vector instruction PCs that still need a per-lane EXEC guard (Structured `guards` analogue).
     pub guarded: BTreeSet<u64>,
 }
@@ -153,26 +155,33 @@ fn likely_wave64(insts: &[Decoded]) -> bool {
 }
 
 /// Trace waterfall loops and per-lane descriptor origins; strengthen sole-live join edges.
+///
+/// Runs [`lane_masks::analyze`] **once** (reuses `join_edge_live` / `guarded`) so prepare does not
+/// triple the BDD work — lowers SO risk vs wave-8 `analyze` + `join_polarity` + second `analyze`.
 pub fn trace(insts: &[Decoded]) -> DescTrace {
     let mut out = DescTrace::default();
     if insts.is_empty() || !strict_joins() {
         return out;
     }
     let wave64 = likely_wave64(insts);
-    if let Ok(sum) = lane_masks::analyze(insts, wave64) {
+    let masks = lane_masks::analyze(insts, wave64);
+    let masks_ok = masks.is_ok();
+    let join_pol = masks.as_ref().ok().map(|s| s.join_edge_live.clone());
+    if let Ok(ref sum) = masks {
         out.guarded.extend(sum.guarded.iter().copied());
         for (join_pc, edges) in &sum.join_edge_live {
             let live: Vec<u64> = edges.iter().filter(|(_, l)| *l).map(|(p, _)| *p).collect();
+            let dead: Vec<u64> = edges.iter().filter(|(_, l)| !*l).map(|(p, _)| *p).collect();
             if live.len() == 1 {
                 out.only_edge.insert(*join_pc, live[0]);
             }
+            if !dead.is_empty() {
+                out.dead_edges.insert(*join_pc, dead);
+            }
         }
-    } else if let Ok(edges) = lane_masks::only_edges(insts, wave64) {
-        out.only_edge.extend(edges);
     }
     // Also fold join_lane_phi CFG sole-live (execz heuristics) into only_edge.
     let leaders: BTreeSet<u64> = insts.iter().map(|d| d.pc).collect();
-    let join_pol = lane_masks::join_polarity(insts, wave64).ok();
     if let Some(cfg) = join_lane_phi::build_sgpr_join_cfg(insts, &leaders) {
         for j in 0..cfg.blocks.len() {
             if let Some(only) =
@@ -186,7 +195,6 @@ pub fn trace(insts: &[Decoded]) -> DescTrace {
     }
     // Tracer `live`: peel nested sole-live joins so a later join sees the transitively live arm.
     peel_only_edges(&mut out.only_edge);
-    let masks_ok = lane_masks::analyze(insts, wave64).is_ok();
     let guarded = out.guarded.clone();
     prove_waterfalls(insts, wave64, masks_ok, &guarded, join_pol.as_ref(), &mut out);
     prove_scc_selects(insts, &mut out);
