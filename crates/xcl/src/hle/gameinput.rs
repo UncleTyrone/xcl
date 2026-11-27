@@ -18,6 +18,8 @@
 
 #[path = "gameinput_mouse.rs"]
 pub mod mouse;
+#[path = "gameinput_keyboard.rs"]
+pub mod keyboard;
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -46,6 +48,7 @@ const KIND_GAMEPAD: u32 = 0x4_0000;
 const KIND_UI_NAVIGATION: u32 = 0x100_0000;
 const KINDS: u32 = KIND_CONTROLLER | KIND_GAMEPAD | KIND_UI_NAVIGATION;
 const KIND_MOUSE: u32 = mouse::KIND_MOUSE;
+const KIND_KEYBOARD: u32 = keyboard::KIND_KEYBOARD;
 // GameInputDeviceStatus: connected, input enabled, output enabled, synchronized
 const STATUS: u32 = 0x1 | 0x2 | 0x4 | 0x40;
 // GameInputEnumerationKind
@@ -354,6 +357,7 @@ struct Reading {
     kind: u32,
     gamepad: GamepadState,
     mouse: mouse::MouseState,
+    keys: Vec<keyboard::KeyState>,
     sequence: u64,
     timestamp: u64,
 }
@@ -461,6 +465,36 @@ fn mouse_device() -> *mut Object {
     *D.get_or_init(|| leak_device_vtable()) as *mut Object
 }
 
+fn keyboard_device() -> *mut Object {
+    static D: OnceLock<usize> = OnceLock::new();
+    *D.get_or_init(|| leak_device_vtable()) as *mut Object
+}
+
+fn keyboard_device_info() -> &'static DeviceInfo {
+    static I: OnceLock<Box<DeviceInfo>> = OnceLock::new();
+    I.get_or_init(|| {
+        Box::new(DeviceInfo {
+            size: std::mem::size_of::<DeviceInfo>() as u32,
+            vendor: 0x045E,
+            product: 0x07B2,
+            revision: 1,
+            interface: 0,
+            collection: 0,
+            usage_page: 1,
+            usage_id: 6,
+            hardware_version: [1, 0, 0, 0],
+            firmware_version: [1, 0, 0, 0],
+            device_id: keyboard::KEYBOARD_DEVICE_ID_BYTES,
+            root_id: keyboard::KEYBOARD_DEVICE_ID_BYTES,
+            family: 3,
+            capabilities: 0,
+            supported_input: KIND_KEYBOARD,
+            rumble_motors: 0,
+            rest: [0; 896],
+        })
+    })
+}
+
 fn leak_device_vtable() -> usize {
     let v = vtable(
         "IGameInputDevice",
@@ -537,8 +571,8 @@ fn reading_vtable() -> *const usize {
             zero_count::<11> as usize,
             zero_count::<12> as usize,
             zero_count::<13> as usize,
-            zero_count::<14> as usize,
-            zero_count::<15> as usize,
+            reading_key_count as usize,
+            reading_key_state as usize,
             zero_count::<17> as usize,
             zero_count::<18> as usize,
         ];
@@ -570,6 +604,7 @@ impl OwnedReading {
             kind: KINDS,
             gamepad: state,
             mouse: mouse::MouseState::default(),
+            keys: Vec::new(),
             sequence,
             timestamp,
         })))
@@ -582,6 +617,20 @@ impl OwnedReading {
             kind: KIND_MOUSE,
             gamepad: GamepadState::default(),
             mouse: state,
+            keys: Vec::new(),
+            sequence,
+            timestamp,
+        })))
+    }
+
+    fn new_keyboard(keys: Vec<keyboard::KeyState>, sequence: u64, timestamp: u64) -> Self {
+        Self(Box::into_raw(Box::new(Reading {
+            vtable: reading_vtable(),
+            refs: AtomicU32::new(1),
+            kind: KIND_KEYBOARD,
+            gamepad: GamepadState::default(),
+            mouse: mouse::MouseState::default(),
+            keys,
             sequence,
             timestamp,
         })))
@@ -627,7 +676,9 @@ struct ReadingHistory {
 
 static HISTORY: Mutex<ReadingHistory> = Mutex::new(ReadingHistory::new());
 static MOUSE_HISTORY: Mutex<ReadingHistory> = Mutex::new(ReadingHistory::new());
+static KEYBOARD_HISTORY: Mutex<ReadingHistory> = Mutex::new(ReadingHistory::new());
 static MOUSE_READING_READY: Condvar = Condvar::new();
+static KEYBOARD_READING_READY: Condvar = Condvar::new();
 static READING_READY: Condvar = Condvar::new();
 
 impl ReadingHistory {
@@ -662,6 +713,16 @@ impl ReadingHistory {
         let changed = self.readings.back().is_none_or(|r| r.reading().mouse != state);
         if changed {
             let reading = OwnedReading::new_mouse(state, self.sequence() + 1, now);
+            self.readings.push_back(reading);
+        }
+        self.prune(now);
+        changed
+    }
+
+    fn record_keyboard(&mut self, keys: Vec<keyboard::KeyState>, now: u64) -> bool {
+        let changed = self.readings.back().is_none_or(|r| r.reading().keys != keys);
+        if changed {
+            let reading = OwnedReading::new_keyboard(keys, self.sequence() + 1, now);
             self.readings.push_back(reading);
         }
         self.prune(now);
@@ -746,6 +807,8 @@ unsafe extern "system" fn nothing_u32_f32(_this: *mut c_void, _a: u32, _b: f32) 
 unsafe extern "system" fn get_device_info(this: *mut Object) -> *const DeviceInfo {
     if this == mouse_device() {
         mouse_device_info()
+    } else if this == keyboard_device() {
+        keyboard_device_info()
     } else {
         device_info()
     }
@@ -777,11 +840,17 @@ unsafe extern "system" fn get_current_timestamp(_this: *mut Object) -> u64 {
 }
 
 fn ours(device: *mut c_void) -> bool {
-    device.is_null() || device == self::device() as *mut c_void || device == mouse_device() as *mut c_void
+    device.is_null()
+        || device == self::device() as *mut c_void
+        || device == mouse_device() as *mut c_void
+        || device == keyboard_device() as *mut c_void
 }
 
 fn ours_for_kind(dev: *mut c_void, kind: u32) -> bool {
     if dev.is_null() {
+        return true;
+    }
+    if kind & KIND_KEYBOARD != 0 && dev == keyboard_device() as *mut c_void {
         return true;
     }
     if kind & KIND_MOUSE != 0 && dev == mouse_device() as *mut c_void {
@@ -811,10 +880,11 @@ fn note_query(what: &str, kind: u32) {
 fn targets_mouse(kind: u32, dev: *mut c_void) -> bool {
     let mouse = kind & KIND_MOUSE != 0;
     let pad = kind & KINDS != 0;
-    if mouse && !pad {
+    let kb = kind & KIND_KEYBOARD != 0;
+    if mouse && !pad && !kb {
         return ours_for_kind(dev, KIND_MOUSE);
     }
-    if pad && !mouse {
+    if pad && !mouse && !kb {
         return false;
     }
     if mouse && pad && dev == mouse_device() as *mut c_void {
@@ -823,11 +893,24 @@ fn targets_mouse(kind: u32, dev: *mut c_void) -> bool {
     false
 }
 
+fn targets_keyboard(kind: u32, dev: *mut c_void) -> bool {
+    let kb = kind & KIND_KEYBOARD != 0;
+    let other = kind & (KINDS | KIND_MOUSE);
+    if kb && other == 0 {
+        return ours_for_kind(dev, KIND_KEYBOARD);
+    }
+    if kb && other != 0 && dev == keyboard_device() as *mut c_void {
+        return true;
+    }
+    false
+}
+
 unsafe extern "system" fn get_current_reading(_this: *mut Object, kind: u32, dev: *mut c_void, out: *mut *mut Reading) -> HRESULT {
     note_query("GetCurrentReading", kind);
     let mouse = targets_mouse(kind, dev);
-    let pad = kind & KINDS != 0 && ours_for_kind(dev, KINDS) && !mouse;
-    if !mouse && !pad {
+    let keyboard = targets_keyboard(kind, dev);
+    let pad = kind & KINDS != 0 && ours_for_kind(dev, KINDS) && !mouse && !keyboard;
+    if !mouse && !pad && !keyboard {
         if out.is_null() {
             return E_POINTER;
         }
@@ -836,7 +919,16 @@ unsafe extern "system" fn get_current_reading(_this: *mut Object, kind: u32, dev
         }
         return GAMEINPUT_E_READING_NOT_FOUND;
     }
-    if mouse {
+    if keyboard {
+        current_reading(out, || {
+            let started = start_poller();
+            let mut history = KEYBOARD_HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+            if !started && history.record_keyboard(keyboard::poll_keys(), now_us()) {
+                KEYBOARD_READING_READY.notify_one();
+            }
+            history.readings.back().cloned()
+        })
+    } else if mouse {
         current_reading(out, || {
             let started = start_poller();
             let mut history = MOUSE_HISTORY.lock().unwrap_or_else(|e| e.into_inner());
@@ -877,7 +969,9 @@ unsafe extern "system" fn other_reading<const NEXT: bool>(
     out: *mut *mut Reading,
 ) -> HRESULT {
     note_query("GetNext/PreviousReading", kind);
-    let history = if targets_mouse(kind, dev) {
+    let history = if targets_keyboard(kind, dev) {
+        &KEYBOARD_HISTORY
+    } else if targets_mouse(kind, dev) {
         &MOUSE_HISTORY
     } else {
         &HISTORY
@@ -1115,6 +1209,10 @@ fn start_poller() -> bool {
         let now = now_us();
         HISTORY.lock().unwrap_or_else(|e| e.into_inner()).record_gamepad(poll(), now);
         MOUSE_HISTORY.lock().unwrap_or_else(|e| e.into_inner()).record_mouse(mouse::poll_mouse(), now);
+        KEYBOARD_HISTORY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record_keyboard(keyboard::poll_keys(), now);
         let worker = std::thread::Builder::new().name("xcl-gameinput".into()).spawn(|| {
             crate::eh::arm_current_thread();
             loop {
@@ -1122,11 +1220,15 @@ fn start_poller() -> bool {
                 let now = now_us();
                 let state = poll();
                 let mouse = mouse::poll_mouse();
+                let keys = keyboard::poll_keys();
                 if HISTORY.lock().unwrap_or_else(|e| e.into_inner()).record_gamepad(state, now) {
                     READING_READY.notify_one();
                 }
                 if MOUSE_HISTORY.lock().unwrap_or_else(|e| e.into_inner()).record_mouse(mouse, now) {
                     MOUSE_READING_READY.notify_one();
+                }
+                if KEYBOARD_HISTORY.lock().unwrap_or_else(|e| e.into_inner()).record_keyboard(keys, now) {
+                    KEYBOARD_READING_READY.notify_one();
                 }
             }
         });
@@ -1157,6 +1259,9 @@ unsafe extern "system" fn register_device_callback(_this: *mut Object, dev: *mut
     }
     if kind & KIND_MOUSE != 0 && ours_for_kind(dev, KIND_MOUSE) {
         devices.push(mouse_device());
+    }
+    if kind & KIND_KEYBOARD != 0 && ours_for_kind(dev, KIND_KEYBOARD) {
+        devices.push(keyboard_device());
     }
     if devices.is_empty() {
         return S_OK;
@@ -1239,6 +1344,10 @@ unsafe extern "system" fn find_device_from_id(_this: *mut Object, id: *const [u8
             *out = mouse_device();
             return S_OK;
         }
+        if *id == keyboard::KEYBOARD_DEVICE_ID_BYTES {
+            *out = keyboard_device();
+            return S_OK;
+        }
     }
     *out = std::ptr::null_mut();
     GAMEINPUT_E_DEVICE_NOT_FOUND
@@ -1278,7 +1387,9 @@ unsafe extern "system" fn reading_timestamp(this: *mut Reading) -> u64 {
 }
 unsafe extern "system" fn reading_device(this: *mut Reading, out: *mut *mut Object) {
     if !out.is_null() {
-        *out = if (*this).kind & KIND_MOUSE != 0 {
+        *out = if (*this).kind & KIND_KEYBOARD != 0 {
+            keyboard_device()
+        } else if (*this).kind & KIND_MOUSE != 0 {
             mouse_device()
         } else {
             device()
@@ -1322,6 +1433,21 @@ unsafe extern "system" fn zero_count<const SLOT: usize>(_this: *mut Reading, _a:
 unsafe extern "system" fn no_state<const SLOT: usize>(_this: *mut Reading, _out: *mut c_void) -> bool {
     note_reading_call(SLOT);
     false
+}
+unsafe extern "system" fn reading_key_count(this: *mut Reading) -> u32 {
+    if (*this).kind & KIND_KEYBOARD == 0 {
+        return 0;
+    }
+    (*this).keys.len() as u32
+}
+unsafe extern "system" fn reading_key_state(this: *mut Reading, count: u32, out: *mut keyboard::KeyState) -> u32 {
+    if (*this).kind & KIND_KEYBOARD == 0 || out.is_null() {
+        return 0;
+    }
+    let keys = &(*this).keys;
+    let n = keys.len().min(count as usize);
+    std::ptr::copy_nonoverlapping(keys.as_ptr(), out, n);
+    n as u32
 }
 unsafe extern "system" fn reading_gamepad(this: *mut Reading, out: *mut GamepadState) -> bool {
     if out.is_null() || (*this).kind & KINDS == 0 {
