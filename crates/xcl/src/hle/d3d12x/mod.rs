@@ -13,7 +13,7 @@ mod alloc_pool;
 pub mod bind;
 pub(crate) mod clamp;
 pub mod console_heap;
-mod heap_strides;
+pub(crate) mod heap_strides;
 pub mod console_list;
 mod depth_uav;
 pub mod device_x;

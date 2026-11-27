@@ -1167,6 +1167,9 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
             list.SetComputeRootUnorderedAccessView(k as u32, v);
         }
     }
+    if let Some(idx) = crate::gpu::recomp::pso::abi_heap_strides_root_index(false, false) {
+        super::heap_strides::bind_root(list, gfx, idx);
+    }
     let real = real as *mut c_void;
     let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?;
     list.SetPipelineState(pc);

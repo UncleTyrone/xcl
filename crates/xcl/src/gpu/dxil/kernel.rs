@@ -503,6 +503,8 @@ impl Lw {
         }
         let coherent = cs.is_some() && crate::gpu::recomp::needs_coherent_mem(insts);
         let (mems, heap_mem) = mem_windows(&mut s, o.mem_windows, coherent);
+        let table_strides = crate::hle::d3d12x::heap_strides::on()
+            .then(|| s.raw_srv(crate::hle::d3d12x::heap_strides::SLOT_TABLE_STRIDES as u32, 1));
         let i32 = s.m.i32();
         let z = s.m.i32c(0);
         let mut lw = Lw {
@@ -517,6 +519,7 @@ impl Lw {
             half: z,
             mems,
             heap_mem,
+            table_strides,
             res,
             fmt_table: None,
             fmt_desc_cache: HashMap::new(),

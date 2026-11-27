@@ -159,6 +159,12 @@ pub struct RawUav {
     pub(super) binding: Option<usize>,
 }
 
+/// Root-bound raw SRV (`ByteAddressBuffer` at `t<lower>, space<space>`).
+pub struct RawSrv {
+    pub(super) handle: Value,
+    pub(super) binding: Option<usize>,
+}
+
 impl Shader {
     pub(super) fn dispatch_piece(&self) -> Self {
         Self {
@@ -289,6 +295,16 @@ impl Shader {
         // resource properties: IsUAV (bit 12) | IsGloballyCoherent (bit 14)
         let handle = self.annotate(h, kind::RAW_BUFFER | 0x1000 | 0x4000, 0);
         RawUav { handle, binding: Some(id) }
+    }
+
+    /// Declares a raw SRV at `t<lower>, space<space>` (the heap stride table when `XCL_HEAP_STRIDES=1`).
+    pub fn raw_srv(&mut self, lower: u32, space: u32) -> RawSrv {
+        self.require(Feature::RawAndStructuredBuffers);
+        let id = self.bindings.len();
+        self.bindings.push(Binding::new(ResClass::Srv, space, lower, kind::RAW_BUFFER));
+        let h = self.handle_from_binding(ResClass::Srv, lower, lower, space, lower);
+        let handle = self.annotate(h, kind::RAW_BUFFER, 0);
+        RawSrv { handle, binding: Some(id) }
     }
 
     pub(super) fn handle_from_binding(&mut self, class: ResClass, lower: u32, upper: u32, space: u32, index: u32) -> Value {
