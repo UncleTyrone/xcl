@@ -1505,6 +1505,13 @@ impl State {
             }
             for (dst, off, len, snap) in pending.iter() {
                 let (dst, off, len) = (*dst, *off, *len);
+                if super::shadow::enabled() && super::land::enabled() {
+                    let card = std::slice::from_raw_parts(p.add(off), len);
+                    if unsafe { super::shadow::merge_if_covered(dst, card, len) }.is_some() {
+                        s.sync_sent_range(dst, len);
+                        continue;
+                    }
+                }
                 let snap_base = dst & !(CHUNK - 1);
                 // Copy only committed (non-hole) 64-byte chunks whose host memory did not change
                 // during the GPU readback wait, so concurrent CPU writes are never clobbered.
@@ -1943,6 +1950,7 @@ pub(super) unsafe fn readback_after_execute_sync(queue: &ID3D12CommandQueue, ran
     if let Some((f, v)) = readback_after(&s.rb_queue, queue) {
         super::list_x::note_internal_wait(s.rb_queue.as_raw() as usize, "sparse readback behind a title queue", &f, v);
     }
+    super::shadow::declare_gpu_writes(&merged);
     s.readback_ranges(&merged);
     super::land::note_sparse_landed(&merged);
 }

@@ -257,6 +257,18 @@ impl Shadow {
         !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
+    /// Whether a declared shader-write span overlaps title `[from, to)`.
+    pub(crate) fn write_overlaps(&self, from: usize, to: usize) -> bool {
+        if from >= to {
+            return false;
+        }
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|&(a, e)| a < to && e > from)
+    }
+
     /// Note that landed GPU bytes touched title `[from, to)`.
     pub(crate) fn note_landing(&self, from: usize, to: usize) {
         if from >= to {
@@ -452,6 +464,51 @@ pub(crate) fn capture_after_land(dst: usize, card: &[u8], len: usize) {
     }
 }
 
+/// Before sparse GPU readback: note shaders may be writing these title spans (registered shadows).
+pub(crate) fn declare_gpu_writes(ranges: &[(usize, usize)]) {
+    if !enabled() {
+        return;
+    }
+    for &(va, n) in ranges {
+        if n == 0 {
+            continue;
+        }
+        let Some(s) = peek(va as u64, n as u64).or_else(|| find(va as u64, n as u64)) else {
+            continue;
+        };
+        let end = va.saturating_add(n);
+        let lo = va.max(s.start as usize);
+        let hi = end.min((s.start + s.len) as usize);
+        if lo < hi {
+            s.declare_write(lo, hi - lo);
+        }
+    }
+}
+
+/// After land-back: clear declared write spans that were copied back.
+pub(crate) fn finish_gpu_writes(ranges: &[(usize, usize)]) {
+    if !enabled() {
+        return;
+    }
+    let map = BUFFERS.read().unwrap_or_else(|e| e.into_inner());
+    for &(va, n) in ranges {
+        if n == 0 {
+            continue;
+        }
+        let end = va.saturating_add(n);
+        for (_, entry) in map.iter() {
+            let Some(shadow) = entry.shadow.as_ref() else { continue };
+            let s0 = shadow.start as usize;
+            let s1 = (shadow.start + shadow.len) as usize;
+            let lo = va.max(s0);
+            let hi = end.min(s1);
+            if lo < hi {
+                shadow.writes_done(&[(lo, hi)]);
+            }
+        }
+    }
+}
+
 /// Note landed ranges onto covering shadows (sparse beside path).
 pub(crate) fn note_landed_ranges(ranges: &[(usize, usize)]) {
     if !enabled() {
@@ -528,7 +585,7 @@ pub(crate) fn stale_pages(
             let page = start / PAGE + i;
             let lo = (page * PAGE).max(start);
             let hi = ((page + 1) * PAGE).min(end);
-            if lo >= hi {
+            if lo >= hi || shadow.write_overlaps(lo, hi) {
                 continue;
             }
             let buf = &mut title[..hi - lo];
@@ -651,6 +708,17 @@ mod tests {
         let runs = s.take_landed(0x10_0000, 0x10_0000 + 64);
         assert!(!runs.is_empty());
         assert!(runs.iter().any(|r| r.2));
+    }
+
+    #[test]
+    fn declare_and_finish_gpu_writes() {
+        clear_dir();
+        register(4, 0x20_0000, 0x10_0000);
+        let s = find(0x20_0000, 1).unwrap();
+        declare_gpu_writes(&[(0x20_1000, 0x2000)]);
+        assert!(s.writes_pending());
+        finish_gpu_writes(&[(0x20_1000, 0x2000)]);
+        assert!(!s.writes_pending());
     }
 
     #[test]

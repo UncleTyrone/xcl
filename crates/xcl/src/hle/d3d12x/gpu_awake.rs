@@ -74,8 +74,9 @@ fn parse_mode(val: Option<&str>) -> Mode {
 fn should_enable(mode: Mode, vendor_id: u32) -> bool {
     match mode {
         Mode::Off => false,
-        Mode::On => true,
-        Mode::Auto => vendor_id == AMD_VENDOR_ID,
+        // Forced-on still only helps AMD SMU clocking. On NVIDIA the async-compute
+        // 400k-LCG heartbeat contends with the title and costs ~7 PresentX / 2s.
+        Mode::On | Mode::Auto => vendor_id == AMD_VENDOR_ID,
     }
 }
 
