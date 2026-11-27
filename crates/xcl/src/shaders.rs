@@ -1774,6 +1774,9 @@ fn warm_done_note(key: &str) {
     }
 }
 
+/// Translate workers run join/desc analysis that can recurse on retail shaders (Windows default ~1 MiB stack).
+const PREPARE_STACK: usize = 64 << 20;
+
 fn precompile(
     input: &Input,
     limit: usize,
@@ -1843,8 +1846,11 @@ fn precompile(
         if split { ", split wave64 for a GPU with 32-lane waves" } else { "" }
     );
     std::thread::scope(|s| {
-        for _ in 0..threads {
-            s.spawn(|| loop {
+        for t in 0..threads {
+            std::thread::Builder::new()
+                .name(format!("xcl-prepare-{t}"))
+                .stack_size(PREPARE_STACK)
+                .spawn_scoped(s, || loop {
                 if startup.is_some_and(|p| p.cancel.load(Ordering::Relaxed)) { break; }
                 if warm_time && t0.elapsed().as_secs() >= warm_limit.unwrap_or(0) {
                     warm_timed_out.store(true, Ordering::Relaxed);
@@ -1970,7 +1976,8 @@ fn precompile(
                     }
                 }
                 record_done();
-            });
+            })
+                .expect("prepare worker");
         }
     });
     let failed = failed.into_inner();

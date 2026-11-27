@@ -31,6 +31,9 @@ pub(crate) type SgprKnown = HashMap<u64, u32>;
 /// CGBJ `MAX_JOINS`: nested `only_edge` / `live` peel budget.
 pub(crate) const MAX_JOINS: usize = 8;
 
+/// Cap forward worklist steps at joins (pathological CFG fan-in can churn without converging).
+const MAX_PROP_STEPS: usize = 1 << 20;
+
 /// Block CFG used for SGPR constant propagation at joins (leaders = basic-block entries).
 pub(crate) struct SgprJoinCfg<'a> {
     pub blocks: Vec<&'a [Decoded]>,
@@ -200,10 +203,14 @@ where
     if !strict_joins() {
         return known;
     }
+    let mut peeled = BTreeSet::new();
     for _ in 0..MAX_JOINS {
         let Some(only) = join_sole_live_predecessor_polarity(cfg, block, polarity) else {
             break;
         };
+        if !peeled.insert(only) {
+            break;
+        }
         let arm = block_end_known(cfg, start, only, run_block);
         let mut changed = false;
         for (r, v) in arm {
@@ -289,7 +296,12 @@ where
         start[0] = Some(SgprKnown::new());
         work.push(0);
     }
+    let mut steps = 0usize;
     while let Some(k) = work.pop() {
+        steps += 1;
+        if steps > MAX_PROP_STEPS {
+            break;
+        }
         let mut known = start[k].clone().unwrap_or_default();
         run_block(&cfg.blocks[k], &mut known, false);
         for &n in &cfg.next[k] {
