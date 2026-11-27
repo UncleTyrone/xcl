@@ -314,6 +314,33 @@ pub(crate) fn note_landed_block(block: usize) {
     }
 }
 
+static CURRENT_LAND: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
+static CURRENT_GEN: AtomicU64 = AtomicU64::new(1);
+
+/// `XCL_LAND_TAKEN`: mark a 64 KiB block as already holding the card's bytes after a beside land
+/// so the next refresh can skip a full re-upload of that span.
+pub(crate) fn mark_landed_current(block: usize) {
+    let gen = CURRENT_GEN.load(Ordering::Relaxed);
+    CURRENT_LAND.lock().unwrap_or_else(|e| e.into_inner()).insert(block, gen);
+}
+
+/// Whether [`mark_landed_current`] still says this block matches the card (same generation).
+pub(crate) fn landed_is_current(block: usize) -> bool {
+    let gen = CURRENT_GEN.load(Ordering::Relaxed);
+    CURRENT_LAND
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&block)
+        .copied()
+        == Some(gen)
+}
+
+/// Bump the landed-current generation (call when title mappings change enough to invalidate).
+pub(crate) fn invalidate_landed_current() {
+    CURRENT_GEN.fetch_add(1, Ordering::Relaxed);
+    CURRENT_LAND.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
 /// Note write-watch dirty pages after a scan (`refresh_once`).
 pub(crate) fn note_write_watch_dirty(dirty: &[usize], page_size: usize) {
     if !port::journal() || dirty.is_empty() {

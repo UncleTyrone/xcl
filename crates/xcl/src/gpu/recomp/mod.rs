@@ -57,6 +57,7 @@ pub mod dxc;
 pub mod dxil;
 pub mod lane_masks;
 mod join_lane_phi;
+pub mod desc_trace;
 pub mod lower;
 pub mod lower_dxil;
 pub(crate) mod emit;
@@ -1675,6 +1676,32 @@ fn join_skip_pred(from: &[Decoded], join_pc: u64) -> bool {
     )
 }
 
+/// Optional BDD join-edge polarity from [`lane_masks`] (pred block-start PC → live?).
+/// When set, an edge marked unreachable is treated as lane-dead (CGBJ `meet` subset).
+pub(crate) fn join_lane_dead_pred_polarity(
+    from: &[Decoded],
+    join_pc: u64,
+    join_idx: usize,
+    preds: &[usize],
+    rpo: &[usize],
+    polarity: Option<&std::collections::BTreeMap<u64, Vec<(u64, bool)>>>,
+) -> bool {
+    if !strict_joins() {
+        return false;
+    }
+    if let Some(pol) = polarity {
+        if let Some(edges) = pol.get(&join_pc) {
+            let pred_pc = from.first().map(|d| d.pc).unwrap_or(0);
+            if let Some((_, live)) = edges.iter().find(|(p, _)| *p == pred_pc) {
+                if !*live {
+                    return true;
+                }
+            }
+        }
+    }
+    join_lane_dead_pred(from, join_pc, join_idx, preds, rpo)
+}
+
 /// LanePhi-inspired: is this predecessor edge lane-dead at the join (do not intersect away
 /// constants defined only on live arms)?
 pub(crate) fn join_lane_dead_pred(from: &[Decoded], join_pc: u64, join_idx: usize, preds: &[usize], rpo: &[usize]) -> bool {
@@ -1687,6 +1714,33 @@ pub(crate) fn join_lane_dead_pred(from: &[Decoded], join_pc: u64, join_idx: usiz
     // Loop-header joins: LanePhi refuses `only_edge` here; do not treat inert arms as dead.
     if preds.len() >= 2 && preds.iter().any(|&p| rpo[p] >= rpo[join_idx]) {
         return false;
+    }
+    // Stronger exec/lane polarity (closer to CGBJ meet, without full BDD): a predecessor that
+    // ends by branching to the join on EXECZ/VCCZ/SCC0 is a skip edge (taken only when the
+    // mask is empty). Fall-through after EXECNZ/VCCNZ/SCC1 to the join is similarly dead when
+    // the taken target is elsewhere and the branch is a "mask non-empty → elsewhere" form.
+    if let Some(last) = from.last() {
+        if let Some(t) = rdna2::branch_target(last) {
+            if t == join_pc
+                && matches!(
+                    last.inst.name,
+                    "S_CBRANCH_EXECZ" | "S_CBRANCH_VCCZ" | "S_CBRANCH_SCC0"
+                )
+            {
+                return true;
+            }
+            if t != join_pc
+                && matches!(
+                    last.inst.name,
+                    "S_CBRANCH_EXECNZ" | "S_CBRANCH_VCCNZ" | "S_CBRANCH_SCC1"
+                )
+            {
+                let fall = last.pc + last.len as u64;
+                if fall == join_pc {
+                    return true;
+                }
+            }
+        }
     }
     if block_sets_sgpr_constants(from) {
         return false;
@@ -1806,7 +1860,7 @@ pub(crate) fn block_rpo(next: &[Vec<usize>]) -> Vec<usize> {
 ///
 /// `follow`: follow constants through branches when recording S# for MIMG. At joins,
 /// LanePhi-inspired merge keeps constants from live predecessors when another arm defines none;
-/// full per-lane `LanePhi` tracing in emit remains unported.
+/// per-lane heap indices for waterfall / Fetched / Lanes live in [`desc_trace`].
 pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, follow: bool) -> BTreeMap<u64, [u32; 4]> {
     propagate_sgpr_descriptors(
         insts,
@@ -1968,6 +2022,8 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let follow_sgpr = matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_) | Mode::Compute(_) | Mode::Kernel | Mode::Mesh(_));
     em.static_ss = constant_samplers(&insts, &leaders, follow_sgpr);
     em.static_sr = constant_srsrc(&insts, &leaders, follow_sgpr);
+    let desc = desc_trace::trace(&insts);
+    em.lane_heap = desc.lane_heap;
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
     // continues from the ES into the GS through s_setpc: left as it is); pixel shaders: they
     // skip the quad reads that give the helper lanes' bits

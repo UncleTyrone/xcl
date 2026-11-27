@@ -24,11 +24,17 @@ Usage:
   xcl run <game folder | file.exe> [-- game arguments]
       Runs the game. The game folder is only read; writes, game saves and logs go to
       %LOCALAPPDATA%\\XCL\\<title>\\ (or %XCL_DATA_ROOT%\\<title>\\).
-  xcl inspect <file.exe|file.dll> [--json]
+  xcl inspect <file.exe|file.dll> [--json] [--imports] [--exports]
       Analysis without running: imports and what XCL has for them (HLE / Windows / stub).
+      --imports lists every import; --exports lists export names.
+  xcl census <path...> [--strict] [--missing]
+      Walk PE images under paths; aggregate import coverage (HLE / host / stub).
+      --strict treats Windows pass-through as uncovered; --missing lists stub imports.
   xcl disasm <file> [--offset N] [--length N] [--all] [--hex] [--fssm FILE]
       Disassembler for console GPU code (RDNA2) – e.g. for shaders saved in <data>\\shaders\\.
       Console containers (XDAT/XBCH/FSSM) are unpacked; --fssm saves the unpacked FSSM.
+  xcl shader-info <file | folder | package.rpf> [...]
+      Alias of `shaders` without --recomp (container / stage survey).
   xcl shaders <file | folder | package.rpf> [--top N] [--json] [--recomp] [--compile N]
       Shader corpus statistics: formats, stages, RDNA2 instruction histogram (priorities
       for the recompiler). RPF9 packages are scanned for shader records.
@@ -44,10 +50,21 @@ Usage:
       --direct [--sample N] [--seed S] [--validate] [--compare]: direct DXIL translator
       coverage over a seeded sample (default 200 programs, 0 = all); also
       --timeout, --max-bytes, --threads, --json, --hash H, --dump DIR.
+  xcl translate <file | folder | package.rpf> [--validate] [--pipelines] [--list] [--jobs N]
+      Offline translator pass (forwards to `shaders --recomp`; --validate → --direct --validate).
+  xcl warm <file | folder | package.rpf> [--jobs N] [--used-only]
+      Precompile + build pipelines into the DXIL / driver caches (`shaders --precompile --pipelines`).
+  xcl replay <capture-dir> [--json] [--frame N] [--wire] [--fences] [--present]
+           [--no-execute] [--at N] [--run <game>] [-- args]
+      Inspect an XCL_RECORD / XCLFRAME capture (list payloads, contents.bin, planes).
+      With --run, set XCL_REPLAY (+ optional PresentX re-issue) and start the title
+      (same-process only — not a cross-process VICFRAME player).
   xcl rpf <package.rpf> [--top N] [--find NAME] [--extract NAME --out DIR]
       Lists or extracts readable inline records. Archives larger than 1 GB use a
       bounded-memory header probe; --probe requests it explicitly and --full overrides it.
       Use --probe only for header summaries, without --find, --extract, --out or --full.
+  xcl config
+      Show resolved data / cache / game / config paths and XCL_DEVICE_TYPE.
   xcl --version
 ";
 
@@ -71,11 +88,28 @@ fn main() {
         }
         Some("inspect") if args.len() >= 2 => {
             let json = args.iter().any(|a| a == "--json");
-            xcl::inspect::run(&PathBuf::from(&args[1]), json)
+            let imports = args.iter().any(|a| a == "--imports");
+            let exports = args.iter().any(|a| a == "--exports");
+            xcl::inspect::run_opts(&PathBuf::from(&args[1]), json, imports, exports)
+        }
+        Some("census") if args.len() >= 2 => {
+            let strict = args.iter().any(|a| a == "--strict");
+            let missing = args.iter().any(|a| a == "--missing");
+            let paths: Vec<PathBuf> = args[1..]
+                .iter()
+                .filter(|a| !a.starts_with('-'))
+                .map(PathBuf::from)
+                .collect();
+            xcl::census::run(&paths, strict, missing)
         }
         Some("disasm") if args.len() >= 2 => xcl::disasm::run(&PathBuf::from(&args[1]), &args[2..]),
+        Some("shader-info") if args.len() >= 2 => xcl::shaders::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("shaders") if args.len() >= 2 => xcl::shaders::run(&PathBuf::from(&args[1]), &args[2..]),
+        Some("translate") if args.len() >= 2 => translate_cmd(&PathBuf::from(&args[1]), &args[2..]),
+        Some("warm") if args.len() >= 2 => warm_cmd(&PathBuf::from(&args[1]), &args[2..]),
+        Some("replay") if args.len() >= 2 => xcl::replay_cmd::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("rpf") if args.len() >= 2 => xcl::rpf::run(&PathBuf::from(&args[1]), &args[2..]),
+        Some("config") => show_config(),
         Some("--version") | Some("-V") => {
             println!("xcl {}", env!("CARGO_PKG_VERSION"));
             0
@@ -91,6 +125,113 @@ fn main() {
         }
     };
     std::process::exit(code);
+}
+
+/// `xcl translate`: forward to `shaders --recomp` (and optional validate / pipelines).
+fn translate_cmd(path: &std::path::Path, args: &[String]) -> i32 {
+    let mut validate = false;
+    let mut pipelines = false;
+    let mut list = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--validate" => validate = true,
+            "--pipelines" => pipelines = true,
+            "--list" | "--json" => list = true,
+            "--jobs" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    std::env::set_var("XCL_DXC_THREADS", v);
+                    std::env::set_var("XCL_PIPELINE_THREADS", v);
+                } else {
+                    eprintln!("xcl translate: --jobs needs a value");
+                    return 2;
+                }
+            }
+            other if other.starts_with('-') => {
+                eprintln!("xcl translate: unknown option {other} (pass extras via `xcl shaders`)");
+                return 2;
+            }
+            other => {
+                eprintln!("xcl translate: unexpected argument {other}");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+    // Pipeline warming is the precompile path; otherwise survey via --recomp.
+    let mut fwd = if pipelines {
+        vec!["--precompile".into(), "--pipelines".into()]
+    } else {
+        vec!["--recomp".into()]
+    };
+    if validate {
+        fwd.push("--direct".into());
+        fwd.push("--validate".into());
+    }
+    if list {
+        fwd.push("--json".into());
+    }
+    xcl::shaders::run(path, &fwd)
+}
+
+/// `xcl warm`: precompile shaders and host pipelines into caches.
+fn warm_cmd(path: &std::path::Path, args: &[String]) -> i32 {
+    let mut fwd = vec!["--precompile".to_string(), "--pipelines".to_string()];
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--used-only" | "--used" => fwd.push("--used-only".into()),
+            "--jobs" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    std::env::set_var("XCL_PIPELINE_THREADS", v);
+                    std::env::set_var("XCL_DXC_THREADS", v);
+                } else {
+                    eprintln!("xcl warm: --jobs needs a value");
+                    return 2;
+                }
+            }
+            other if other.starts_with('-') => {
+                eprintln!("xcl warm: unknown option {other}");
+                return 2;
+            }
+            other => {
+                eprintln!("xcl warm: unexpected argument {other}");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+    xcl::shaders::run(path, &fwd)
+}
+
+fn show_config() -> i32 {
+    let root = xcl::launcher::data_root();
+    let game = xcl::launcher::game_dir_override();
+    let data = xcl::launcher::data_dir_override();
+    let cfg = xcl::launcher::config_path_override();
+    let cache = match (&data, game.as_ref()) {
+        (Some(d), _) => xcl::launcher::cache_dir_for(d),
+        (None, Some(g)) => xcl::launcher::cache_dir_for(&root.join(g.file_name().unwrap_or_default())),
+        _ => xcl::launcher::cache_dir_for(&root.join("(title)")),
+    };
+    let status = |p: &Option<PathBuf>| match p {
+        Some(p) if p.exists() => format!("{}", p.display()),
+        Some(p) => format!("{}  (does not exist)", p.display()),
+        None => "(not set)".to_owned(),
+    };
+    println!("data_root     : {}", root.display());
+    println!("XCL_GAME_DIR  : {}", status(&game));
+    println!("XCL_DATA_DIR  : {}", status(&data));
+    println!("XCL_CACHE_DIR : {}", cache.display());
+    println!("XCL_CONFIG    : {}", status(&cfg));
+    println!(
+        "XCL_DEVICE_TYPE: {}",
+        std::env::var("XCL_DEVICE_TYPE").unwrap_or_else(|_| "(unset → anaconda / Series X)".into())
+    );
+    println!("XCL_DATA_ROOT : {}", std::env::var("XCL_DATA_ROOT").unwrap_or_else(|_| "(unset)".into()));
+    0
 }
 
 /// xcl.exe opened from Explorer: the console is its own (from a terminal, the shell shares it).
@@ -120,6 +261,19 @@ fn run_picked_game() -> i32 {
     let Some(target) = target else { return 0 };
     let _ = std::fs::create_dir_all(xcl::launcher::data_root());
     let _ = std::fs::write(&last_file, target.to_string_lossy().as_bytes());
+    // Which console XCL is to the game, unless the environment says (`XCL_DEVICE_TYPE`).
+    if std::env::var_os("XCL_DEVICE_TYPE").is_none() {
+        let console_file = xcl::launcher::data_root().join("last-console.txt");
+        let saved = std::fs::read_to_string(&console_file).ok();
+        let picked = {
+            let _ui = Ui::enter();
+            console_menu(console_of(saved.as_deref()))
+        };
+        let Some(console) = picked else { return 0 };
+        let _ = std::fs::write(&console_file, console);
+        std::env::set_var("XCL_DEVICE_TYPE", console);
+        println!("console: {}", console_name(console));
+    }
     println!("xcl run \"{}\"", target.display());
     let code = xcl::launcher::run_from_menu(&target);
     if code != 0 {
@@ -262,4 +416,65 @@ fn pick_game_file() -> Option<PathBuf> {
     }
     let n = file.iter().position(|&c| c == 0).unwrap_or(file.len());
     Some(PathBuf::from(String::from_utf16_lossy(&file[..n])))
+}
+
+/// The device type a saved choice names: "lockhart" (Series S) or, for anything else and for
+/// no choice yet, "anaconda" (Series X), the names `XCL_DEVICE_TYPE` takes.
+fn console_of(saved: Option<&str>) -> &'static str {
+    match saved.map(str::trim) {
+        Some(s) if s.eq_ignore_ascii_case("lockhart") => "lockhart",
+        _ => "anaconda",
+    }
+}
+
+fn console_name(console: &str) -> &'static str {
+    if console == "lockhart" { "Xbox Series S" } else { "Xbox Series X" }
+}
+
+/// Second menu: which console XCL is to the game. Series X unless told. None: cancelled.
+fn console_menu(last: &'static str) -> Option<&'static str> {
+    use windows_sys::Win32::UI::Controls::*;
+    const X: i32 = 110;
+    const S: i32 = 111;
+    type TaskDialogIndirect = unsafe extern "system" fn(*const TASKDIALOGCONFIG, *mut i32, *mut i32, *mut i32) -> i32;
+    let Some(f) = (unsafe { system_proc("comctl32.dll", "TaskDialogIndirect") }) else { return Some(last) };
+    let title = wide("XCL");
+    let heading = wide("Which console should XCL be?");
+    let content = wide("The game asks which console it runs on and sets its memory, resolution and detail by the answer. This can be changed at every start; XCL_DEVICE_TYPE sets it without this question.");
+    let x = wide("Xbox Series X\nThe game's full settings. Needs the most video memory.");
+    let s = wide("Xbox Series S\nLower resolution and detail, 8 GB of game memory. Needs less video memory.");
+    let buttons = [TASKDIALOG_BUTTON { nButtonID: X, pszButtonText: x.as_ptr() }, TASKDIALOG_BUTTON { nButtonID: S, pszButtonText: s.as_ptr() }];
+    let mut c: TASKDIALOGCONFIG = unsafe { std::mem::zeroed() };
+    c.cbSize = std::mem::size_of::<TASKDIALOGCONFIG>() as u32;
+    c.hwndParent = unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() };
+    c.dwFlags = TDF_USE_COMMAND_LINKS | TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
+    c.dwCommonButtons = TDCBF_CANCEL_BUTTON;
+    c.pszWindowTitle = title.as_ptr();
+    c.pszMainInstruction = heading.as_ptr();
+    c.pszContent = content.as_ptr();
+    c.cButtons = buttons.len() as u32;
+    c.pButtons = buttons.as_ptr();
+    c.nDefaultButton = if last == "lockhart" { S } else { X };
+    let mut pressed = 0i32;
+    let hr = unsafe { std::mem::transmute::<usize, TaskDialogIndirect>(f)(&c, &mut pressed, std::ptr::null_mut(), std::ptr::null_mut()) };
+    match (hr, pressed) {
+        (h, _) if h < 0 => Some(last),
+        (_, X) => Some("anaconda"),
+        (_, S) => Some("lockhart"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod console_tests {
+    #[test]
+    fn the_saved_console_is_the_default_of_the_menu() {
+        assert_eq!(super::console_of(None), "anaconda");
+        assert_eq!(super::console_of(Some(" lockhart\n")), "lockhart");
+        assert_eq!(super::console_of(Some("LOCKHART")), "lockhart");
+        assert_eq!(super::console_of(Some("anaconda")), "anaconda");
+        assert_eq!(super::console_of(Some("")), "anaconda");
+        assert_eq!(super::console_name("lockhart"), "Xbox Series S");
+        assert_eq!(super::console_name("anaconda"), "Xbox Series X");
+    }
 }

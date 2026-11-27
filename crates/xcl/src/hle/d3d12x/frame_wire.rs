@@ -3,17 +3,26 @@
 //! Opt-in via `XCL_RECORD_WIRE=1` while `XCL_RECORD` is set: each recorded present also writes
 //! `frames/frame_NNNN.bin` (magic + version + little-endian event stream). Not a byte-compatible
 //! CGBJ `VICFRAME` file; same operator role for submit/signal/present with a practical metadata
-//! subset for validation (heaps, bind ids, title GPU addresses, list meta, title-memory samples).
+//! subset for validation (heaps, bind ids, title GPU addresses, list meta/payloads, title-memory
+//! samples and content chunks).
 //!
-//! ## `XCLFRAME` version 3 (current [`VERSION`])
+//! ## `XCLFRAME` version 4 (current [`VERSION`])
 //!
-//! Same stream as version 2, plus:
+//! Same stream as version 3, plus:
+//! - **`ListPayload` (tag 8)** — structured command dump for a mapped PC list (bind snapshot,
+//!   written ranges, and optional draw/dispatch op bytes). VICFRAME `List.commands` role without
+//!   a full host `Cmd` codec; same-process re-issue still uses live list pointers.
+//! - **`ContentChunk` (tag 9)** — title-memory region hashed and stored in sidecar
+//!   `frames/frame_NNNN.contents.bin` at `file_off` (VICFRAME `contents.bin` / `Content` role).
+//! - **`Present` (tag 4) tail** — when `wire_version >= 4`: `queue`, `plane_count`, and per-plane
+//!   `(resource, optional source rect)` so replay can re-issue `PresentX` in-process.
+//!
+//! ## `XCLFRAME` version 3
+//!
 //! - **`ListMeta` (tag 6)** — per mapped PC list: pointer, `D3D12_COMMAND_LIST_TYPE`, PSO/RS ids,
-//!   bound heap ptrs, and title GPU VAs touched on that list (VICFRAME `List` role without
-//!   recording host command bytes).
+//!   bound heap ptrs, and title GPU VAs touched on that list.
 //! - **`ContentSample` (tag 7)** — title-memory sample at a GPU VA: length hashed, FNV-1a-32,
-//!   and up to 256 leading bytes (VICFRAME `Content` / `contents.bin` role for same-state boot
-//!   debugging; not a full resource dump).
+//!   and a leading sample prefix.
 //!
 //! ## Version 2
 //!
@@ -23,18 +32,24 @@
 //!   `(ptr u64, type u32, count u32, flags u32)` for descriptor heaps known this frame.
 //!
 //! Version 1 blobs omit the `Submit` tail and have no `HeapSnap` events. [`decode_frame`] accepts
-//! versions 1..=3.
+//! versions 1..=4.
 
 use std::path::Path;
 
 /// First eight bytes of `frame_*.bin`.
 pub const MAGIC: [u8; 8] = *b"XCLFRAME";
-/// Layout version for newly written blobs (see module docs for field differences vs 1/2).
-pub const VERSION: u32 = 3;
+/// Layout version for newly written blobs (see module docs for field differences vs 1..=3).
+pub const VERSION: u32 = 4;
 pub const VERSION_MIN: u32 = 1;
 
 /// Max leading bytes stored in a [`WireEvent::ContentSample`].
-pub const CONTENT_SAMPLE_CAP: usize = 256;
+pub const CONTENT_SAMPLE_CAP: usize = 4096;
+
+/// Max bytes hashed / dumped per title VA into `contents.bin` (one chunk).
+pub const CONTENT_CHUNK_CAP: usize = 256 * 1024;
+
+/// Soft cap on total `contents.bin` bytes written for one frame.
+pub const CONTENTS_BIN_SOFT_CAP: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bad(pub &'static str);
@@ -82,6 +97,15 @@ fn get_u32(from: &mut Dec<'_>) -> Result<u32, Bad> {
 fn get_u64(from: &mut Dec<'_>) -> Result<u64, Bad> {
     let b = from.take(8)?;
     Ok(u64::from_le_bytes(b.try_into().map_err(|_| Bad("u64"))?))
+}
+
+fn put_i32(out: &mut Vec<u8>, v: i32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn get_i32(from: &mut Dec<'_>) -> Result<i32, Bad> {
+    let b = from.take(4)?;
+    Ok(i32::from_le_bytes(b.try_into().map_err(|_| Bad("i32"))?))
 }
 
 fn put_usize_list(out: &mut Vec<u8>, xs: &[usize]) {
@@ -151,6 +175,8 @@ pub mod tag {
     pub const HEAP_SNAP: u8 = 5;
     pub const LIST_META: u8 = 6;
     pub const CONTENT_SAMPLE: u8 = 7;
+    pub const LIST_PAYLOAD: u8 = 8;
+    pub const CONTENT_CHUNK: u8 = 9;
 }
 
 /// Descriptor heap metadata (pointer id + creation sizes; no descriptor bytes).
@@ -180,6 +206,39 @@ impl HeapEntry {
     }
 }
 
+/// One PresentX plane resource (+ optional source rect) for v4 present tails.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PresentPlane {
+    pub resource: usize,
+    pub rect: Option<[i32; 4]>,
+}
+
+impl PresentPlane {
+    fn put(&self, out: &mut Vec<u8>) {
+        put_u64(out, self.resource as u64);
+        match self.rect {
+            Some(r) => {
+                out.push(1);
+                for v in r {
+                    put_i32(out, v);
+                }
+            }
+            None => out.push(0),
+        }
+    }
+
+    fn get(from: &mut Dec<'_>) -> Result<Self, Bad> {
+        let resource = get_u64(from)? as usize;
+        let has = *from.take(1)?.first().ok_or(Bad("plane rect flag"))?;
+        let rect = if has != 0 {
+            Some([get_i32(from)?, get_i32(from)?, get_i32(from)?, get_i32(from)?])
+        } else {
+            None
+        };
+        Ok(Self { resource, rect })
+    }
+}
+
 /// One recorded event in binary form (mirrors JSONL kinds).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WireEvent {
@@ -206,6 +265,10 @@ pub enum WireEvent {
         frame: u64,
         token: u64,
         submits: u64,
+        /// v4+: queue that issued PresentX (0 if unknown / older wire).
+        queue: usize,
+        /// v4+: plane resources for PresentX re-issue.
+        planes: Vec<PresentPlane>,
     },
     HeapSnap { heaps: Vec<HeapEntry> },
     /// v3: one mapped PC list's bind/VA snapshot (no command-byte blob).
@@ -223,6 +286,19 @@ pub enum WireEvent {
         len: u32,
         hash: u32,
         sample: Vec<u8>,
+    },
+    /// v4: structured list payload (op bytes) for same-process diagnosis / re-issue hints.
+    ListPayload {
+        list: usize,
+        kind: u32,
+        ops: Vec<u8>,
+    },
+    /// v4: content chunk stored in `contents.bin` at `file_off` (`len` bytes, `hash` of those).
+    ContentChunk {
+        va: u64,
+        len: u32,
+        hash: u32,
+        file_off: u64,
     },
 }
 
@@ -265,11 +341,24 @@ impl WireEvent {
                 put_u64(out, *fence as u64);
                 put_u64(out, *value);
             }
-            Self::Present { frame, token, submits } => {
+            Self::Present {
+                frame,
+                token,
+                submits,
+                queue,
+                planes,
+            } => {
                 out.push(tag::PRESENT);
                 put_u64(out, *frame);
                 put_u64(out, *token);
                 put_u64(out, *submits);
+                if wire_version >= 4 {
+                    put_u64(out, *queue as u64);
+                    put_u32(out, planes.len() as u32);
+                    for p in planes {
+                        p.put(out);
+                    }
+                }
             }
             Self::HeapSnap { heaps } => {
                 out.push(tag::HEAP_SNAP);
@@ -300,6 +389,24 @@ impl WireEvent {
                 put_u32(out, *len);
                 put_u32(out, *hash);
                 put_bytes(out, sample);
+            }
+            Self::ListPayload { list, kind, ops } => {
+                out.push(tag::LIST_PAYLOAD);
+                put_u64(out, *list as u64);
+                put_u32(out, *kind);
+                put_bytes(out, ops);
+            }
+            Self::ContentChunk {
+                va,
+                len,
+                hash,
+                file_off,
+            } => {
+                out.push(tag::CONTENT_CHUNK);
+                put_u64(out, *va);
+                put_u32(out, *len);
+                put_u32(out, *hash);
+                put_u64(out, *file_off);
             }
         }
     }
@@ -344,11 +451,29 @@ impl WireEvent {
                 fence: get_u64(from)? as usize,
                 value: get_u64(from)?,
             },
-            tag::PRESENT => Self::Present {
-                frame: get_u64(from)?,
-                token: get_u64(from)?,
-                submits: get_u64(from)?,
-            },
+            tag::PRESENT => {
+                let frame = get_u64(from)?;
+                let token = get_u64(from)?;
+                let submits = get_u64(from)?;
+                let (queue, planes) = if wire_version >= 4 {
+                    let queue = get_u64(from)? as usize;
+                    let n = get_u32(from)? as usize;
+                    let mut planes = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        planes.push(PresentPlane::get(from)?);
+                    }
+                    (queue, planes)
+                } else {
+                    (0, Vec::new())
+                };
+                Self::Present {
+                    frame,
+                    token,
+                    submits,
+                    queue,
+                    planes,
+                }
+            }
             tag::HEAP_SNAP => {
                 let n = get_u32(from)? as usize;
                 let mut heaps = Vec::with_capacity(n);
@@ -379,6 +504,27 @@ impl WireEvent {
                     len: get_u32(from)?,
                     hash: get_u32(from)?,
                     sample: get_bytes(from)?,
+                }
+            }
+            tag::LIST_PAYLOAD => {
+                if wire_version < 4 {
+                    return Err(Bad("ListPayload requires wire version >= 4"));
+                }
+                Self::ListPayload {
+                    list: get_u64(from)? as usize,
+                    kind: get_u32(from)?,
+                    ops: get_bytes(from)?,
+                }
+            }
+            tag::CONTENT_CHUNK => {
+                if wire_version < 4 {
+                    return Err(Bad("ContentChunk requires wire version >= 4"));
+                }
+                Self::ContentChunk {
+                    va: get_u64(from)?,
+                    len: get_u32(from)?,
+                    hash: get_u32(from)?,
+                    file_off: get_u64(from)?,
                 }
             }
             _ => return Err(Bad("unknown event kind")),
@@ -437,14 +583,28 @@ pub fn read_frame(path: &Path) -> Result<Vec<WireEvent>, String> {
     decode_frame(&bytes).map_err(|e| e.to_string())
 }
 
+/// Compact kind tags inside a [`WireEvent::ListPayload`] `ops` blob.
+pub mod list_op {
+    pub const DRAW: u8 = 1;
+    pub const DISPATCH: u8 = 2;
+    #[allow(dead_code)]
+    pub const SET_PSO: u8 = 3;
+    pub const HEAPS: u8 = 4;
+    pub const TOUCH_VA: u8 = 5;
+    pub const WRITTEN: u8 = 6;
+    pub const BIND_IDS: u8 = 7;
+    pub const SNAP_MAGIC: &[u8; 4] = b"XLST";
+    pub const SNAP_VER: u8 = 1;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn roundtrip_submit_present_v3() {
+    fn roundtrip_submit_present_v4() {
         let events = vec![
-            WireEvent::Session { format: 3 },
+            WireEvent::Session { format: 4 },
             WireEvent::Submit {
                 n: 3,
                 queue: 0x1000,
@@ -465,11 +625,22 @@ mod tests {
                 heaps: vec![0xC],
                 vas: vec![0x10_00],
             },
+            WireEvent::ListPayload {
+                list: 3,
+                kind: 0,
+                ops: vec![list_op::DRAW, 1, 0, 0, 0, 3],
+            },
             WireEvent::ContentSample {
                 va: 0x10_00,
                 len: 4,
                 hash: fnv1a32(&[1, 2, 3, 4]),
                 sample: vec![1, 2, 3, 4],
+            },
+            WireEvent::ContentChunk {
+                va: 0x10_00,
+                len: 4,
+                hash: fnv1a32(&[1, 2, 3, 4]),
+                file_off: 0,
             },
             WireEvent::HeapSnap {
                 heaps: vec![HeapEntry {
@@ -488,6 +659,11 @@ mod tests {
                 frame: 1,
                 token: 42,
                 submits: 3,
+                queue: 0x1000,
+                planes: vec![PresentPlane {
+                    resource: 0xABCD,
+                    rect: Some([0, 0, 1920, 1080]),
+                }],
             },
         ];
         let bytes = encode_frame(&events);
@@ -513,6 +689,13 @@ mod tests {
                 gpu_vas: vec![],
                 bound_heaps: vec![],
             },
+            WireEvent::Present {
+                frame: 1,
+                token: 1,
+                submits: 1,
+                queue: 0,
+                planes: vec![],
+            },
         ];
         let bytes = encode_frame_version(&events_v1, 1);
         let back = decode_frame(&bytes).unwrap();
@@ -520,30 +703,15 @@ mod tests {
     }
 
     #[test]
-    fn decodes_v2_without_list_meta() {
-        let events = vec![
-            WireEvent::Submit {
-                n: 1,
-                queue: 1,
-                lists: 1,
-                addrs: vec![1],
-                pc_addrs: vec![2],
-                backing: vec![2],
-                psos: vec![3],
-                rs_gfx: vec![4],
-                gpu_vas: vec![5],
-                bound_heaps: vec![6],
-            },
-            WireEvent::HeapSnap {
-                heaps: vec![HeapEntry {
-                    ptr: 6,
-                    ty: 0,
-                    count: 8,
-                    flags: 0,
-                }],
-            },
-        ];
-        let bytes = encode_frame_version(&events, 2);
+    fn decodes_v3_present_without_planes() {
+        let events = vec![WireEvent::Present {
+            frame: 2,
+            token: 9,
+            submits: 4,
+            queue: 0,
+            planes: vec![],
+        }];
+        let bytes = encode_frame_version(&events, 3);
         let back = decode_frame(&bytes).unwrap();
         assert_eq!(back, events);
     }

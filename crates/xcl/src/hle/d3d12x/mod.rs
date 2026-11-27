@@ -34,6 +34,12 @@ pub(crate) mod gpu_awake;
 pub mod guard;
 mod frame_replay;
 mod frame_wire;
+
+/// Offline `xcl replay <dir>` inspect (no GPU). See [`frame_replay::cli_inspect`].
+pub fn frame_replay_inspect(dir: &std::path::Path, json: bool, frame: Option<u64>) -> Result<String, String> {
+    frame_replay::cli_inspect(dir, json, frame)
+}
+
 mod late_release;
 mod late_wait;
 pub mod layout;
@@ -49,6 +55,7 @@ pub(crate) mod join;
 pub(crate) mod card_rehash;
 pub(crate) mod card_steps;
 pub(crate) mod land;
+pub(crate) mod safecopy;
 pub(crate) mod root_env;
 pub(crate) mod send_env;
 pub(crate) mod texture_env;

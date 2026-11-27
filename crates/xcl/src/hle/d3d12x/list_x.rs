@@ -703,6 +703,86 @@ pub(super) fn frame_bound_heaps(list: *mut c_void) -> Vec<usize> {
     heaps
 }
 
+/// Structured list payload for `XCLFRAME` `ListPayload` (VICFRAME `List.commands` role).
+pub(super) fn frame_list_payload(list: *mut c_void) -> Vec<u8> {
+    use super::frame_wire::list_op;
+    let mut out = Vec::with_capacity(128);
+    out.extend_from_slice(list_op::SNAP_MAGIC);
+    out.push(list_op::SNAP_VER);
+    let (pso, rs) = super::bind::frame_bind_ids(list);
+    out.push(list_op::BIND_IDS);
+    out.extend_from_slice(&(pso as u64).to_le_bytes());
+    out.extend_from_slice(&(rs as u64).to_le_bytes());
+    let mut heaps = frame_bound_heaps(list);
+    heaps.sort_unstable();
+    heaps.dedup();
+    out.push(list_op::HEAPS);
+    out.extend_from_slice(&(heaps.len() as u32).to_le_bytes());
+    for h in heaps {
+        out.extend_from_slice(&(h as u64).to_le_bytes());
+    }
+    let mut vas = frame_touch_vas(list);
+    vas.sort_unstable();
+    vas.dedup();
+    for va in vas {
+        out.push(list_op::TOUCH_VA);
+        out.extend_from_slice(&va.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+    }
+    let mut ranges = Vec::new();
+    {
+        let g = LISTS.lock().unwrap();
+        if let Some(st) = g.as_ref().and_then(|m| m.get(&(list as usize))) {
+            ranges = st.written_ranges.clone();
+        }
+    }
+    for (va, end) in ranges.into_iter().take(64) {
+        out.push(list_op::WRITTEN);
+        out.extend_from_slice(&va.to_le_bytes());
+        out.extend_from_slice(&end.to_le_bytes());
+    }
+    out
+}
+
+pub(super) fn note_frame_draw(
+    list: *mut c_void,
+    indexed: bool,
+    count: u32,
+    instances: u32,
+    first: u32,
+    base: i32,
+) {
+    if !super::frame_replay::list_ops_recording() {
+        return;
+    }
+    use super::frame_wire::list_op;
+    let mut bytes = Vec::with_capacity(18);
+    bytes.push(list_op::DRAW);
+    bytes.push(u8::from(indexed));
+    bytes.extend_from_slice(&count.to_le_bytes());
+    bytes.extend_from_slice(&instances.to_le_bytes());
+    bytes.extend_from_slice(&first.to_le_bytes());
+    bytes.extend_from_slice(&base.to_le_bytes());
+    super::frame_replay::append_list_op(list as usize, &bytes);
+}
+
+pub(super) fn note_frame_dispatch(list: *mut c_void, x: u32, y: u32, z: u32) {
+    if !super::frame_replay::list_ops_recording() {
+        return;
+    }
+    use super::frame_wire::list_op;
+    let mut bytes = Vec::with_capacity(13);
+    bytes.push(list_op::DISPATCH);
+    bytes.extend_from_slice(&x.to_le_bytes());
+    bytes.extend_from_slice(&y.to_le_bytes());
+    bytes.extend_from_slice(&z.to_le_bytes());
+    super::frame_replay::append_list_op(list as usize, &bytes);
+}
+
+pub(super) fn take_frame_ops(list: *mut c_void) -> Vec<u8> {
+    super::frame_replay::take_list_ops(list as usize)
+}
+
 /// (tests) The view heaps XCL counts as bound on `list`; forgetting the list with `forget`.
 #[cfg(test)]
 pub(super) fn bound_heaps(list: *mut c_void, forget: bool) -> Vec<usize> {

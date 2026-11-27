@@ -58,11 +58,40 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
     }
     let token = (planes as *const u64).read_unaligned();
     let _present = PRESENTX_LOCK.lock().unwrap();
+    let extracted = extract_planes(plane_count, planes);
+    super::frame_replay::note_present_context(queue, &extracted);
     present_x_frame(queue, plane_count, planes);
     // The title can use flip statistics to decide when to reuse its buffer.
     // Queue our copy before reporting the flip.
     super::frame::mark_flipped(token);
     0
+}
+
+/// Same-process `PresentX` re-issue for `XCL_REPLAY_PRESENT` (does not `mark_flipped`).
+pub(super) unsafe fn reissue_present_x(queue: *mut c_void, token: u64, planes: &[(usize, Option<[i32; 4]>)]) {
+    if planes.is_empty() {
+        return;
+    }
+    let n = planes.len().min(MAX_PLANES);
+    let mut res_slots: Vec<usize> = planes.iter().take(n).map(|(r, _)| *r).collect();
+    let mut rects: Vec<[i32; 4]> = (0..n)
+        .map(|i| planes[i].1.unwrap_or([0, 0, 0, 0]))
+        .collect();
+    let mut buf = vec![0u8; PLANE_STRIDE * n];
+    for i in 0..n {
+        let plane = buf.as_mut_ptr().add(i * PLANE_STRIDE);
+        if i == 0 {
+            (plane as *mut u64).write_unaligned(token);
+        }
+        (plane.add(8) as *mut u32).write_unaligned(1);
+        (plane.add(0x10) as *mut usize).write_unaligned(res_slots.as_mut_ptr().add(i) as usize);
+        if planes[i].1.is_some() {
+            (plane.add(0x18) as *mut usize).write_unaligned(rects[i].as_mut_ptr() as usize);
+        }
+    }
+    let _keep = (&res_slots, &rects);
+    let _guard = PRESENTX_LOCK.lock().unwrap();
+    present_x_frame(queue, n as u32, buf.as_ptr());
 }
 
 const PLANE_STRIDE: usize = 0x48;

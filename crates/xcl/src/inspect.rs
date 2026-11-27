@@ -66,6 +66,11 @@ fn status(s: &Source) -> String {
 }
 
 pub fn run(path: &Path, json: bool) -> i32 {
+    run_opts(path, json, false, false)
+}
+
+/// `list_imports` / `list_exports`: print every symbol (CGBJ `inspect --imports/--exports` role).
+pub fn run_opts(path: &Path, json: bool, list_imports: bool, list_exports: bool) -> i32 {
     let data = match std::fs::read(path) {
         Ok(d) => d,
         Err(e) => {
@@ -148,8 +153,26 @@ pub fn run(path: &Path, json: bool) -> i32 {
         }
         let c: Vec<String> = counts.iter().map(|(k, v)| format!("{v} {k}")).collect();
         println!("  {dll}: {}", c.join(", "));
-        for e in entries.iter().filter(|e| e.status == "STUB") {
-            println!("      - {}", e.function);
+        if list_imports {
+            for e in entries {
+                println!("      {}  [{}]", e.function, e.status);
+            }
+        } else {
+            for e in entries.iter().filter(|e| e.status == "STUB") {
+                println!("      - {}", e.function);
+            }
+        }
+    }
+    if list_exports {
+        match pe.exports() {
+            Ok(Some(ex)) => {
+                println!("\nExports: {} names", ex.names.len());
+                for (name, _) in &ex.names {
+                    println!("  {name}");
+                }
+            }
+            Ok(None) => println!("\nExports: none"),
+            Err(e) => eprintln!("xcl inspect: exports: {e}"),
         }
     }
     0
