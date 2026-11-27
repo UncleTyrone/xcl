@@ -212,6 +212,50 @@ pub fn join_copies() -> bool {
     latch(&ON, "XCL_JOIN_COPIES")
 }
 
+pub fn copy_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("XCL_COPY_MODE").ok().as_deref().map(str::trim) {
+        Some("plain") => {
+            once("XCL_COPY_MODE", true);
+            1
+        }
+        Some("none") => {
+            once("XCL_COPY_MODE", true);
+            2
+        }
+        _ => 0,
+    })
+}
+
+pub fn copy_plain() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = copy_mode() == 1 || env_on("XCL_COPY_PLAIN");
+        once("XCL_COPY_PLAIN", on);
+        on
+    })
+}
+
+pub fn copies_in_place() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_COPIES_IN_PLACE").is_none_or(|v| v != "0"))
+}
+
+pub fn copy_beside() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    latch(&ON, "XCL_COPY_BESIDE")
+}
+
+pub fn copy_over_title() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    latch(&ON, "XCL_COPY_OVER_TITLE")
+}
+
+pub fn alias_copy() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_ALIAS_COPY").is_none_or(|v| v != "0"))
+}
+
 /// Join compare re-hash passes across runs (`XCL_CARD_REHASH_RUNS=1`, legacy `VICTORY_CARD_REHASH_RUNS=1`).
 pub fn card_rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();

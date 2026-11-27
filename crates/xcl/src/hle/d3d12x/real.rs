@@ -1194,6 +1194,7 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
     // a null `ppv` is D3D12's validation call: S_FALSE and no heap to register
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         let raw = *ppv;
+        super::frame_replay::note_descriptor_heap(raw as usize, d[0], d[1], flags);
         let heap = ID3D12DescriptorHeap::from_raw_borrowed(&raw).unwrap();
         let dev = ID3D12Device::from_raw_borrowed(&this).unwrap();
         let cpu = heap.GetCPUDescriptorHandleForHeapStart().ptr as u64;
@@ -4063,7 +4064,9 @@ unsafe fn adjust_raytracing_options5(feature: i32, data: *mut u8, size: u32) {
     let opts = &mut *(data as *mut D3D12_FEATURE_DATA_D3D12_OPTIONS5);
     let host = opts.RaytracingTier.0;
     super::dxr_build::note_host_raytracing_tier(host);
-    if let Some(tier) = crate::state::config().raytracing_tier_override() {
+    if !super::bvh_env::activate_rays() {
+        opts.RaytracingTier = D3D12_RAYTRACING_TIER(0);
+    } else if let Some(tier) = crate::state::config().raytracing_tier_override() {
         opts.RaytracingTier = D3D12_RAYTRACING_TIER(tier as i32);
     }
     super::dxr_build::note_effective_raytracing_tier(opts.RaytracingTier.0);
