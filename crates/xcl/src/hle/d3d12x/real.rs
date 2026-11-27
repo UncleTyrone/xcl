@@ -2970,6 +2970,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     }
     super::console_heap::publish(&slot, false);
     super::console_heap::note_resource(&slot, res as usize);
+    super::heap_strides::note_view(slot.index, res as usize);
     if super::present::trace_frame() && super::title_textures::address(res as usize).is_some() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 24 {
@@ -3609,6 +3610,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     pc_uav(slot.pc_uav);
     super::console_heap::publish(&slot, true);
     super::console_heap::note_resource(&slot, res as usize);
+    super::heap_strides::note_view(slot.index + 1, res as usize);
     let amb_idx = if slot.shared_srv != 0 { slot.index } else { 0 };
     let Some(r) = ID3D12Resource::from_raw_borrowed(&uav_res) else {
         super::ambient::note_descriptor(slot.at, amb_idx, 0, 0, 0, true);

@@ -14,6 +14,7 @@ mod ambient;
 pub mod bind;
 pub(crate) mod clamp;
 pub mod console_heap;
+mod heap_strides;
 pub mod console_list;
 mod depth_uav;
 pub(crate) mod descriptor_sites;
