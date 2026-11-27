@@ -1,10 +1,11 @@
-﻿# src/xcl (main) — safe minimal env (thin/join off). Frame-path modules are present;
-# enable XCL_RELAY=2 / LAND / CARD_STEPS / WIDE_BACK explicitly, or use amd-dev
-# (pareto-amd.ps1) / nvidia-dev (pareto-nvidia.ps1) for full CGBJ-shaped bundles.
+﻿# src/xcl (main) pareto env — profile split for present-rate vs CGBJ-dense.
 #
 # Usage:
-#   . .\scripts\pareto-main.ps1
-#   # build from src/xcl: cargo build --release -p xcl
+#   . .\scripts\pareto-main.ps1            # safe (rate-friendly)
+#   . .\scripts\pareto-main.ps1 -Full      # denser residency/heap/awake (may lower presents/2s)
+#   cargo build --release -p xcl
+
+param([switch]$Full)
 
 $pareto = @{
     XCL_THIN                    = '0'
@@ -19,14 +20,18 @@ $pareto = @{
     XCL_TEXTURE_GUARD           = '1'
     XCL_PORT_CONSTANTS          = '0'
     XCL_PORT_CBV                = '0'
-    XCL_HEAP_STRIDES            = '1'
-    XCL_RESIDENCY               = '1'
-    XCL_FRAME_INTERVAL_MS       = '16'
-    XCL_GPU_AWAKE               = '1'
+}
+
+if ($Full) {
+    $pareto['XCL_HEAP_STRIDES'] = '1'
+    $pareto['XCL_RESIDENCY'] = '1'
+    $pareto['XCL_FRAME_INTERVAL_MS'] = '16'
+    $pareto['XCL_GPU_AWAKE'] = '1'
 }
 
 foreach ($k in $pareto.Keys) {
     Set-Item -Path "Env:$k" -Value $pareto[$k]
 }
 
-Write-Host "src/xcl safe pareto env set ($($pareto.Count) XCL_* variables)."
+$label = if ($Full) { 'full' } else { 'safe' }
+Write-Host "src/xcl $label pareto env set ($($pareto.Count) XCL_* variables)."
