@@ -695,6 +695,8 @@ pub(super) unsafe extern "system" fn set_graphics_root_constants(this: *mut c_vo
 /// #42 / #44 / #46 SetGraphicsRoot{ConstantBuffer,ShaderResource,UnorderedAccess}View (PC #38 /
 /// #40 / #42)
 pub(super) unsafe extern "system" fn set_graphics_root_descriptor(this: *mut c_void, i: u32, va: u64) {
+    super::root_env::on_root_bind();
+    let _ = (super::root_env::root_view_bytes(), super::root_env::root_uav_bytes());
     note_address(va);
     put_in(this, true, i, 0, &va.to_le_bytes());
 }
@@ -3096,6 +3098,7 @@ pub(super) unsafe extern "system" fn set_compute_root_constants(this: *mut c_voi
 /// #41 / #43 / #45 SetComputeRoot{ConstantBuffer,ShaderResource,UnorderedAccess}View (PC #37 /
 /// #39 / #41): the 64-bit GPU address
 pub(super) unsafe extern "system" fn set_compute_root_descriptor(this: *mut c_void, i: u32, va: u64) {
+    super::root_env::on_root_bind();
     note_address(va);
     put(this, i, 0, &va.to_le_bytes());
 }
@@ -3445,11 +3448,13 @@ fn fold_counts(x: u32, y: u32, z: u32) -> (u32, [u32; 3]) {
 /// nothing runs: such a dispatch kept an NVIDIA GPU busy until the driver reset the device.
 fn fold_counts_within(x: u32, y: u32, z: u32, most: u32) -> (u32, [u32; 3]) {
     use crate::gpu::recomp::FOLD_X;
-    if x <= FOLD_X && y <= 65_535 && z <= 65_535 {
+    let dim = super::render_env::dispatch_dim_cap(false);
+    let _ = super::render_env::indirect_card_budget();
+    if x <= FOLD_X && y <= dim && z <= dim {
         return (0, [x, y, z]);
     }
     let (limit, groups) =
-        if y == 1 && z <= 65_535 && x.div_ceil(FOLD_X) <= 65_535 { (x, [FOLD_X, x.div_ceil(FOLD_X), z]) } else { (0, [x.min(65_535), y.min(65_535), z.min(65_535)]) };
+        if y == 1 && z <= dim && x.div_ceil(FOLD_X) <= dim { (x, [FOLD_X, x.div_ceil(FOLD_X), z]) } else { (0, [x.min(dim), y.min(dim), z.min(dim)]) };
     // (a folded dispatch has up to one row of groups more than the console's count; the bound in
     // 32 bits, as `clamp`'s pass takes it)
     if groups.iter().map(|&n| n as u64).product::<u64>() > most.saturating_add(FOLD_X) as u64 {

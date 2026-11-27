@@ -82,6 +82,9 @@ pub fn validator_supported() -> bool {
 /// the validator at run time, and the GPU tests still run. Malformed containers still fail.
 pub fn validate(container: &[u8]) -> Result<(), String> {
     header_fits(container)?;
+    // Prefer an explicit `XCL_DXIL` / `VICTORY_DXIL` path when set (latch + log); validator
+    // still comes from dxcompiler unless a separate dxil.dll loader is wired.
+    let _ = crate::hle::d3d12x::diag_env::dxil_path();
     let v: IDxcValidator = instance(compiler_create()?, &CLSID_DxcValidator)?;
     let b = blob(container)?;
     unsafe {

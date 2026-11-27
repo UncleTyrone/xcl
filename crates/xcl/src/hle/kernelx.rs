@@ -2830,11 +2830,18 @@ pub fn host_os_version() -> (u32, u32, u32) {
 pub fn fine_timer() {
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, ProcessPowerThrottling, SetProcessInformation, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        PROCESS_POWER_THROTTLING_STATE,
+    };
+    // `XCL_EFFICIENCY_MODE=1` leaves Windows execution-speed throttling alone; otherwise disable it.
+    let execution = if crate::hle::d3d12x::diag_env::efficiency_mode() {
+        0
+    } else {
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED
     };
     let state = PROCESS_POWER_THROTTLING_STATE {
         Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION | execution,
         StateMask: 0,
     };
     let size = std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32;

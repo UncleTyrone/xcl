@@ -161,6 +161,7 @@ fn drain_fills() -> Vec<FillStep> {
 
 /// Called before title lists execute; returns true when a card-step prelude list was submitted.
 pub fn try_prep_before_lists(queue: *mut c_void, _mapped: &[*mut c_void]) -> bool {
+    let _lazy = super::render_env::lazy_prelude();
     let st = stage();
     if st == 0 {
         return false;

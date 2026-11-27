@@ -478,6 +478,19 @@ fn stop_asked(fault: bool) -> ! {
     super::real::end_title(0)
 }
 
+/// Heartbeat for `XCL_ASK_EARLY` background thread (journal path stays warm).
+pub(crate) fn tick_early_ask() {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n == 0 {
+        super::ask_env::on_refresh_start();
+        super::keep_env::note_boot();
+        super::page_env::note_boot();
+        super::pop_env::note_boot();
+        super::read_env::note_boot();
+    }
+}
+
 pub fn guard_ask_always() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("XCL_GUARD_ASK").is_ok_and(|v| v.trim() == "1"))

@@ -138,6 +138,9 @@ pub(crate) fn log_policy_once() {
     if indirect_rest() {
         crate::xlog_info!("D3D12.X: XCL_INDIRECT_REST=1 (oversized indirect record takes batch remainder)");
     }
+    let _ = super::render_env::indirect_wide();
+    let _ = super::render_env::indirect_card_budget();
+    let _ = super::render_env::memory_card_mb();
 }
 
 /// `XCL_CLAMP_INDIRECT=1`. Off unless asked for: with the pass on, a retail title's first world

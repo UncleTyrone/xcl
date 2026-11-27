@@ -644,21 +644,36 @@ type Work = Box<dyn FnOnce() + Send>;
 fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
     static Q: OnceLock<Mutex<mpsc::Sender<Work>>> = OnceLock::new();
     Q.get_or_init(|| {
+        super::pipeline_env::note_boot();
+        super::library_env::note_boot();
         let (tx, rx) = mpsc::channel::<Work>();
         let rx = Arc::new(Mutex::new(rx));
         // translation recurses deeply on big programs; DXC itself runs on its own pool
-        let n = crate::gpu::recomp::dxc::compile_threads();
+        let n = super::pipeline_env::pipeline_workers()
+            .min(crate::gpu::recomp::dxc::compile_threads().max(1));
+        let _ = super::pipeline_env::pipeline_slow_limit(n);
+        let lowest = super::pipeline_env::pipeline_lowest();
         for k in 0..n {
             let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
-                let next = rx.lock().unwrap().recv();
-                let Ok(work) = next else { return };
-                while let Some(p) = next_needed() {
-                    if build_queued(&p) {
-                        NEEDED_FIRST.fetch_add(1, Ordering::Relaxed);
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || {
+                if lowest {
+                    unsafe {
+                        use windows_sys::Win32::System::Threading::{
+                            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST,
+                        };
+                        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
                     }
                 }
-                work();
+                loop {
+                    let next = rx.lock().unwrap().recv();
+                    let Ok(work) = next else { return };
+                    while let Some(p) = next_needed() {
+                        if build_queued(&p) {
+                            NEEDED_FIRST.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    work();
+                }
             });
         }
         Mutex::new(tx)
@@ -2622,7 +2637,11 @@ fn wait_budget() -> Option<std::time::Duration> {
 /// when draws did not wait.
 fn gfx_wait_budget() -> Option<std::time::Duration> {
     static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
-    *B.get_or_init(|| budget_of(std::env::var("XCL_GFX_PSO_WAIT_MS").ok().as_deref()))
+    *B.get_or_init(|| {
+        let _ = super::pipeline_env::pipeline_wait_shared();
+        let _ = super::pipeline_env::pipeline_book();
+        budget_of(std::env::var("XCL_GFX_PSO_WAIT_MS").ok().as_deref())
+    })
 }
 
 /// How long a bind waits for a compute pipeline still being built (`XCL_CS_PSO_WAIT_MS`; unset

@@ -1,10 +1,13 @@
 //! BCPack: the DirectStorage stage between zlib and swizzle that unpacks console BCn blocks.
 //! A stream has no header; 12 or 16 rANS lanes share one byte stream and rebuild into blocks.
 //! Decodes BC1, BC3, BC4, BC5, BC6H and BC7 from the format's constant tables (`tables.rs`);
-//! BC2 has no lane layout.
+//! BC2 has no lane layout. Optional `XCL_BCPACK_TABLES` / `VICTORY_BCPACK_TABLES` override the
+//! built-in tables for decode (default: compiled-in, matching CGBJ production).
 //! Port of VIctory's `victory-formats/src/bcpack.rs`; tables generated from its
 //! `bcpack-tables.bin` by `scripts/gen_bcpack_victory_tables.py`.
 
+pub mod env;
+mod load;
 mod tables;
 mod victory;
 
@@ -61,8 +64,7 @@ pub fn decode(mode: u8, src: &[u8], out_len: usize) -> Result<Vec<u8>, Error> {
         return Err(Error::OutputSize);
     }
     let mut out = vec![0u8; out_len];
-    victory::decode(mode, src, &mut out, victory::Tables::builtin())
-        .map_err(|e| Error::Decode(e.0))?;
+    victory::decode(mode, src, &mut out, env::tables_for_decode()).map_err(|e| Error::Decode(e.0))?;
     Ok(out)
 }
 

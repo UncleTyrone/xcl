@@ -50,6 +50,22 @@ pub fn beside() -> bool {
     *ON.get_or_init(|| super::port::land_beside())
 }
 
+pub fn anytime() -> bool {
+    super::render_env::land_anytime()
+}
+
+pub fn echo() -> bool {
+    super::render_env::land_echo()
+}
+
+pub fn skip() -> bool {
+    super::render_env::land_skip()
+}
+
+pub fn taken() -> bool {
+    super::render_env::land_taken()
+}
+
 pub fn threads() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
@@ -106,10 +122,16 @@ pub unsafe fn merge_range(dst: usize, src: &[u8], held: &[u8], len: usize) -> (u
         apply_piece(0, len)
     };
 
-    if beside() {
+    if beside() || anytime() {
         for &b in &blocks {
             watch::note_landed_block(b);
+            if taken() {
+                let _ = echo();
+            }
         }
+    }
+    if skip() && new_bytes == 0 {
+        return (0, 0);
     }
     count(S_NEW_BYTES, new_bytes as u64);
     count(S_DWORDS, dwords as u64);

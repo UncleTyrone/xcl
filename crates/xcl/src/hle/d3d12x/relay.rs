@@ -70,9 +70,10 @@ fn ensure_worker() {
         });
         let st = stage();
         crate::xlog_info!(
-            "D3D12.X: relay worker (XCL_RELAY={st}{}{})",
+            "D3D12.X: relay worker (XCL_RELAY={st}{}{}{})",
             if exact() { ", exact" } else { "" },
-            if relay_copy() { ", copy queue fetch" } else { "" }
+            if relay_copy() { ", copy queue fetch" } else { "" },
+            if super::diag_env::fetch_check() { ", XCL_FETCH_CHECK" } else { "" },
         );
     });
 }

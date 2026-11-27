@@ -1739,6 +1739,18 @@ pub(crate) fn needs_coherent_mem(insts: &[Decoded]) -> bool {
 }
 
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
+    let _ = crate::gpu::shader_env::shader_loop_limit();
+    if let Some(dir) = crate::gpu::shader_env::shader_save_dir() {
+        let _ = std::fs::create_dir_all(dir);
+        let stem = format!("{:016x}", crate::gpu::shader::fnv64(code));
+        let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), code);
+    }
+    if let Some(path) = crate::gpu::shader_env::shader_census_path() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{:016x}\t{}", crate::gpu::shader::fnv64(code), code.len());
+        }
+    }
     let program = code;
     let normalized;
     let opt = if opt.mem_windows & HEAP_WINDOWS != 0 {

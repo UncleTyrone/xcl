@@ -650,7 +650,10 @@ pub fn init() -> Result<String, String> {
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI: {e}"))?;
         let mut device: Option<ID3D12Device> = None;
         let mut name = String::new();
-        let sel = crate::gpu::adapter::Selector::from_env_or(&cfg.d3d12_adapter);
+        let mut sel = crate::gpu::adapter::Selector::from_env_or(&cfg.d3d12_adapter);
+        if super::d3d12_boot::force_warp() {
+            sel = crate::gpu::adapter::Selector::Warp;
+        }
         if sel != crate::gpu::adapter::Selector::Warp {
             let mut list = crate::gpu::adapter::candidates(&factory, &sel);
             if list.is_empty() {
@@ -678,6 +681,7 @@ pub fn init() -> Result<String, String> {
                 d
             }
         };
+        super::d3d12_boot::apply_device_boot(&device, debug);
         if debug {
             // the debug layer's messages into XCL's log (they otherwise go to a debugger only)
             if let Ok(q) = device.cast::<ID3D12InfoQueue1>() {
@@ -5115,6 +5119,10 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if !is_console(cs) {
         return None;
     }
+    let record = crate::gpu::shader::fnv64(cs);
+    if crate::gpu::shader_env::defrag_off() && record == crate::gpu::shader_env::DEFRAG_SHADER_HASH {
+        return None;
+    }
     // made when first bound (`pso_async::lazy`): not even translated now
     if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
         return Some(Err(()));
@@ -5146,7 +5154,6 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if big && crate::gpu::recomp::dxc::defer() {
         return Some(Err(()));
     }
-    let record = crate::gpu::shader::fnv64(cs);
     let warm = compiled.dispatch_chain.as_ref().and_then(|_| {
         let rs = abi_rs_for(this, &compiled.samplers)?;
         let result = compute_container(this, f, d, rs, &dxil, record, riid, ppv, ComputeBuild::CachedWhole);
@@ -8794,6 +8801,13 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
 /// A stand-in pipeline is bound as its real pipeline once that is built (compute: waited for at its use).
 /// SetPipelineState on the PC list (a pipeline still building in the background: its stand-in)
 pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
+    let _ = (
+        crate::gpu::shader_env::skip_pipelines(),
+        super::root_env::rt_resolve(),
+        crate::gpu::shader_env::shader_save_dir(),
+        crate::gpu::shader_env::shader_census_path(),
+        crate::gpu::shader_env::shader_loop_limit(),
+    );
     cl_set_pipeline_state(this, pso)
 }
 

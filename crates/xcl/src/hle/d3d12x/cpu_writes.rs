@@ -76,6 +76,7 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
                         Write::Immediate(va, words) => write_now(*va, words),
                         Write::ReadbackU64 { va, src, .. } => {
                             let value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
+                            let value = super::gpu_load::adjust_timestamp(*va, value);
                             write_u64_now(*va, value);
                         }
                     }
