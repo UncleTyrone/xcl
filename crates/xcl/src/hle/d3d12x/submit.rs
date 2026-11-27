@@ -123,9 +123,9 @@ pub fn note_submit_done() {
     }
 }
 
-/// Present path: stay synchronous until present-behind is tracked with fences.
+/// Present path: synchronous unless `XCL_LATE_WAIT=3` and async submit frames-ahead.
 pub fn present_may_queue() -> bool {
-    false
+    super::late_wait::present_ahead() && super::port::async_submit()
 }
 
 pub fn wait_present_room() {

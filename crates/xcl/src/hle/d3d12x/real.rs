@@ -9279,6 +9279,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
 
 /// Title `ExecuteCommandLists` after refresh / translate join.
 unsafe fn execute_command_lists_body(this: *mut c_void, lists: &[*mut c_void]) {
+    super::frame_replay::on_title_submit(this, lists);
     super::title_textures::before_title_execute(this);
     super::capture::submit(this, lists);
     let _in_pc = super::pso_async::pc_call();
@@ -9340,6 +9341,7 @@ pub(super) unsafe fn execute_mapped_lists(this: *mut c_void, mapped: &[*mut c_vo
         super::list_x::readback_sparse_writes(this, chunk);
         super::list_x::cpu_writes_after(this, chunk);
         super::list_x::note_submitted(this);
+        super::late_wait::note_chunk_sent();
         super::submit_cost::after(t1.elapsed());
         if super::port::submit_serial() {
             super::session::serial_wait_after_submit(this);
