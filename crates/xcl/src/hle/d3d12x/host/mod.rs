@@ -35,6 +35,7 @@ pub(crate) fn note_frame(frames: f64) {
 
 /// Submit about to go to the driver: stamps / spans / timeline.
 pub(crate) fn before_submit() -> Option<spans::SpanTicket> {
+    super::shadow::let_go_idle();
     timeline::sent();
     spans::begin()
 }

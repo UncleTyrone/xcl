@@ -2,7 +2,8 @@
 //!
 //! CGBJ draws white bitmap text onto the swap chain (F3 toggles). XCL currently samples the same
 //! counter set into the log twice a second when the latch is on, and toggles visibility with F3
-//! when an XCL/title window is foreground — GPU blit overlay lands with the full host panel port.
+//! when an XCL/title window is foreground. Set `XCL_PANEL_GPU=1` for a GPU status box on the
+//! swap-chain back buffer (card-local DEFAULT blit + multi-line/scale; per-glyph atlas still open).
 //!
 //! Study-only reference: CGBJ `victory-gpu` `host/panel.rs` (GPL-3); this file is GPL-2.
 
@@ -77,22 +78,32 @@ pub(crate) fn on_frame(frame: u64) {
     let d_draws = draws.saturating_sub(p.1) as f64 / frames;
     let d_disp = dispatches.saturating_sub(p.2) as f64 / frames;
     *p = (presents, draws, dispatches, Instant::now());
-    let mem = match super::real::video_memory() {
-        Some((local, non_local, budget)) => format!(
-            "vram local={}MB non-local={}MB budget={}MB",
+    // N `video_memory` is (local, non_local, shared); M/A omit shared.
+    let mem = match (super::real::video_memory(), super::real::video_budget()) {
+        (Some((local, non_local, shared)), Some((loc, _))) => format!(
+            "vram local={}MB non-local={}MB shared={}MB budget={}MB",
             local >> 20,
             non_local >> 20,
-            budget >> 20
+            shared >> 20,
+            loc.Budget >> 20
         ),
-        None => "vram unknown".into(),
+        (Some((local, non_local, shared)), None) => {
+            format!(
+                "vram local={}MB non-local={}MB shared={}MB",
+                local >> 20,
+                non_local >> 20,
+                shared >> 20
+            )
+        }
+        _ => "vram unknown".into(),
     };
     let line = format!(
-        "FPS {fps:.1}  DRAWS {d_draws:.0}  DISPATCH {d_disp:.0}  frame={frame}  {mem}"
+        "FPS {fps:.1}  DRAWS {d_draws:.0}  DISPATCH {d_disp:.0}  frame={frame}\n{mem}"
     );
     super::panel_gpu::set_overlay_text(&line);
-    crate::xlog_info!("XCL PANEL {line}");
+    crate::xlog_info!("XCL PANEL {}", line.replace('\n', " | "));
     if let Some(hwnd) = super::present::window_hwnd() {
-        let title = format!("XCL | {line}");
+        let title = format!("XCL | {}", line.replace('\n', "  "));
         let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
         unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(hwnd, wide.as_ptr());
