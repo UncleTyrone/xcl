@@ -4774,6 +4774,7 @@ pub fn forget_buffer(res: usize) {
 
 fn forget_in(s: &mut State, res: usize) {
     let Some(tiles) = s.buffers.remove(&res) else { return };
+    super::shadow::unregister_resource(res);
     for (t, tile) in tiles {
         if let Some(c) = s.pinned.get_mut(&tile) {
             *c -= 1;

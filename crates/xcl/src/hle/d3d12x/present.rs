@@ -148,6 +148,10 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
     super::faultbook::on_frame(frames);
     super::panel::on_frame(frames);
+    {
+        let (draws, _) = super::bind::activity();
+        super::host::on_present(frames, draws);
+    }
     super::targets::frame_end();
     super::gpu_times::present(frames);
     super::bvh_want::frame();
@@ -160,6 +164,7 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
             super::late_wait::log_frame_stats(300.0);
             super::relay::note_frame(300.0);
             super::land::log_stats(300.0);
+            super::host::note_frame(300.0);
         }
     }
     super::real::stop_if_device_removed();
@@ -1385,12 +1390,18 @@ fn frame_dump_due() -> bool {
         Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(120),
         Err(_) => 0,
     });
-    every > 0 && PRESENTS.load(Ordering::Relaxed) % every == 20.min(every - 1)
+    (every > 0 && PRESENTS.load(Ordering::Relaxed) % every == 20.min(every - 1)) || super::host::capture::wanted(PRESENTS.load(Ordering::Relaxed).saturating_add(1))
 }
 
 /// Frames shown so far.
 pub fn presents() -> u64 {
     PRESENTS.load(Ordering::Relaxed)
+}
+
+/// Present window HWND, if created (for the host panel title).
+pub fn window_hwnd() -> Option<windows_sys::Win32::Foundation::HWND> {
+    let raw = HWND_RAW.load(Ordering::Acquire);
+    (raw != 0).then_some(raw as windows_sys::Win32::Foundation::HWND)
 }
 
 /// Content sampled by an existing `XCL_FRAME_DUMP` readback, not proof of gameplay.
@@ -1639,6 +1650,12 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
                 sampled_pixels: (ow * oh) as u64,
                 non_dark_samples: decoded.then_some(lit as u64),
             });
+        }
+    }
+    if tag == "frame" {
+        let cap_n = n.saturating_add(1);
+        if super::host::capture::wanted(cap_n) {
+            super::host::capture::save_bmp(cap_n, &bmp);
         }
     }
     let Some(boot) = crate::state::boot() else { return };
