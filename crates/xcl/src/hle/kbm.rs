@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
+use super::gameinput::mouse::MouseState;
 use super::gameinput::{GamepadState, LEFT_SHOULDER, LEFT_STICK, RIGHT_SHOULDER, RIGHT_STICK, X, Y};
 
 // ---------------------------------------------------------------------------------------
@@ -137,6 +138,7 @@ extern "system" {
     fn GetClientRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
     fn ClientToScreen(hwnd: *mut c_void, point: *mut Point) -> i32;
     fn SetCursor(cursor: *mut c_void) -> *mut c_void;
+    fn GetCursorPos(point: *mut Point) -> i32;
 }
 
 #[repr(C)]
@@ -215,6 +217,10 @@ static SIZING: AtomicBool = AtomicBool::new(false);
 /// mouse counts not yet taken by `apply`
 static DX: AtomicI32 = AtomicI32::new(0);
 static DY: AtomicI32 = AtomicI32::new(0);
+/// parallel accumulators for GameInput mouse readings (consumed by `gameinput_mouse_sample`)
+static GI_DX: AtomicI32 = AtomicI32::new(0);
+static GI_DY: AtomicI32 = AtomicI32::new(0);
+static GI_WHEEL: AtomicI32 = AtomicI32::new(0);
 /// wheel movement not yet taken (WHEEL_DELTA = 120 a notch)
 static WHEEL: AtomicI32 = AtomicI32::new(0);
 
@@ -224,6 +230,12 @@ struct Mouse {
     wheel: Wheel,
     wheel_rest: i32,
 }
+
+struct GameInputMouse {
+    last_cursor: Option<(i32, i32)>,
+}
+
+static GAMEINPUT_MOUSE: Mutex<Option<GameInputMouse>> = Mutex::new(None);
 
 impl Mouse {
     fn reset(&mut self, now: Instant) {
@@ -240,9 +252,16 @@ fn reset_mouse_state() {
     DX.store(0, Ordering::Relaxed);
     DY.store(0, Ordering::Relaxed);
     WHEEL.store(0, Ordering::Relaxed);
+    GI_DX.store(0, Ordering::Relaxed);
+    GI_DY.store(0, Ordering::Relaxed);
+    GI_WHEEL.store(0, Ordering::Relaxed);
     let mut g = MOUSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(m) = g.as_mut() {
         m.reset(Instant::now());
+    }
+    let mut gi = GAMEINPUT_MOUSE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(m) = gi.as_mut() {
+        m.last_cursor = None;
     }
 }
 
@@ -309,9 +328,13 @@ pub unsafe fn on_message(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> b
                 if raw.flags & MOUSE_MOVE_ABSOLUTE == 0 {
                     DX.fetch_add(raw.last_x, Ordering::Relaxed);
                     DY.fetch_add(raw.last_y, Ordering::Relaxed);
+                    GI_DX.fetch_add(raw.last_x, Ordering::Relaxed);
+                    GI_DY.fetch_add(raw.last_y, Ordering::Relaxed);
                 }
                 if raw.button_flags & RI_MOUSE_WHEEL != 0 {
-                    WHEEL.fetch_add(raw.button_data as i16 as i32, Ordering::Relaxed);
+                    let w = raw.button_data as i16 as i32;
+                    WHEEL.fetch_add(w, Ordering::Relaxed);
+                    GI_WHEEL.fetch_add(w, Ordering::Relaxed);
                 }
             }
             false // DefWindowProc cleans up
@@ -444,6 +467,58 @@ pub fn apply(s: &mut GamepadState) {
     m.wheel_rest -= notches * 120;
     m.wheel.notches(notches);
     s.buttons |= m.wheel.step(dt.min(0.1));
+}
+
+/// Update `out` for GameInput `GetMouseState`: cumulative position and buttons while the XCL
+/// window has the focus. Returns false when unfocused (neutral reading, position unchanged).
+pub fn gameinput_mouse_sample(out: &mut MouseState) -> bool {
+    let hwnd = WINDOW.load(Ordering::Acquire);
+    if hwnd == 0 {
+        return false;
+    }
+    // SAFETY: Win32 foreground and cursor queries.
+    let focused = unsafe { GetForegroundWindow() } as isize == hwnd;
+    if !focused {
+        return false;
+    }
+    let dx = GI_DX.swap(0, Ordering::Relaxed);
+    let dy = GI_DY.swap(0, Ordering::Relaxed);
+    let wheel = GI_WHEEL.swap(0, Ordering::Relaxed);
+  out.position_x += i64::from(dx);
+    out.position_y += i64::from(dy);
+    out.wheel_y += i64::from(wheel);
+
+    let mut gi = GAMEINPUT_MOUSE.lock().unwrap_or_else(|e| e.into_inner());
+    let track = gi.get_or_insert_with(|| GameInputMouse { last_cursor: None });
+    // When raw input did not deliver relative counts, follow screen cursor deltas (menus).
+    if dx == 0 && dy == 0 {
+        let mut pos = Point::default();
+        // SAFETY: `GetCursorPos` writes a `POINT`.
+        if unsafe { GetCursorPos(&mut pos) } != 0 {
+            if let Some((lx, ly)) = track.last_cursor {
+                out.position_x += i64::from(pos.x - lx);
+                out.position_y += i64::from(pos.y - ly);
+            }
+            track.last_cursor = Some((pos.x, pos.y));
+        }
+    } else {
+        track.last_cursor = None;
+    }
+
+    out.buttons = 0;
+    const BTNS: [(i32, u32); 5] = [
+        (0x01, super::gameinput::mouse::MOUSE_LEFT),
+        (0x02, super::gameinput::mouse::MOUSE_RIGHT),
+        (0x04, super::gameinput::mouse::MOUSE_MIDDLE),
+        (0x05, super::gameinput::mouse::MOUSE_BUTTON4),
+        (0x06, super::gameinput::mouse::MOUSE_BUTTON5),
+    ];
+    // SAFETY: `GetAsyncKeyState` for standard mouse VKs.
+    out.buttons = BTNS
+        .iter()
+        .filter(|(vk, _)| unsafe { GetAsyncKeyState(*vk) } as u16 & 0x8000 != 0)
+        .fold(0, |b, (_, bit)| b | bit);
+    true
 }
 
 #[cfg(test)]

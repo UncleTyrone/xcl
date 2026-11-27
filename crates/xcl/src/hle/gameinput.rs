@@ -2,20 +2,24 @@
 //!
 //! The title gets the console's GameInput interfaces (the public GameInput.h of the GDK, v0:
 //! IGameInput, IGameInputDevice, IGameInputReading as COM objects with the methods in that
-//! header's order) with one device: a gamepad that is always connected. A reading is the
-//! state at the moment it is asked for – the PC's first XInput controller (else a PlayStation
-//! controller, `playstation`), and the keyboard
-//! while a window of this process has the focus (Enter / Space A, Escape / Backspace B,
+//! header's order) with a gamepad and a mouse device, both always connected. Readings sample
+//! the PC's first XInput controller (or a PlayStation controller when XInput is absent) and
+//! the keyboard while a window of this process has the focus (Enter / Space A, Escape / Backspace B,
 //! arrows the D-pad, Tab View, P Menu). Windows' own GameInput.dll is not used: its
 //! interfaces are not the console's and it reads only for a foreground app of its own.
 //! Device callbacks report the gamepad (at once for a blocking enumeration, from another
-//! thread for an asynchronous one); reading callbacks get a reading when the state changes
-//! (polled at 250 Hz). Methods not listed log their slot once and fail.
+//! thread for an asynchronous one). One poller samples the gamepad about every 4 ms.
+//! State changes enter a half-second history and reach the reading callbacks.
+//! Methods not listed log their slot once and fail.
 //!
 //! `XCL_PRESS_A_AT=s1,s2…`: press A for 200 ms at those seconds after start (tests).
 
 #![allow(non_snake_case)]
 
+#[path = "gameinput_mouse.rs"]
+pub mod mouse;
+
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -28,6 +32,7 @@ use crate::util::{E_NOINTERFACE, E_NOTIMPL, E_POINTER, HRESULT, S_OK};
 
 const GAMEINPUT_E_DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
 const GAMEINPUT_E_READING_NOT_FOUND: HRESULT = 0x838A_0003_u32 as i32;
+const GAMEINPUT_E_REFERENCE_READING_TOO_OLD: HRESULT = 0x838A_0004_u32 as i32;
 
 // Verified GameInput v0 interface GUIDs (Windows SDK / GDK `GameInput.h`).
 const IID_IUNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_c000_000000000046);
@@ -40,6 +45,7 @@ const KIND_CONTROLLER: u32 = 0xE;
 const KIND_GAMEPAD: u32 = 0x4_0000;
 const KIND_UI_NAVIGATION: u32 = 0x100_0000;
 const KINDS: u32 = KIND_CONTROLLER | KIND_GAMEPAD | KIND_UI_NAVIGATION;
+const KIND_MOUSE: u32 = mouse::KIND_MOUSE;
 // GameInputDeviceStatus: connected, input enabled, output enabled, synchronized
 const STATUS: u32 = 0x1 | 0x2 | 0x4 | 0x40;
 // GameInputEnumerationKind
@@ -345,7 +351,9 @@ unsafe impl Send for Object {}
 struct Reading {
     vtable: *const usize,
     refs: AtomicU32,
-    state: GamepadState,
+    kind: u32,
+    gamepad: GamepadState,
+    mouse: mouse::MouseState,
     sequence: u64,
     timestamp: u64,
 }
@@ -417,29 +425,62 @@ fn vtable(name: &str, n: usize, set: &[(usize, usize)]) -> *const usize {
     Box::leak(v.into_boxed_slice()).as_ptr()
 }
 
+fn mouse_device_info() -> &'static DeviceInfo {
+    static I: OnceLock<Box<DeviceInfo>> = OnceLock::new();
+    I.get_or_init(|| {
+        Box::new(DeviceInfo {
+            size: std::mem::size_of::<DeviceInfo>() as u32,
+            vendor: 0x046D,
+            product: 0xC077,
+            revision: 1,
+            interface: 0,
+            collection: 0,
+            usage_page: 1,
+            usage_id: 2,
+            hardware_version: [1, 0, 0, 0],
+            firmware_version: [1, 0, 0, 0],
+            device_id: mouse::MOUSE_DEVICE_ID_BYTES,
+            root_id: mouse::MOUSE_DEVICE_ID_BYTES,
+            // GameInputFamilyHid
+            family: 3,
+            capabilities: 0,
+            supported_input: KIND_MOUSE,
+            rumble_motors: 0,
+            rest: [0; 896],
+        })
+    })
+}
+
 fn device() -> *mut Object {
     static D: OnceLock<usize> = OnceLock::new();
-    *D.get_or_init(|| {
-        let v = vtable(
-            "IGameInputDevice",
-            24,
-            &[
-                (0, device_qi as usize),
-                (1, add_ref as usize),
-                (2, release as usize),
-                (3, get_device_info as usize),
-                (4, get_device_status as usize),
-                (5, get_battery_state as usize),
-                (7, motor_powered_on as usize),
-                (8, nothing_u32_f32 as usize),
-                (10, set_rumble_state as usize),
-                (11, nothing_u32 as usize),
-                (12, nothing as usize),
-                (13, nothing as usize),
-            ],
-        );
-        Box::leak(Box::new(Object { vtable: v })) as *mut Object as usize
-    }) as *mut Object
+    *D.get_or_init(|| leak_device_vtable()) as *mut Object
+}
+
+fn mouse_device() -> *mut Object {
+    static D: OnceLock<usize> = OnceLock::new();
+    *D.get_or_init(|| leak_device_vtable()) as *mut Object
+}
+
+fn leak_device_vtable() -> usize {
+    let v = vtable(
+        "IGameInputDevice",
+        24,
+        &[
+            (0, device_qi as usize),
+            (1, add_ref as usize),
+            (2, release as usize),
+            (3, get_device_info as usize),
+            (4, get_device_status as usize),
+            (5, get_battery_state as usize),
+            (7, motor_powered_on as usize),
+            (8, nothing_u32_f32 as usize),
+            (10, set_rumble_state as usize),
+            (11, nothing_u32 as usize),
+            (12, nothing as usize),
+            (13, nothing as usize),
+        ],
+    );
+    Box::leak(Box::new(Object { vtable: v })) as *mut Object as usize
 }
 
 fn input() -> *mut Object {
@@ -454,8 +495,8 @@ fn input() -> *mut Object {
                 (2, release as usize),
                 (3, get_current_timestamp as usize),
                 (4, get_current_reading as usize),
-                (5, other_reading as usize),
-                (6, other_reading as usize),
+                (5, other_reading::<true> as usize),
+                (6, other_reading::<false> as usize),
                 (7, get_temporal_reading as usize),
                 (8, register_reading_callback as usize),
                 (9, register_device_callback as usize),
@@ -504,19 +545,149 @@ fn reading_vtable() -> *const usize {
         for (i, f) in [8, 9, 10, 11, 12, 13, 14, 15, 17, 18].into_iter().zip(counts) {
             set.push((i, f));
         }
-        // mouse, motion, arcade / flight stick, racing wheel: not this device
-        let states: [usize; 5] = [no_state::<16> as usize, no_state::<19> as usize, no_state::<20> as usize, no_state::<21> as usize, no_state::<23> as usize];
-        for (i, f) in [16, 19, 20, 21, 23].into_iter().zip(states) {
+        set.push((16, reading_mouse as usize));
+        // motion, arcade / flight stick, racing wheel: not this device
+        let states: [usize; 4] = [no_state::<19> as usize, no_state::<20> as usize, no_state::<21> as usize, no_state::<23> as usize];
+        for (i, f) in [19, 20, 21, 23].into_iter().zip(states) {
             set.push((i, f));
         }
         vtable("IGameInputReading", 32, &set) as usize
     }) as *const usize
 }
 
-static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// One owned COM reference, held by the history or a callback dispatch.
+struct OwnedReading(*mut Reading);
 
-fn new_reading(state: GamepadState) -> *mut Reading {
-    Box::into_raw(Box::new(Reading { vtable: reading_vtable(), refs: AtomicU32::new(1), state, sequence: SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1, timestamp: now_us() }))
+// SAFETY: a reading is immutable except for its atomic reference count. Its
+// vtable has process lifetime, and this owner keeps the allocation alive.
+unsafe impl Send for OwnedReading {}
+
+impl OwnedReading {
+    fn new_gamepad(state: GamepadState, sequence: u64, timestamp: u64) -> Self {
+        Self(Box::into_raw(Box::new(Reading {
+            vtable: reading_vtable(),
+            refs: AtomicU32::new(1),
+            kind: KINDS,
+            gamepad: state,
+            mouse: mouse::MouseState::default(),
+            sequence,
+            timestamp,
+        })))
+    }
+
+    fn new_mouse(state: mouse::MouseState, sequence: u64, timestamp: u64) -> Self {
+        Self(Box::into_raw(Box::new(Reading {
+            vtable: reading_vtable(),
+            refs: AtomicU32::new(1),
+            kind: KIND_MOUSE,
+            gamepad: GamepadState::default(),
+            mouse: state,
+            sequence,
+            timestamp,
+        })))
+    }
+
+    fn reading(&self) -> &Reading {
+        // SAFETY: this owner holds a reference for at least the lifetime of the borrow.
+        unsafe { &*self.0 }
+    }
+
+    fn into_raw(self) -> *mut Reading {
+        let ptr = self.0;
+        std::mem::forget(self);
+        ptr
+    }
+}
+
+impl Clone for OwnedReading {
+    fn clone(&self) -> Self {
+        // SAFETY: self owns a reference.
+        unsafe { reading_add_ref(self.0) };
+        Self(self.0)
+    }
+}
+
+impl Drop for OwnedReading {
+    fn drop(&mut self) {
+        // SAFETY: release the reference owned by self.
+        unsafe { reading_release(self.0) };
+    }
+}
+
+const POLL_INTERVAL_MS: u64 = 4;
+const HISTORY_US: u64 = 500_000;
+const HISTORY_CAPACITY: usize = (HISTORY_US / (POLL_INTERVAL_MS * 1000)) as usize + 1;
+
+struct ReadingHistory {
+    readings: VecDeque<OwnedReading>,
+    /// A title can still use the reading preceding the retained window to
+    /// advance to its immediate successor after a long period of no input.
+    predecessor: Option<OwnedReading>,
+}
+
+static HISTORY: Mutex<ReadingHistory> = Mutex::new(ReadingHistory::new());
+static MOUSE_HISTORY: Mutex<ReadingHistory> = Mutex::new(ReadingHistory::new());
+static MOUSE_READING_READY: Condvar = Condvar::new();
+static READING_READY: Condvar = Condvar::new();
+
+impl ReadingHistory {
+    const fn new() -> Self {
+        Self { readings: VecDeque::new(), predecessor: None }
+    }
+
+    fn prune(&mut self, now: u64) {
+        while self.readings.len() > 1
+            && (self.readings.len() > HISTORY_CAPACITY
+                || self.readings.front().is_some_and(|r| now.saturating_sub(r.reading().timestamp) > HISTORY_US))
+        {
+            self.predecessor = self.readings.pop_front();
+        }
+    }
+
+    fn sequence(&self) -> u64 {
+        self.readings.back().map_or(0, |r| r.reading().sequence)
+    }
+
+    fn record_gamepad(&mut self, state: GamepadState, now: u64) -> bool {
+        let changed = self.readings.back().is_none_or(|r| r.reading().gamepad != state);
+        if changed {
+            let reading = OwnedReading::new_gamepad(state, self.sequence() + 1, now);
+            self.readings.push_back(reading);
+        }
+        self.prune(now);
+        changed
+    }
+
+    fn record_mouse(&mut self, state: mouse::MouseState, now: u64) -> bool {
+        let changed = self.readings.back().is_none_or(|r| r.reading().mouse != state);
+        if changed {
+            let reading = OwnedReading::new_mouse(state, self.sequence() + 1, now);
+            self.readings.push_back(reading);
+        }
+        self.prune(now);
+        changed
+    }
+
+    fn next_after(&self, sequence: u64) -> Option<OwnedReading> {
+        self.readings.iter().find(|r| r.reading().sequence > sequence).cloned()
+    }
+
+    fn adjacent<const NEXT: bool>(&mut self, reference: *mut Reading, now: u64) -> Result<OwnedReading, HRESULT> {
+        self.prune(now);
+        let Some(index) = self.readings.iter().position(|r| r.0 == reference) else {
+            if NEXT && self.predecessor.as_ref().is_some_and(|r| r.0 == reference) {
+                return self
+                    .readings
+                    .front()
+                    .filter(|r| now.saturating_sub(r.reading().timestamp) <= HISTORY_US)
+                    .cloned()
+                    .ok_or(GAMEINPUT_E_REFERENCE_READING_TOO_OLD);
+            }
+            return Err(GAMEINPUT_E_REFERENCE_READING_TOO_OLD);
+        };
+        let neighbor = if NEXT { index.checked_add(1) } else { index.checked_sub(1) };
+        neighbor.and_then(|i| self.readings.get(i)).cloned().ok_or(GAMEINPUT_E_READING_NOT_FOUND)
+    }
 }
 
 // ---- shared methods ----
@@ -572,8 +743,12 @@ unsafe extern "system" fn nothing_u32_f32(_this: *mut c_void, _a: u32, _b: f32) 
 
 // ---- IGameInputDevice ----
 
-unsafe extern "system" fn get_device_info(_this: *mut Object) -> *const DeviceInfo {
-    device_info()
+unsafe extern "system" fn get_device_info(this: *mut Object) -> *const DeviceInfo {
+    if this == mouse_device() {
+        mouse_device_info()
+    } else {
+        device_info()
+    }
 }
 unsafe extern "system" fn get_device_status(_this: *mut Object) -> u32 {
     STATUS
@@ -602,7 +777,20 @@ unsafe extern "system" fn get_current_timestamp(_this: *mut Object) -> u64 {
 }
 
 fn ours(device: *mut c_void) -> bool {
-    device.is_null() || device == self::device() as *mut c_void
+    device.is_null() || device == self::device() as *mut c_void || device == mouse_device() as *mut c_void
+}
+
+fn ours_for_kind(dev: *mut c_void, kind: u32) -> bool {
+    if dev.is_null() {
+        return true;
+    }
+    if kind & KIND_MOUSE != 0 && dev == mouse_device() as *mut c_void {
+        return true;
+    }
+    if kind & KINDS != 0 && dev == device() as *mut c_void {
+        return true;
+    }
+    false
 }
 
 /// A GameInput query of a kind not seen before: worth a line (which input a title reads how).
@@ -620,26 +808,108 @@ fn note_query(what: &str, kind: u32) {
     }
 }
 
+fn targets_mouse(kind: u32, dev: *mut c_void) -> bool {
+    let mouse = kind & KIND_MOUSE != 0;
+    let pad = kind & KINDS != 0;
+    if mouse && !pad {
+        return ours_for_kind(dev, KIND_MOUSE);
+    }
+    if pad && !mouse {
+        return false;
+    }
+    if mouse && pad && dev == mouse_device() as *mut c_void {
+        return true;
+    }
+    false
+}
+
 unsafe extern "system" fn get_current_reading(_this: *mut Object, kind: u32, dev: *mut c_void, out: *mut *mut Reading) -> HRESULT {
     note_query("GetCurrentReading", kind);
+    let mouse = targets_mouse(kind, dev);
+    let pad = kind & KINDS != 0 && ours_for_kind(dev, KINDS) && !mouse;
+    if !mouse && !pad {
+        if out.is_null() {
+            return E_POINTER;
+        }
+        if !out.is_null() {
+            *out = std::ptr::null_mut();
+        }
+        return GAMEINPUT_E_READING_NOT_FOUND;
+    }
+    if mouse {
+        current_reading(out, || {
+            let started = start_poller();
+            let mut history = MOUSE_HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+            if !started && history.record_mouse(mouse::poll_mouse(), now_us()) {
+                MOUSE_READING_READY.notify_one();
+            }
+            history.readings.back().cloned()
+        })
+    } else {
+        current_reading(out, || {
+            let started = start_poller();
+            let mut history = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+            if !started && history.record_gamepad(poll(), now_us()) {
+                READING_READY.notify_one();
+            }
+            history.readings.back().cloned()
+        })
+    }
+}
+
+unsafe fn current_reading(out: *mut *mut Reading, latest: impl FnOnce() -> Option<OwnedReading>) -> HRESULT {
     if out.is_null() {
         return E_POINTER;
     }
     *out = std::ptr::null_mut();
-    if kind & KINDS == 0 || !ours(dev) {
+    let Some(reading) = latest() else {
         return GAMEINPUT_E_READING_NOT_FOUND;
-    }
-    *out = new_reading(poll());
+    };
+    *out = reading.into_raw();
     S_OK
 }
 
-/// the readings before and after one are not kept
-unsafe extern "system" fn other_reading(_this: *mut Object, _reference: *mut c_void, kind: u32, _dev: *mut c_void, out: *mut *mut Reading) -> HRESULT {
+unsafe extern "system" fn other_reading<const NEXT: bool>(
+    _this: *mut Object,
+    reference: *mut Reading,
+    kind: u32,
+    dev: *mut c_void,
+    out: *mut *mut Reading,
+) -> HRESULT {
     note_query("GetNext/PreviousReading", kind);
-    if !out.is_null() {
-        *out = std::ptr::null_mut();
+    let history = if targets_mouse(kind, dev) {
+        &MOUSE_HISTORY
+    } else {
+        &HISTORY
+    };
+    adjacent_reading::<NEXT>(history, reference, dev, out, now_us())
+}
+
+unsafe fn adjacent_reading<const NEXT: bool>(
+    history: &Mutex<ReadingHistory>,
+    reference: *mut Reading,
+    dev: *mut c_void,
+    out: *mut *mut Reading,
+    now: u64,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
     }
-    GAMEINPUT_E_READING_NOT_FOUND
+    *out = std::ptr::null_mut();
+    if reference.is_null() {
+        return E_POINTER;
+    }
+    if !ours(dev) && !dev.is_null() {
+        return GAMEINPUT_E_READING_NOT_FOUND;
+    }
+    let mut history = history.lock().unwrap_or_else(|e| e.into_inner());
+    match history.adjacent::<NEXT>(reference, now) {
+        Ok(reading) => {
+            *out = reading.into_raw();
+            S_OK
+        }
+        Err(hr) => hr,
+    }
 }
 
 unsafe extern "system" fn get_temporal_reading(this: *mut Object, _timestamp: u64, dev: *mut c_void, out: *mut *mut Reading) -> HRESULT {
@@ -652,7 +922,7 @@ type ReadingCallback = unsafe extern "system" fn(u64, *mut c_void, *mut Reading,
 type DeviceCallback = unsafe extern "system" fn(u64, *mut c_void, *mut Object, u64, u32, u32);
 
 enum CallbackKind {
-    Reading { ctx: usize, cb: ReadingCallback },
+    Reading { ctx: usize, cb: ReadingCallback, after_sequence: u64 },
     Device,
 }
 
@@ -761,15 +1031,30 @@ unsafe extern "system" fn register_reading_callback(_this: *mut Object, dev: *mu
     if !token.is_null() {
         *token = t;
     }
-    if let Some(cb) = cb.filter(|_| kind & KINDS != 0 && ours(dev)) {
-        let entry = Arc::new(CallbackEntry::new(t, CallbackKind::Reading { ctx: context as usize, cb }));
-        CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
+    let mouse = targets_mouse(kind, dev);
+    let pad = kind & KINDS != 0 && ours_for_kind(dev, KINDS) && !mouse;
+    if let Some(cb) = cb.filter(|_| pad || mouse) {
         start_poller();
+        let after_sequence = if mouse {
+            MOUSE_HISTORY.lock().unwrap_or_else(|e| e.into_inner()).sequence()
+        } else {
+            HISTORY.lock().unwrap_or_else(|e| e.into_inner()).sequence()
+        };
+        track_reading_callback(t, context, cb, after_sequence);
+        if pad {
+            start_reading_dispatcher(after_sequence);
+        }
     }
     S_OK
 }
 
-fn dispatch_reading_callbacks(s: GamepadState) {
+fn track_reading_callback(token: u64, context: *mut c_void, cb: ReadingCallback, after_sequence: u64) {
+    let entry = Arc::new(CallbackEntry::new(token, CallbackKind::Reading { ctx: context as usize, cb, after_sequence }));
+    CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
+}
+
+fn dispatch_reading_callbacks(reading: &OwnedReading, previous: u64) {
+    let sequence = reading.reading().sequence;
     let cbs: Vec<Arc<CallbackEntry>> = CALLBACKS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -778,36 +1063,79 @@ fn dispatch_reading_callbacks(s: GamepadState) {
         .cloned()
         .collect();
     for entry in cbs {
-        let CallbackKind::Reading { ctx, cb } = entry.kind else { continue };
-        let Some(_guard) = entry.try_enter() else { continue };
-        let r = new_reading(s);
-        // SAFETY: `cb` and `ctx` were registered by the caller; `_guard` keeps
-        // `UnregisterCallback` blocked until `cb` returns so `ctx` stays valid.
-        unsafe {
-            cb(entry.token, ctx as *mut c_void, r, false);
-            reading_release(r);
+        let CallbackKind::Reading { ctx, cb, after_sequence } = entry.kind else { continue };
+        if sequence <= after_sequence {
+            continue;
         }
+        let Some(_guard) = entry.try_enter() else { continue };
+        let overrun = sequence - previous.max(after_sequence) > 1;
+        // SAFETY: `cb` and `ctx` were registered by the caller; `_guard` keeps
+        // `UnregisterCallback` blocked until `cb` returns, and reading is borrowed
+        // from a live owner throughout the call.
+        unsafe { cb(entry.token, ctx as *mut c_void, reading.0, overrun) };
     }
 }
 
-/// A thread that calls the reading callbacks when the gamepad's state changes.
-fn start_poller() {
+/// Deliver callbacks in order on a different thread so guest code cannot
+/// stall sampling. If the worker falls behind, resume at the oldest retained
+/// reading and report the skipped readings through the v0 overrun flag.
+fn start_reading_dispatcher(after_sequence: u64) {
     static STARTED: OnceLock<()> = OnceLock::new();
     STARTED.get_or_init(|| {
-        let _ = std::thread::Builder::new().name("xcl-gameinput".into()).spawn(|| {
+        let worker = std::thread::Builder::new().name("xcl-gameinput-callback".into()).spawn(move || {
             crate::eh::arm_current_thread();
-            let mut last = GamepadState::default();
+            let mut previous = after_sequence;
             loop {
-                std::thread::sleep(Duration::from_millis(4));
-                let s = poll();
-                if s == last {
-                    continue;
+                let reading = {
+                    let history = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut history = READING_READY
+                        .wait_while(history, |history| history.sequence() <= previous)
+                        .unwrap_or_else(|e| e.into_inner());
+                    history.prune(now_us());
+                    history.next_after(previous)
+                };
+                if let Some(reading) = reading {
+                    dispatch_reading_callbacks(&reading, previous);
+                    previous = reading.reading().sequence;
                 }
-                last = s;
-                dispatch_reading_callbacks(s);
             }
         });
+        if let Err(e) = worker {
+            crate::xlog_warn!("GameInput: could not start reading callback worker: {e}");
+        }
     });
+}
+
+/// One sampler for current, historical and callback reads. In particular,
+/// sampling consumes mouse deltas, so the query and worker must not both poll.
+fn start_poller() -> bool {
+    static STARTED: OnceLock<bool> = OnceLock::new();
+    *STARTED.get_or_init(|| {
+        // Seed before starting the worker or returning the first current reading.
+        let now = now_us();
+        HISTORY.lock().unwrap_or_else(|e| e.into_inner()).record_gamepad(poll(), now);
+        MOUSE_HISTORY.lock().unwrap_or_else(|e| e.into_inner()).record_mouse(mouse::poll_mouse(), now);
+        let worker = std::thread::Builder::new().name("xcl-gameinput".into()).spawn(|| {
+            crate::eh::arm_current_thread();
+            loop {
+                std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+                let now = now_us();
+                let state = poll();
+                let mouse = mouse::poll_mouse();
+                if HISTORY.lock().unwrap_or_else(|e| e.into_inner()).record_gamepad(state, now) {
+                    READING_READY.notify_one();
+                }
+                if MOUSE_HISTORY.lock().unwrap_or_else(|e| e.into_inner()).record_mouse(mouse, now) {
+                    MOUSE_READING_READY.notify_one();
+                }
+            }
+        });
+        if let Err(e) = worker {
+            crate::xlog_warn!("GameInput: could not start reading poller: {e}");
+            return false;
+        }
+        true
+    })
 }
 
 /// RegisterDeviceCallback(device, kind, status filter, enumeration kind, context, callback,
@@ -819,24 +1147,41 @@ unsafe extern "system" fn register_device_callback(_this: *mut Object, dev: *mut
         *token = t;
     }
     crate::xlog_info!("GameInput: device callback for kinds {kind:#x} (enumeration {enumeration})");
-    let Some(cb) = cb.filter(|_| kind & KINDS != 0 && ours(dev) && enumeration != 0) else { return S_OK };
-    if enumeration == ENUM_BLOCKING {
-        cb(t, context, device(), now_us(), STATUS, 0);
-    } else {
-        let entry = Arc::new(CallbackEntry::new(t, CallbackKind::Device));
-        CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&entry));
-        let ctx = context as usize;
-        let spawned = std::thread::Builder::new().name("xcl-gameinput-enum".into()).spawn(move || {
-            crate::eh::arm_current_thread();
-            if let Some(_guard) = entry.try_enter() {
-                // SAFETY: `cb` and `ctx` were registered by the caller; `_guard` keeps
-                // `UnregisterCallback` blocked until `cb` returns so `ctx` stays valid.
-                unsafe { cb(t, ctx as *mut c_void, device(), now_us(), STATUS, 0) };
+    let Some(cb) = cb else { return S_OK };
+    if enumeration == 0 {
+        return S_OK;
+    }
+    let mut devices: Vec<*mut Object> = Vec::new();
+    if kind & KINDS != 0 && ours_for_kind(dev, KINDS) {
+        devices.push(device());
+    }
+    if kind & KIND_MOUSE != 0 && ours_for_kind(dev, KIND_MOUSE) {
+        devices.push(mouse_device());
+    }
+    if devices.is_empty() {
+        return S_OK;
+    }
+    for d in devices {
+        let dev = d as usize;
+        if enumeration == ENUM_BLOCKING {
+            // SAFETY: caller-registered callback.
+            unsafe { cb(t, context, dev as *mut Object, now_us(), STATUS, 0) };
+        } else {
+            let entry = Arc::new(CallbackEntry::new(t, CallbackKind::Device));
+            CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&entry));
+            let ctx = context as usize;
+            let spawned = std::thread::Builder::new().name("xcl-gameinput-enum".into()).spawn(move || {
+                crate::eh::arm_current_thread();
+                if let Some(_guard) = entry.try_enter() {
+                    // SAFETY: `cb` and `ctx` were registered by the caller; `_guard` keeps
+                    // `UnregisterCallback` blocked until `cb` returns so `ctx` stays valid.
+                    unsafe { cb(t, ctx as *mut c_void, dev as *mut Object, now_us(), STATUS, 0) };
+                }
+                CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.token != t);
+            });
+            if spawned.is_err() {
+                CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.token != t);
             }
-            CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.token != t);
-        });
-        if spawned.is_err() {
-            CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.token != t);
         }
     }
     S_OK
@@ -885,9 +1230,15 @@ unsafe extern "system" fn find_device_from_id(_this: *mut Object, id: *const [u8
     if out.is_null() {
         return E_POINTER;
     }
-    if !id.is_null() && *id == DEVICE_ID {
-        *out = device();
-        return S_OK;
+    if !id.is_null() {
+        if *id == DEVICE_ID {
+            *out = device();
+            return S_OK;
+        }
+        if *id == mouse::MOUSE_DEVICE_ID_BYTES {
+            *out = mouse_device();
+            return S_OK;
+        }
     }
     *out = std::ptr::null_mut();
     GAMEINPUT_E_DEVICE_NOT_FOUND
@@ -916,8 +1267,8 @@ unsafe extern "system" fn reading_release(this: *mut Reading) -> u32 {
     }
     left
 }
-unsafe extern "system" fn reading_kind(_this: *mut Reading) -> u32 {
-    KINDS
+unsafe extern "system" fn reading_kind(this: *mut Reading) -> u32 {
+    (*this).kind
 }
 unsafe extern "system" fn reading_sequence(this: *mut Reading, _kind: u32) -> u64 {
     (*this).sequence
@@ -925,9 +1276,13 @@ unsafe extern "system" fn reading_sequence(this: *mut Reading, _kind: u32) -> u6
 unsafe extern "system" fn reading_timestamp(this: *mut Reading) -> u64 {
     (*this).timestamp
 }
-unsafe extern "system" fn reading_device(_this: *mut Reading, out: *mut *mut Object) {
+unsafe extern "system" fn reading_device(this: *mut Reading, out: *mut *mut Object) {
     if !out.is_null() {
-        *out = device();
+        *out = if (*this).kind & KIND_MOUSE != 0 {
+            mouse_device()
+        } else {
+            device()
+        };
     }
 }
 /// IGameInputReading method names by slot (the logged ones)
@@ -969,10 +1324,17 @@ unsafe extern "system" fn no_state<const SLOT: usize>(_this: *mut Reading, _out:
     false
 }
 unsafe extern "system" fn reading_gamepad(this: *mut Reading, out: *mut GamepadState) -> bool {
-    if out.is_null() {
+    if out.is_null() || (*this).kind & KINDS == 0 {
         return false;
     }
-    *out = (*this).state;
+    *out = (*this).gamepad;
+    true
+}
+unsafe extern "system" fn reading_mouse(this: *mut Reading, out: *mut mouse::MouseState) -> bool {
+    if out.is_null() || (*this).kind & KIND_MOUSE == 0 {
+        return false;
+    }
+    *out = (*this).mouse;
     true
 }
 /// GameInputUiNavigationState {buttons}
@@ -980,7 +1342,7 @@ unsafe extern "system" fn reading_ui_navigation(this: *mut Reading, out: *mut u3
     if out.is_null() {
         return false;
     }
-    *out = ui_navigation((*this).state.buttons);
+    *out = ui_navigation((*this).gamepad.buttons);
     true
 }
 
@@ -991,7 +1353,7 @@ pub unsafe extern "system" fn GameInputCreate(out: *mut *mut c_void) -> HRESULT 
     }
     start();
     *out = input() as *mut c_void;
-    crate::xlog_info!("GameInput: GameInputCreate – one gamepad (XInput controller / keyboard)");
+    crate::xlog_info!("GameInput: GameInputCreate – gamepad (XInput / keyboard) and mouse");
     S_OK
 }
 
@@ -1004,6 +1366,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mouse_state_matches_gdk_layout() {
+        assert_eq!(std::mem::size_of::<mouse::MouseState>(), 40);
+    }
+
+    #[test]
     fn xinput_buttons_map_to_gameinput() {
         // A + B + D-pad up + start
         assert_eq!(buttons_from_xinput(0x1000 | 0x2000 | 0x0001 | 0x0010), A | B | DPAD_UP | MENU);
@@ -1014,18 +1381,125 @@ mod tests {
     #[test]
     fn readings_come_and_go() {
         unsafe {
-            let g = input();
+            let reading = OwnedReading::new_gamepad(GamepadState { buttons: A, ..Default::default() }, 1, 1);
             let mut r = std::ptr::null_mut();
-            assert_eq!(get_current_reading(g, KIND_GAMEPAD, std::ptr::null_mut(), &mut r), S_OK);
-            let mut s = GamepadState { buttons: 99, ..Default::default() };
+            assert_eq!(current_reading(&mut r, || Some(reading.clone())), S_OK);
+            assert_eq!(r, reading.0);
+            let mut s = GamepadState::default();
             assert!(reading_gamepad(r, &mut s));
-            assert_ne!(s.buttons, 99);
+            assert_eq!(s.buttons, A);
             let mut d = std::ptr::null_mut();
             reading_device(r, &mut d);
             assert_eq!(d, device());
-            assert_eq!(reading_release(r), 0);
-            assert_eq!(get_current_reading(g, 0x10, std::ptr::null_mut(), &mut r), GAMEINPUT_E_READING_NOT_FOUND, "keyboard kind");
+            assert_eq!(reading_release(r), 1);
+            assert_eq!(current_reading(&mut r, || None), GAMEINPUT_E_READING_NOT_FOUND);
+            assert!(r.is_null());
         }
+    }
+
+    fn record_test_reading(history: &mut ReadingHistory, buttons: u32, now: u64) -> OwnedReading {
+        assert!(history.record_gamepad(GamepadState { buttons, ..Default::default() }, now));
+        history.readings.back().unwrap().clone()
+    }
+
+    #[test]
+    fn adjacent_readings_preserve_a_tap_after_idle() {
+        let pressed_at = HISTORY_US + 2;
+        let now = pressed_at + 3;
+        let history = Mutex::new(ReadingHistory::new());
+        let (neutral, pressed, released) = {
+            let mut stream = history.lock().unwrap();
+            let neutral = record_test_reading(&mut stream, 0, 1);
+            let pressed = record_test_reading(&mut stream, A, pressed_at);
+            assert!(!stream.record_gamepad(pressed.reading().gamepad, pressed_at + 1));
+            let released = record_test_reading(&mut stream, 0, pressed_at + 2);
+            assert_eq!(stream.readings.back().unwrap().0, released.0);
+            (neutral, pressed, released)
+        };
+        // Use the same out-pointer and filtering path as the IGameInput vtable.
+        let mut out = std::ptr::null_mut();
+        unsafe {
+            let any_device = std::ptr::null_mut();
+            assert_eq!(adjacent_reading::<true>(&history, neutral.0, any_device, &mut out, now), S_OK);
+            assert_eq!(out, pressed.0);
+            let mut state = GamepadState::default();
+            assert!(reading_gamepad(out, &mut state));
+            assert_eq!(state.buttons, A);
+            assert_eq!(reading_timestamp(out), pressed_at);
+            assert!(reading_sequence(out, KIND_GAMEPAD) > reading_sequence(neutral.0, KIND_GAMEPAD));
+            reading_release(out);
+
+            assert_eq!(adjacent_reading::<true>(&history, pressed.0, any_device, &mut out, now), S_OK);
+            assert_eq!(out, released.0);
+            assert!(reading_gamepad(out, &mut state));
+            assert_eq!(state.buttons, 0);
+            reading_release(out);
+
+            let gamepad = device().cast();
+            assert_eq!(adjacent_reading::<false>(&history, released.0, gamepad, &mut out, now), S_OK);
+            assert_eq!(out, pressed.0);
+            reading_release(out);
+
+            assert_eq!(
+                adjacent_reading::<true>(&history, released.0, gamepad, &mut out, now),
+                GAMEINPUT_E_READING_NOT_FOUND
+            );
+            assert!(out.is_null());
+        }
+    }
+
+    #[test]
+    fn adjacent_readings_check_inputs_and_keep_caller_references_alive() {
+        use std::ptr::{dangling_mut, null_mut};
+        let history = Mutex::new(ReadingHistory::new());
+        let (old, latest) = {
+            let mut stream = history.lock().unwrap();
+            let old = record_test_reading(&mut stream, A, 1);
+            let latest = record_test_reading(&mut stream, 0, HISTORY_US + 1);
+            (old, latest)
+        };
+        let mut out = dangling_mut();
+        unsafe {
+            assert_eq!(adjacent_reading::<true>(&history, old.0, null_mut(), null_mut(), 1), E_POINTER);
+            assert_eq!(adjacent_reading::<true>(&history, null_mut(), null_mut(), &mut out, 1), E_POINTER);
+            assert!(out.is_null());
+            assert_eq!(
+                adjacent_reading::<true>(&history, old.0, dangling_mut::<Object>().cast(), &mut out, 1),
+                GAMEINPUT_E_READING_NOT_FOUND
+            );
+
+            // At the retention boundary the old reading is still available.
+            assert_eq!(adjacent_reading::<false>(&history, latest.0, null_mut(), &mut out, HISTORY_US + 1), S_OK);
+            assert_eq!(out, old.0);
+            let caller_ref = out;
+            drop(old);
+            assert_eq!(
+                adjacent_reading::<false>(&history, latest.0, null_mut(), &mut out, HISTORY_US + 2),
+                GAMEINPUT_E_READING_NOT_FOUND
+            );
+            assert!(out.is_null());
+            // The predecessor cannot advance when its successor is also expired,
+            // even though that successor remains available as the current reading.
+            assert_eq!(
+                adjacent_reading::<true>(&history, caller_ref, null_mut(), &mut out, 2 * HISTORY_US + 2),
+                GAMEINPUT_E_REFERENCE_READING_TOO_OLD
+            );
+            assert!(out.is_null());
+            assert_eq!(reading_timestamp(caller_ref), 1);
+            let mut state = GamepadState::default();
+            assert!(reading_gamepad(caller_ref, &mut state));
+            assert_eq!(state.buttons, A);
+            reading_release(caller_ref);
+
+            assert_eq!(
+                adjacent_reading::<false>(&history, latest.0, null_mut(), &mut out, 3 * HISTORY_US),
+                GAMEINPUT_E_READING_NOT_FOUND
+            );
+            assert!(out.is_null());
+        }
+        let stream = history.lock().unwrap();
+        assert_eq!(stream.readings.len(), 1);
+        assert_eq!(stream.readings.back().unwrap().0, latest.0);
     }
 
     #[test]
@@ -1131,7 +1605,7 @@ mod tests {
             assert_eq!(call_qi(d, &IID_IGAMEINPUT_DEVICE, std::ptr::null_mut()), E_POINTER);
 
             // IGameInputReading (refcounted)
-            let r = new_reading(GamepadState::default());
+            let r = OwnedReading::new_gamepad(GamepadState::default(), 1, now_us()).into_raw();
             let rp = r as *mut c_void;
             out = sentinel;
             assert_eq!(call_qi(rp, &IID_IUNKNOWN, &mut out), S_OK);
@@ -1219,21 +1693,54 @@ mod tests {
 
     static READING_CB_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    // These tests drive dispatch explicitly so no host input changes can
+    // invoke their callbacks or hold up their synchronization handshake.
+    fn track_test_reading_callback(context: *mut c_void, cb: ReadingCallback) -> u64 {
+        let token = TOKENS.fetch_add(1, Ordering::Relaxed) + 1;
+        track_reading_callback(token, context, cb, 0);
+        token
+    }
+
+    fn dispatch_test_reading(buttons: u32) {
+        let reading = OwnedReading::new_gamepad(GamepadState { buttons, ..Default::default() }, 1, now_us());
+        dispatch_reading_callbacks(&reading, 0);
+    }
+
+    #[test]
+    fn callback_history_filters_old_readings_and_reports_overrun() {
+        let _serial = READING_CB_TEST_LOCK.lock().unwrap();
+        unsafe extern "system" fn record_delivery(_token: u64, ctx: *mut c_void, _r: *mut Reading, overrun: bool) {
+            // SAFETY: the test keeps this counter alive until unregistering.
+            unsafe { &*ctx.cast::<AtomicU32>() }.store(if overrun { 2 } else { 1 }, Ordering::Relaxed);
+        }
+        let mut history = ReadingHistory::new();
+        let initial = record_test_reading(&mut history, 0, 1);
+        let sequence = history.sequence();
+        let delivered = AtomicU32::new(0);
+        let token = TOKENS.fetch_add(1, Ordering::Relaxed) + 1;
+        track_reading_callback(token, (&raw const delivered).cast_mut().cast(), record_delivery, sequence);
+        dispatch_reading_callbacks(&initial, 0);
+        let delivered_before = delivered.load(Ordering::Relaxed);
+
+        history.record_gamepad(GamepadState { buttons: A, ..Default::default() }, 2);
+        let latest = record_test_reading(&mut history, 0, HISTORY_US + 3);
+        let recovered = history.next_after(sequence).unwrap();
+        dispatch_reading_callbacks(&recovered, sequence);
+        assert!(unsafe { unregister_callback(input(), token, 0) });
+        assert_eq!(delivered_before, 0, "pre-registration readings aren't dispatched");
+        assert_eq!(recovered.0, latest.0);
+        assert_eq!(delivered.load(Ordering::Relaxed), 2, "expired unread readings set overrun");
+    }
+
     #[test]
     fn unregister_reading_callback_waits_for_in_flight_and_prevents_uaf() {
         let _serial = READING_CB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let gate = Arc::new(CallbackGate::new());
         let g = input();
-        let mut token = 0u64;
-        unsafe {
-            assert_eq!(
-                register_reading_callback(g, std::ptr::null_mut(), KIND_GAMEPAD, 0.0, Arc::as_ptr(&gate) as *mut c_void, Some(gated_reading_cb), &mut token),
-                S_OK
-            );
-        }
+        let token = track_test_reading_callback(Arc::as_ptr(&gate) as *mut c_void, gated_reading_cb);
 
         let dispatch_thread = std::thread::spawn(|| {
-            dispatch_reading_callbacks(GamepadState { buttons: A, ..Default::default() });
+            dispatch_test_reading(A);
         });
         gate.wait_entered();
 
@@ -1259,7 +1766,7 @@ mod tests {
 
         // Subsequent dispatches must never invoke the unregistered callback again.
         let calls_before = gate.calls.load(Ordering::Acquire);
-        dispatch_reading_callbacks(GamepadState { buttons: B, ..Default::default() });
+        dispatch_test_reading(B);
         assert_eq!(gate.calls.load(Ordering::Acquire), calls_before);
     }
 
@@ -1268,16 +1775,10 @@ mod tests {
         let _serial = READING_CB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let gate = Arc::new(CallbackGate::new());
         let g = input();
-        let mut token = 0u64;
-        unsafe {
-            assert_eq!(
-                register_reading_callback(g, std::ptr::null_mut(), KIND_GAMEPAD, 0.0, Arc::as_ptr(&gate) as *mut c_void, Some(gated_reading_cb), &mut token),
-                S_OK
-            );
-        }
+        let token = track_test_reading_callback(Arc::as_ptr(&gate) as *mut c_void, gated_reading_cb);
 
         let dispatch_thread = std::thread::spawn(|| {
-            dispatch_reading_callbacks(GamepadState { buttons: X, ..Default::default() });
+            dispatch_test_reading(X);
         });
         gate.wait_entered();
 
@@ -1316,21 +1817,13 @@ mod tests {
             calls: AtomicU32::new(0),
             unreg_ok: std::sync::atomic::AtomicBool::new(false),
         });
-        let g = input();
-        let mut token = 0u64;
-        unsafe {
-            assert_eq!(
-                register_reading_callback(g, std::ptr::null_mut(), KIND_GAMEPAD, 0.0, &*ctx as *const SelfCtx as *mut c_void, Some(self_unreg_cb), &mut token),
-                S_OK
-            );
-        }
-
-        dispatch_reading_callbacks(GamepadState { buttons: Y, ..Default::default() });
+        track_test_reading_callback(&*ctx as *const SelfCtx as *mut c_void, self_unreg_cb);
+        dispatch_test_reading(Y);
         assert_eq!(ctx.calls.load(Ordering::Acquire), 1);
         assert!(ctx.unreg_ok.load(Ordering::Acquire));
 
         // Must not fire again after self-unregister.
-        dispatch_reading_callbacks(GamepadState { buttons: MENU, ..Default::default() });
+        dispatch_test_reading(MENU);
         assert_eq!(ctx.calls.load(Ordering::Acquire), 1);
     }
 
