@@ -188,6 +188,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::report::write_final(None);
     let code = crate::loader::run_main(&main);
     crate::xlog_info!("game entry point returned code {code}");
+    crate::hle::d3d12x::real::flush_pipeline_library();
     crate::report::write_final(None);
     crate::log::flush();
     code as i32

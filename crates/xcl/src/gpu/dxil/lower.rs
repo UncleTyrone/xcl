@@ -212,6 +212,8 @@ pub struct Lw {
     pub static_srsrc: std::collections::BTreeMap<u64, [u32; 4]>,
     /// Access PC → per-lane heap index ([`recomp::desc_trace`], CGBJ `lane_heap_index` analogue).
     pub lane_heap: std::collections::BTreeMap<u64, crate::gpu::recomp::desc_trace::LaneHeapExpr>,
+    /// Access PC → VGPR for each of T# dwords 0..3 when waterfall proves them.
+    pub lane_tsharp: std::collections::BTreeMap<u64, [Option<u64>; 4]>,
     /// the program writes a non-default MODE[3:2] and has f16 rounding ops (no f64 ones):
     /// f16 results round in software under `VAR_FP16_RM` (the recompiler's `dynamic_f16_rm`)
     pub dyn_rm: bool,
@@ -677,18 +679,26 @@ impl Lw {
     }
 
     /// SRSRC dwords for a memory instruction: immediates when [`Self::static_srsrc`] has `pc`.
-    /// When [`Self::lane_heap`] proves a waterfall / Fetched origin, dword0 is each lane's own
-    /// heap index (CGBJ `lane_heap_index` analogue).
+    /// When [`Self::lane_heap`] proves a waterfall / Fetched / SCC Select origin, dword0 is the
+    /// heap index (CGBJ `lane_heap_index` analogue). Dwords 1..3 use waterfall VGPRs when
+    /// [`Self::lane_tsharp`] proves them.
     pub fn buffer_srsrc_words(&mut self, pc: u64, base: u64) -> [Value; 4] {
         if let Some(w) = self.static_srsrc.get(&pc).copied() {
             return [self.c(w[0]), self.c(w[1]), self.c(w[2]), self.c(w[3])];
         }
         let lane0 = self.lane_heap.get(&pc).cloned().map(|e| self.lane_heap_index(&e));
+        let ts = self.lane_tsharp.get(&pc).copied();
+        let word = |s: &mut Self, k: usize, fallback: u64| {
+            ts.and_then(|t| t[k])
+                .map(|v| s.vreg(v))
+                .unwrap_or_else(|| s.sreg(fallback))
+        };
         [
-            lane0.unwrap_or_else(|| self.sreg(base)),
-            self.sreg(base + 1),
-            self.sreg(base + 2),
-            self.sreg(base + 3),
+            lane0
+                .unwrap_or_else(|| ts.and_then(|t| t[0]).map(|v| self.vreg(v)).unwrap_or_else(|| self.sreg(base))),
+            word(self, 1, base + 1),
+            word(self, 2, base + 2),
+            word(self, 3, base + 3),
         ]
     }
 
@@ -721,6 +731,12 @@ impl Lw {
                 let one = self.c(1);
                 let bit = self.and(bit, one);
                 let cond = self.nz(bit);
+                let s = self.lane_heap_index(set);
+                let c = self.lane_heap_index(clear);
+                self.sel(cond, s, c)
+            }
+            E::Select { set, clear } => {
+                let cond = self.scc_bit();
                 let s = self.lane_heap_index(set);
                 let c = self.lane_heap_index(clear);
                 self.sel(cond, s, c)

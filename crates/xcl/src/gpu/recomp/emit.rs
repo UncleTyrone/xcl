@@ -59,9 +59,11 @@ pub(super) struct Em {
     pub static_ss: BTreeMap<u64, [u32; 4]>,
     /// Memory instruction address → SRSRC words when built from constants ([`constant_srsrc`])
     pub static_sr: BTreeMap<u64, [u32; 4]>,
-    /// Access PC → per-lane heap index when [`super::desc_trace`] proves a waterfall / Fetched
-    /// descriptor (CGBJ `lane_heap_index` analogue).
+    /// Access PC → per-lane heap index when [`super::desc_trace`] proves a waterfall / Fetched /
+    /// SCC Select descriptor (CGBJ `lane_heap_index` analogue).
     pub lane_heap: BTreeMap<u64, super::desc_trace::LaneHeapExpr>,
+    /// Access PC → VGPR for each of T# dwords 0..3 when waterfall readfirstlanes prove them.
+    pub lane_tsharp: BTreeMap<u64, [Option<u64>; 4]>,
     /// the static samplers sampled with: (S#, comparison), in register order
     pub static_used: Vec<([u32; 4], bool)>,
     /// highest VGPR the program references (v_movrel* ranges)
@@ -624,6 +626,7 @@ impl Em {
             static_ss: BTreeMap::new(),
             static_sr: BTreeMap::new(),
             lane_heap: BTreeMap::new(),
+            lane_tsharp: BTreeMap::new(),
             static_used: Vec::new(),
             max_vgpr: 0,
             has_f16_round_op: false,
@@ -794,7 +797,7 @@ impl Em {
                 format!("{}u", w[3]),
             );
         }
-        // Waterfall / Fetched: dword0 is each lane's own heap index (lane_heap_index analogue).
+        // Waterfall / Fetched / SCC Select: dword0 is each lane's (or SCC-selected) heap index.
         let lane_tw0 = self.lane_heap.get(&pc).cloned().map(|expr| {
             let mut sfn = |c: u64| {
                 self.sgprs.insert(c);
@@ -806,20 +809,17 @@ impl Em {
             };
             super::desc_trace::lane_heap_hlsl(&expr, &mut sfn, &mut vfn)
         });
-        if let Some(tw0) = lane_tw0 {
-            return (
-                tw0,
-                self.sreg(srsrc + 1),
-                self.sreg(srsrc + 2),
-                self.sreg(srsrc + 3),
-            );
-        }
-        (
-            self.sreg(srsrc),
-            self.sreg(srsrc + 1),
-            self.sreg(srsrc + 2),
-            self.sreg(srsrc + 3),
-        )
+        // Per-lane T# dwords 1..3 from waterfall VGPRs (CGBJ keeps the whole descriptor per lane).
+        let lane_word = |s: &mut Self, k: usize| -> Option<String> {
+            s.lane_tsharp.get(&pc).and_then(|ts| ts[k]).map(|v| s.vreg(v))
+        };
+        let tw0 = lane_tw0
+            .or_else(|| lane_word(self, 0))
+            .unwrap_or_else(|| self.sreg(srsrc));
+        let tw1 = lane_word(self, 1).unwrap_or_else(|| self.sreg(srsrc + 1));
+        let tw2 = lane_word(self, 2).unwrap_or_else(|| self.sreg(srsrc + 2));
+        let tw3 = lane_word(self, 3).unwrap_or_else(|| self.sreg(srsrc + 3));
+        (tw0, tw1, tw2, tw3)
     }
 
     fn vreg(&mut self, n: u64) -> String {

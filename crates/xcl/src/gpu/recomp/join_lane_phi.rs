@@ -11,11 +11,12 @@
 //! - Dead edges do **not** seed join state (CGBJ `None` on unused edges)
 //! - [`live_peel_known`]: nested sole-live peel at record time (Tracer `live` analogue)
 //! - SGPR copies / same-arm `s_cselect` / const SALU followed through blocks
-//! - Exec/lane polarity + optional [`lane_masks`] BDD join-edge liveness (meet subset)
+//! - Exec/lane polarity + [`lane_masks`] BDD join-edge liveness + Structured `guarded` PCs
+//! - Differing-arm SCC `Select` lives in [`super::desc_trace`] (emit `select(scc,…)`)
+//! - Waterfall selected/remaining/retry structural meet + per-lane T# dwords 0..3 in desc_trace
 //!
-//! **Still out of scope vs full CGBJ:** Structured BDD `meet` over nested multi-block
-//! waterfalls, SCC-dependent `Source::Select` when arms differ, and full IR-level phi
-//! reconstruction (XCL uses decoded RDNA2 + structural waterfall proof instead).
+//! **Still out of scope vs full CGBJ:** nested multi-block waterfall BDD `meet` and full
+//! IR-level phi reconstruction (XCL uses decoded RDNA2 + structural waterfall proof instead).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 

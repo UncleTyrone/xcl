@@ -91,6 +91,7 @@ pub mod present;
 mod residency;
 mod session;
 pub mod pso_async;
+pub mod pso_library;
 pub mod real;
 mod shader_cache_session;
 pub(crate) mod submit;

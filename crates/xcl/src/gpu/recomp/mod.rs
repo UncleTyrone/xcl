@@ -1514,10 +1514,11 @@ pub(crate) fn join_lane_dead_pred(from: &[Decoded], join_pc: u64, join_idx: usiz
     if preds.len() >= 2 && preds.iter().any(|&p| rpo[p] >= rpo[join_idx]) {
         return false;
     }
-    // Stronger exec/lane polarity (closer to CGBJ meet, without full BDD): a predecessor that
-    // ends by branching to the join on EXECZ/VCCZ/SCC0 is a skip edge (taken only when the
-    // mask is empty). Fall-through after EXECNZ/VCCNZ/SCC1 to the join is similarly dead when
-    // the taken target is elsewhere and the branch is a "mask non-empty → elsewhere" form.
+    // Stronger exec/lane polarity (CGBJ Structured meet subset): a predecessor that ends by
+    // branching to the join on EXECZ/VCCZ/SCC0 is a skip edge (taken only when the mask is
+    // empty). Fall-through after EXECNZ/VCCNZ/SCC1 to the join is similarly dead when the
+    // taken target is elsewhere. Also treat `s_and_saveexec` + `s_cbranch_execz` to the join
+    // as a dead edge (narrowed EXEC empty → skip).
     if let Some(last) = from.last() {
         if let Some(t) = rdna2::branch_target(last) {
             if t == join_pc
@@ -1539,12 +1540,27 @@ pub(crate) fn join_lane_dead_pred(from: &[Decoded], join_pc: u64, join_idx: usiz
                     .first()
                     .is_some_and(|d| d.pc != join_pc)
             {
-                // Only treat as dead when this block's fall-through is the join (next PC).
                 let fall = last.pc + last.len as u64;
                 if fall == join_pc {
                     return true;
                 }
             }
+        }
+        // Guarded skip: saveexec then execz to join — the taken edge carries no live lanes
+        // that still hold the pre-narrow EXEC (Structured guard analogue).
+        if matches!(last.inst.name, "S_CBRANCH_EXECZ")
+            && rdna2::branch_target(last) == Some(join_pc)
+            && from.iter().any(|d| {
+                matches!(
+                    d.inst.name,
+                    "S_AND_SAVEEXEC_B32"
+                        | "S_AND_SAVEEXEC_B64"
+                        | "S_ANDN2_SAVEEXEC_B32"
+                        | "S_ANDN2_SAVEEXEC_B64"
+                )
+            })
+        {
+            return true;
         }
     }
     if block_sets_sgpr_constants(from) {
@@ -1832,6 +1848,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     em.static_sr = constant_srsrc(&insts, &leaders, follow_sgpr);
     let desc = desc_trace::trace(&insts);
     em.lane_heap = desc.lane_heap;
+    em.lane_tsharp = desc.lane_tsharp;
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
     // continues from the ES into the GS through s_setpc: left as it is); pixel shaders: they
     // skip the quad reads that give the helper lanes' bits
