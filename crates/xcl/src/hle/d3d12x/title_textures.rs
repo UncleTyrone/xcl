@@ -1111,7 +1111,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
         p.max(b)
     };
     recheck_streamed_unwatched(&ranges, recheck_frame);
-    if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
+    if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 && AGAIN.lock().unwrap().is_empty() {
         return;
     }
     // textures made since the last submit and those with a written page; a reference each
@@ -1715,6 +1715,10 @@ unsafe fn submit_on_title_queue(dev: &ID3D12Device, queue: &ID3D12CommandQueue, 
     let v = q.value;
     q.in_flight.push_back((v, f));
     reclaim(dev, q, in_flight_cap_bytes(super::vram::commit_low()), 10_000);
+    super::texture_upload_ahead::record_sent(&super::texture_upload_ahead::Sent {
+        fence: q.fence.clone(),
+        value: q.value,
+    });
     Ok(failed)
 }
 
