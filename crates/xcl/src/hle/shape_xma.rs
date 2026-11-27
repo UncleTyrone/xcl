@@ -8,10 +8,9 @@
 //! each enabled context's 256-byte PCM output ring from its input packets via
 //! [`crate::hle::xma2::Decoder`].
 //!
-//! Still **ABSENT / thinner than CGBJ**:
-//! - 6th SHAPE kind (PCM contexts) and per-kind context sizes
-//! - bit-accurate mid-packet frame seek / loop / overlap-buffer handoff
-//! - subframe skip fields beyond initial packet decode
+//! Still thinner than CGBJ:
+//! - bit-accurate mid-packet frame seek and overlap-buffer handoff
+//! - full per-kind context layout (6th PCM kind lives in `acphal.rs`)
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -28,12 +27,18 @@ const ADVANCE_XMA_READ: u32 = 18;
 const BLOCK_BYTES: usize = 256;
 const SAMPLES_PER_BLOCK: usize = BLOCK_BYTES / 2;
 const CONTEXT_WORDS: usize = 16;
+/// Samples per XMA subframe at 48 kHz (512 / 4); used for start and loop skip fields.
+const SUBFRAME_SAMPLES: usize = 128;
+/// Error status when both inputs are invalid (hardware status 4).
+const INPUT_INVALID: u32 = 4;
 /// Kind index in XCL's 5-slot SHAPE table that holds XMA contexts (matches CGBJ index 4).
 pub const XMA_KIND: usize = 4;
 
 struct Voice {
     decoder: Option<Decoder>,
     pcm: VecDeque<i16>,
+    /// Samples per channel left to drop (stream start or loop-edge trim).
+    skip: usize,
     ended: bool,
 }
 
@@ -55,8 +60,8 @@ fn xma_read() -> std::sync::RwLockReadGuard<'static, Xma> {
     XMA.read().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Bind the XMA decoder to SHAPE kind-4 contexts after allocation.
-pub fn on_shape_allocated(arrays: &[usize; 5], counts: &[u32; 5]) {
+/// Bind the XMA decoder to SHAPE kind-4 contexts after allocation (6-kind table; XMA slot 4).
+pub fn on_shape_allocated(arrays: &[usize; 6], counts: &[u32; 6]) {
     let mut xma = XMA.write().unwrap_or_else(|e| e.into_inner());
     xma.array = arrays.get(XMA_KIND).copied().unwrap_or(0);
     let n = counts.get(XMA_KIND).copied().unwrap_or(0) as usize;
@@ -114,6 +119,7 @@ impl Xma {
         *slot = Some(Voice {
             decoder: None,
             pcm: VecDeque::new(),
+            skip: context.field(1, 24, 3) as usize * SUBFRAME_SAMPLES,
             ended: false,
         });
         drop(slot);
@@ -177,8 +183,13 @@ fn pump_one(context: Context, voice: &mut Voice) {
         return;
     }
     while context.field(1, 31, 1) == 1 {
-        if voice.pcm.len() < SAMPLES_PER_BLOCK && !voice.ended {
-            decode_packets(context, voice);
+        for _ in 0..8 {
+            if voice.pcm.len() >= SAMPLES_PER_BLOCK || voice.ended {
+                break;
+            }
+            if !decode_packets(context, voice) {
+                break;
+            }
         }
         if voice.pcm.is_empty() || (voice.pcm.len() < SAMPLES_PER_BLOCK && !voice.ended) {
             return;
@@ -200,26 +211,31 @@ fn pump_one(context: Context, voice: &mut Voice) {
     }
 }
 
-fn decode_packets(context: Context, voice: &mut Voice) {
+/// Decode more input into `voice`; false when nothing further is ready.
+fn decode_packets(context: Context, voice: &mut Voice) -> bool {
     let valid = context.field(0, 20, 2);
     if voice.ended {
         if valid == 0 {
-            return;
+            return false;
         }
         voice.ended = false;
+        if context.field(2, 26, 5) == INPUT_INVALID {
+            context.set_field(2, 26, 6, 0);
+        }
     }
     let mut current = context.field(4, 31, 1);
     if valid & (1 << current) == 0 {
         if valid & (1 << (1 - current)) == 0 {
             if let Some(decoder) = &mut voice.decoder {
+                decoder.flush();
                 if let Ok(tail) = decoder.decode_buffer_i16(&[], true) {
                     voice.pcm.extend(tail);
                 }
             }
             voice.ended = true;
-            context.set_field(2, 26, 5, 4);
+            context.set_field(2, 26, 5, INPUT_INVALID);
             context.set_field(2, 31, 1, 1);
-            return;
+            return !voice.pcm.is_empty();
         }
         current = 1 - current;
         context.set_field(4, 31, 1, current);
@@ -231,11 +247,11 @@ fn decode_packets(context: Context, voice: &mut Voice) {
     };
     if packets == 0 {
         context.set_field(0, 20 + current, 1, 0);
-        return;
+        return true;
     }
     let Some(data) = apu_bytes(address & !0x7ff, packets as usize * xma2::PACKET_SIZE) else {
         context.set_field(0, 20 + current, 1, 0);
-        return;
+        return true;
     };
     let channels = context.channels() as u16;
     const RATES: [u32; 4] = [24_000, 32_000, 44_100, 48_000];
@@ -257,18 +273,36 @@ fn decode_packets(context: Context, voice: &mut Voice) {
                 Err(e) => {
                     crate::xlog_warn!("SHAPE XMA: decoder init failed: {e}");
                     context.set_field(0, 20 + current, 1, 0);
-                    return;
+                    return false;
                 }
             }
         }
     };
+    let loops = context.field(0, 12, 8);
     match decoder.decode_buffer_i16(data, false) {
-        Ok(pcm) => voice.pcm.extend(pcm),
+        Ok(mut pcm) => {
+            let channels = context.channels().max(1);
+            let skip = (voice.skip * channels).min(pcm.len());
+            voice.skip -= skip / channels;
+            pcm = pcm.split_off(skip);
+            let loop_end = context.field(4, 0, 26);
+            if loops > 0 && loop_end != 0 {
+                let keep = (context.field(1, 12, 2) as usize + 1) * SUBFRAME_SAMPLES * channels;
+                if pcm.len() > keep {
+                    pcm.truncate(keep);
+                }
+                voice.skip = context.field(1, 17, 3) as usize * SUBFRAME_SAMPLES;
+                if loops != 255 {
+                    context.set_field(0, 12, 8, loops - 1);
+                }
+            }
+            voice.pcm.extend(pcm);
+        }
         Err(e) => crate::xlog_warn!("SHAPE XMA: decode failed: {e}"),
     }
-    // Consume this input buffer; titles refill and re-enable as needed.
     context.set_field(0, 20 + current, 1, 0);
     context.set_field(2, 0, 26, packets * xma2::PACKET_SIZE as u32 * 8);
+    true
 }
 
 /// `XCL_XMA_DUMP=<dir>`: save context words + input 0 for the first 32 enables.
@@ -360,7 +394,10 @@ mod tests {
         words[0] = 1 | (4 << 22) | (1 << 20);
         words[1] = (3 << 27) | (1 << 31);
         words[7] = 0;
-        on_shape_allocated(&[0, 0, 0, 0, words.as_mut_ptr() as usize], &[0, 0, 0, 0, 1]);
+        on_shape_allocated(
+            &[0, 0, 0, 0, words.as_mut_ptr() as usize, 0],
+            &[0, 0, 0, 0, 1, 0],
+        );
         assert!(command(ENABLE_XMA, |_| Some(0)));
         assert!(command(ADVANCE_XMA_READ, |i| Some(if i == 0 { 0 } else { 1 })));
         assert!(command(DISABLE_XMA, |_| Some(0)));

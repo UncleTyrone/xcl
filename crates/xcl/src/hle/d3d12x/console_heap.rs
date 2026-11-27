@@ -471,8 +471,23 @@ fn pending_dynamic_len() -> usize {
     PENDING_DYNAMIC.lock().unwrap().len()
 }
 
+/// Flush quarantined view/sampler heap ranges whose queue fence marks have passed.
+pub unsafe fn drain_quarantined_heaps() {
+    if let Some(s) = GLOBAL.write().unwrap().as_mut() {
+        if drain_retired_ranges(&mut s.retired, &mut s.free, &mut s.leases, |f| f.GetCompletedValue()) {
+            s.smallest_failed = u32::MAX;
+        }
+    }
+    if let Some(s) = GLOBAL_SAMPLER.write().unwrap().as_mut() {
+        if drain_retired_ranges(&mut s.retired, &mut s.free, &mut s.leases, |f| f.GetCompletedValue()) {
+            s.smallest_failed = u32::MAX;
+        }
+    }
+}
+
 /// Retry fence-driven release of deferred dynamic descriptor ranges (CGBJ `settle_for_fence`).
 pub unsafe fn settle_for_fence() {
+    drain_quarantined_heaps();
     if !super::residency::defer_dynamic_slots() {
         return;
     }

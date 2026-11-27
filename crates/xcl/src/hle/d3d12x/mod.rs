@@ -15,6 +15,8 @@ mod bake_upload;
 pub mod bind;
 pub(crate) mod clamp;
 pub mod console_heap;
+#[allow(dead_code)]
+mod desc_recycle;
 pub(crate) mod heap_strides;
 pub mod console_list;
 mod depth_uav;
