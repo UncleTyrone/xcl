@@ -428,7 +428,11 @@ impl Module {
     /// keep their identities; replaced ones simply lose their uses.
     ///
     /// `XCL_DXIL_NO_OPT=phi,cse,dce,merge` (any subset, or `all`) skips passes, for bisecting.
+    /// Shrink passes run only with `XCL_SHADER_OPT=1` (see [`crate::gpu::recomp::shader_opt`]).
     pub fn optimize(&mut self) {
+        if !crate::gpu::recomp::shader_opt::dxil_shrink() {
+            return;
+        }
         let off = std::env::var("XCL_DXIL_NO_OPT").unwrap_or_default();
         let skip = |p: &str| off.split(',').any(|x| x.trim() == p || x.trim() == "all");
         let order: Vec<u32> = self.block_layout().0.into_iter().map(|b| b as u32).collect();
