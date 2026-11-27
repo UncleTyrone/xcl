@@ -7,8 +7,9 @@
 //! **Not** `XCL_CAPTURE_FRAME`: that path records title command streams and shader dumps for one
 //! frame; this path only tracks queue submits, fence signals, and present tokens.
 //!
-//! **Gaps vs CGBJ `victory-gpu/replay/*`:** no VICFRAME wire blob, no host PSO/resource snap,
-//! no cross-process list rehydration, no `PresentX` re-issue (token logged only), no CLI player.
+//! **Gaps vs CGBJ `victory-gpu/replay/*`:** no full heap/PSO/resource snap, no cross-process
+//! list rehydration, no `PresentX` re-issue (token logged only), no CLI player. Binary
+//! `XCLFRAME` blobs (`XCL_RECORD_WIRE=1`) cover submit/signal/present (VICFRAME role, not layout).
 //!
 //! ### Environment (default off)
 //!
@@ -19,6 +20,7 @@
 //! | `XCL_RECORD_FRAMES` | Stop after N frames (unless `ALWAYS`) | `1` frame |
 //! | `XCL_RECORD_ALWAYS` | Keep recording every frame | off |
 //! | `XCL_RECORD_REFS` | Sidecar `refs/submit_*.ref.json` (pointer sets) | off |
+//! | `XCL_RECORD_WIRE` | Also write `frames/frame_NNNN.bin` (`XCLFRAME`) | off |
 //! | `XCL_REPLAY` | Load `index.jsonl` from directory; hook presents | unset = off |
 //! | `XCL_REPLAY_AT` | Skip first N presents before replay | `0` |
 //! | `XCL_REPLAY_EXECUTE` | Re-issue `ExecuteCommandLists` on live queue | on when `XCL_REPLAY` set |
@@ -45,6 +47,8 @@ struct Settings {
     always: bool,
     /// Sidecar ref files under `refs/` (addresses only, no command bytes).
     write_refs: bool,
+    /// Binary `XCLFRAME` beside JSONL (`XCL_RECORD_WIRE=1`).
+    write_wire: bool,
     replay_execute: bool,
     replay_fences: bool,
     replay_skip_presents: u64,
@@ -87,6 +91,7 @@ fn settings() -> &'static Settings {
             max_frames: parse_u64("XCL_RECORD_FRAMES"),
             always,
             write_refs: env_on("XCL_RECORD_REFS"),
+            write_wire: env_on("XCL_RECORD_WIRE"),
             replay_execute,
             replay_fences: env_on("XCL_REPLAY_FENCES"),
             replay_skip_presents: parse_u64("XCL_REPLAY_AT").unwrap_or(0),
@@ -225,6 +230,42 @@ fn append_event(ev: &RecordedEvent) {
     }
 }
 
+fn events_to_wire(events: &[RecordedEvent]) -> Vec<super::frame_wire::WireEvent> {
+    use super::frame_wire::WireEvent;
+    events
+        .iter()
+        .filter_map(|ev| match ev {
+            RecordedEvent::Session { format } => Some(WireEvent::Session { format: *format }),
+            RecordedEvent::Submit {
+                n,
+                queue,
+                lists,
+                addrs,
+                pc_addrs,
+                backing,
+                ..
+            } => Some(WireEvent::Submit {
+                n: *n,
+                queue: *queue,
+                lists: *lists,
+                addrs: addrs.clone(),
+                pc_addrs: pc_addrs.clone(),
+                backing: backing.clone(),
+            }),
+            RecordedEvent::Signal { queue, fence, value } => Some(WireEvent::Signal {
+                queue: *queue,
+                fence: *fence,
+                value: *value,
+            }),
+            RecordedEvent::Present { frame, token, submits } => Some(WireEvent::Present {
+                frame: *frame,
+                token: *token,
+                submits: *submits,
+            }),
+        })
+        .collect()
+}
+
 fn flush_frame_file(frame: u64) {
     let s = settings();
     let Some(dir) = &s.record_dir else { return };
@@ -238,6 +279,13 @@ fn flush_frame_file(frame: u64) {
             if let Ok(line) = serde_json::to_string(ev) {
                 let _ = writeln!(f, "{line}");
             }
+        }
+    }
+    if s.write_wire {
+        let wire_path = dir.join("frames").join(format!("frame_{frame:04}.bin"));
+        let wire = events_to_wire(&events);
+        if let Err(e) = super::frame_wire::write_frame(&wire_path, &wire) {
+            crate::xlog_warn!("D3D12.X: XCL_RECORD_WIRE write {}: {e}", wire_path.display());
         }
     }
 }

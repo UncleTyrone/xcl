@@ -55,7 +55,9 @@ mod tests {
     #[test]
     fn parallel_for_sequential_when_off() {
         let n = AtomicUsize::new(0);
-        parallel_for(5, &|_| n.fetch_add(1, Ordering::Relaxed));
+        parallel_for(5, &|_| {
+            n.fetch_add(1, Ordering::Relaxed);
+        });
         assert_eq!(n.load(Ordering::Relaxed), 5);
     }
 }
