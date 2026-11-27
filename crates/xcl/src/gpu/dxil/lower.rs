@@ -228,6 +228,11 @@ pub struct Lw {
     pub static_srsrc: std::collections::BTreeMap<u64, [u32; 4]>,
     /// Access PC → per-lane heap index ([`recomp::desc_trace`], CGBJ `lane_heap_index` analogue).
     pub lane_heap: std::collections::BTreeMap<u64, crate::gpu::recomp::desc_trace::LaneHeapExpr>,
+    /// Access PC → T# dwords 0..3 ([`crate::gpu::recomp::desc_trace::TsharpWord`]).
+    pub lane_tsharp: std::collections::BTreeMap<
+        u64,
+        [Option<crate::gpu::recomp::desc_trace::TsharpWord>; 4],
+    >,
     /// the program writes a non-default MODE[3:2] and has f16 rounding ops (no f64 ones):
     /// f16 results round in software under `VAR_FP16_RM` (the recompiler's `dynamic_f16_rm`)
     pub dyn_rm: bool,
@@ -706,11 +711,37 @@ impl Lw {
             return [self.c(w[0]), self.c(w[1]), self.c(w[2]), self.c(w[3])];
         }
         let lane0 = self.lane_heap.get(&pc).cloned().map(|e| self.lane_heap_index(&e));
+        let ts = self.lane_tsharp.get(&pc).copied();
+        let word = |s: &mut Self, k: usize, fallback: u64| {
+            use crate::gpu::recomp::desc_trace::TsharpWord;
+            match ts.and_then(|t| t[k]) {
+                Some(TsharpWord::Vgpr(v)) => s.vreg(v),
+                Some(TsharpWord::Select { set, clear }) => {
+                    let cond = s.scc_bit();
+                    let a = s.vreg(set);
+                    let b = s.vreg(clear);
+                    s.sel(cond, a, b)
+                }
+                None => s.sreg(fallback),
+            }
+        };
         [
-            lane0.unwrap_or_else(|| self.sreg(base)),
-            self.sreg(base + 1),
-            self.sreg(base + 2),
-            self.sreg(base + 3),
+            lane0.unwrap_or_else(|| {
+                use crate::gpu::recomp::desc_trace::TsharpWord;
+                match ts.and_then(|t| t[0]) {
+                    Some(TsharpWord::Vgpr(v)) => self.vreg(v),
+                    Some(TsharpWord::Select { set, clear }) => {
+                        let cond = self.scc_bit();
+                        let a = self.vreg(set);
+                        let b = self.vreg(clear);
+                        self.sel(cond, a, b)
+                    }
+                    None => self.sreg(base),
+                }
+            }),
+            word(self, 1, base + 1),
+            word(self, 2, base + 2),
+            word(self, 3, base + 3),
         ]
     }
 
@@ -758,13 +789,15 @@ impl Lw {
                 let c = self.lane_heap_index(clear);
                 self.sel(cond, s, c)
             }
-            E::LanePhi { arms } => {
+            E::LanePhi { arms, joined_vgpr } => {
                 let live: Vec<_> = arms.iter().flatten().collect();
                 match live.len() {
-                    0 => self.c(0),
+                    0 => joined_vgpr.map(|v| self.vreg(v)).unwrap_or_else(|| self.c(0)),
                     1 => self.lane_heap_index(live[0]),
                     _ if live.iter().all(|e| *e == live[0]) => self.lane_heap_index(live[0]),
-                    _ => self.lane_heap_index(live[0]),
+                    _ => joined_vgpr
+                        .map(|v| self.vreg(v))
+                        .unwrap_or_else(|| self.lane_heap_index(live[0])),
                 }
             }
         }

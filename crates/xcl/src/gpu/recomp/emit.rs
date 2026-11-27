@@ -62,6 +62,8 @@ pub(super) struct Em {
     /// Access PC → per-lane heap index when [`super::desc_trace`] proves a waterfall / Fetched
     /// descriptor (CGBJ `lane_heap_index` analogue).
     pub lane_heap: BTreeMap<u64, super::desc_trace::LaneHeapExpr>,
+    /// Access PC → T# dwords 0..3 ([`super::desc_trace::TsharpWord`]).
+    pub lane_tsharp: BTreeMap<u64, [Option<super::desc_trace::TsharpWord>; 4]>,
     /// loops emitted so far with a pass count of their own (`loop_guard`)
     loop_ids: u32,
     /// the static samplers sampled with: (S#, comparison), in register order
@@ -629,6 +631,7 @@ impl Em {
             static_ss: BTreeMap::new(),
             static_sr: BTreeMap::new(),
             lane_heap: BTreeMap::new(),
+            lane_tsharp: BTreeMap::new(),
             loop_ids: 0,
             static_used: Vec::new(),
             max_vgpr: 0,
@@ -801,7 +804,7 @@ impl Em {
                 format!("{}u", w[3]),
             );
         }
-        // Waterfall / Fetched: dword0 is each lane's own heap index (lane_heap_index analogue).
+        // Waterfall / Fetched / SCC Select: dword0 heap index; dwords 1..3 from TsharpWord.
         let lane_tw0 = self.lane_heap.get(&pc).cloned().map(|expr| {
             let mut sfn = |c: u64| {
                 self.sgprs.insert(c);
@@ -813,20 +816,25 @@ impl Em {
             };
             super::desc_trace::lane_heap_hlsl(&expr, &mut sfn, &mut vfn)
         });
-        if let Some(tw0) = lane_tw0 {
-            return (
-                tw0,
-                self.sreg(srsrc + 1),
-                self.sreg(srsrc + 2),
-                self.sreg(srsrc + 3),
-            );
-        }
-        (
-            self.sreg(srsrc),
-            self.sreg(srsrc + 1),
-            self.sreg(srsrc + 2),
-            self.sreg(srsrc + 3),
-        )
+        let lane_word = |s: &mut Self, k: usize| -> Option<String> {
+            use super::desc_trace::TsharpWord;
+            match s.lane_tsharp.get(&pc).and_then(|ts| ts[k]) {
+                Some(TsharpWord::Vgpr(v)) => Some(s.vreg(v)),
+                Some(TsharpWord::Select { set, clear }) => {
+                    let a = s.vreg(set);
+                    let b = s.vreg(clear);
+                    Some(format!("select(scc != 0u, {a}, {b})"))
+                }
+                None => None,
+            }
+        };
+        let tw0 = lane_tw0
+            .or_else(|| lane_word(self, 0))
+            .unwrap_or_else(|| self.sreg(srsrc));
+        let tw1 = lane_word(self, 1).unwrap_or_else(|| self.sreg(srsrc + 1));
+        let tw2 = lane_word(self, 2).unwrap_or_else(|| self.sreg(srsrc + 2));
+        let tw3 = lane_word(self, 3).unwrap_or_else(|| self.sreg(srsrc + 3));
+        (tw0, tw1, tw2, tw3)
     }
 
     fn vreg(&mut self, n: u64) -> String {

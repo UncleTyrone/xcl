@@ -318,6 +318,10 @@ pub struct Summary {
     /// is false when the edge's reach fact is FALSE (no lane can take that edge under the
     /// analyzed path conditions). Used by LanePhi-inspired `only_edge` / dead-pred merge.
     pub join_edge_live: BTreeMap<u64, Vec<(u64, bool)>>,
+    /// `(pc, mask_sgpr) → lane-bit holds` when the mask's BDD node is exactly `TRUE`/`FALSE`
+    /// at that instruction (CGBJ `known` push for `Source::Lanes`). Exact `implies` only —
+    /// not full `Bools::meet` (IMPOSSIBLE without SSA Structured IR).
+    pub mask_known: BTreeMap<(u64, u64), bool>,
 }
 
 /// Whether `d` reads SCC as a non-branch input (either implicitly via `OPR_SSRC_SPECIAL_SCC`
@@ -929,6 +933,23 @@ impl<'a> Lanes<'a> {
                     };
                     if !covered {
                         sum.guarded.push(d.pc);
+                    }
+                }
+                // Exact mask constants for Lanes fold (TRUE/FALSE nodes only).
+                if d.inst.name == "V_CNDMASK_B32" {
+                    let mask = if d.enc.name == "ENC_VOP3" || d.enc.name == "ENC_VOP3B" {
+                        rdna2::field_value(d.enc, &d.words, "SRC2").unwrap_or(106)
+                    } else {
+                        106u64
+                    };
+                    if mask < 128 {
+                        if let Some(Some(node)) = st.regs.get(mask as usize) {
+                            if *node == TRUE {
+                                sum.mask_known.insert((d.pc, mask), true);
+                            } else if *node == FALSE {
+                                sum.mask_known.insert((d.pc, mask), false);
+                            }
+                        }
                     }
                 }
                 // an SCC a mask op set, read by a scalar or vector instruction (implicit or
