@@ -175,12 +175,12 @@ fn walk_pe(root: &Path, visit: &mut dyn FnMut(&Path)) {
     }
 }
 
+/// Cheap pre-filter: `MZ` header (CGBJ census role). Console packages do not always use .exe/.dll.
 fn looks_like_pe(path: &Path) -> bool {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) => {
-            let e = ext.to_ascii_lowercase();
-            e == "exe" || e == "dll" || e == "xex" || e == "mui"
-        }
-        None => false,
-    }
+    use std::io::Read;
+    let mut magic = [0u8; 2];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok()
+        && magic == *b"MZ"
 }

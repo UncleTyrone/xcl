@@ -16,7 +16,15 @@
 //! XCL therefore documents cross-process play as **unsupported** and re-issues only while the title
 //! is live with still-readable pointers (`XCL_REPLAY` / `--run`).
 //!
-//! ## `XCLFRAME` version 4 (current [`VERSION`])
+//! ## `XCLFRAME` version 5 (current [`VERSION`])
+//!
+//! Same stream as version 4, plus:
+//! - **`HeapSnap` / `HeapEntry`** — optional GPU/CPU descriptor-heap start handles
+//!   (VICFRAME `DescriptorHeap` id/kind/count role without full slot-run codecs).
+//! - **`Present` plane tail** — per-plane `width` / `height` / `format` from `GetDesc` when known
+//!   (VICFRAME `Present` picture meta toward `present.bin`; pixel dump remains same-process only).
+//!
+//! ## `XCLFRAME` version 4
 //!
 //! Same stream as version 3, plus:
 //! - **`ListPayload` (tag 8)** — structured command dump for a mapped PC list (bind snapshot,
@@ -42,14 +50,14 @@
 //!   `(ptr u64, type u32, count u32, flags u32)` for descriptor heaps known this frame.
 //!
 //! Version 1 blobs omit the `Submit` tail and have no `HeapSnap` events. [`decode_frame`] accepts
-//! versions 1..=4.
+//! versions 1..=5.
 
 use std::path::Path;
 
 /// First eight bytes of `frame_*.bin`.
 pub const MAGIC: [u8; 8] = *b"XCLFRAME";
-/// Layout version for newly written blobs (see module docs for field differences vs 1..=3).
-pub const VERSION: u32 = 4;
+/// Layout version for newly written blobs (see module docs for field differences vs 1..=4).
+pub const VERSION: u32 = 5;
 pub const VERSION_MIN: u32 = 1;
 
 /// Max leading bytes stored in a [`WireEvent::ContentSample`].
@@ -190,41 +198,69 @@ pub mod tag {
 }
 
 /// Descriptor heap metadata (pointer id + creation sizes; no descriptor bytes).
+///
+/// v5 adds GPU/CPU heap-start handles (0 when unknown) — VICFRAME `DescriptorHeap` spine without
+/// slot-run codecs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeapEntry {
     pub ptr: usize,
     pub ty: u32,
     pub count: u32,
     pub flags: u32,
+    /// `GetGPUDescriptorHandleForHeapStart` (v5+; 0 on older wire / unknown).
+    pub gpu_start: u64,
+    /// `GetCPUDescriptorHandleForHeapStart` (v5+; 0 on older wire / unknown).
+    pub cpu_start: u64,
 }
 
 impl HeapEntry {
-    fn put(&self, out: &mut Vec<u8>) {
+    fn put(&self, out: &mut Vec<u8>, wire_version: u32) {
         put_u64(out, self.ptr as u64);
         put_u32(out, self.ty);
         put_u32(out, self.count);
         put_u32(out, self.flags);
+        if wire_version >= 5 {
+            put_u64(out, self.gpu_start);
+            put_u64(out, self.cpu_start);
+        }
     }
 
-    fn get(from: &mut Dec<'_>) -> Result<Self, Bad> {
+    fn get(from: &mut Dec<'_>, wire_version: u32) -> Result<Self, Bad> {
+        let ptr = get_u64(from)? as usize;
+        let ty = get_u32(from)?;
+        let count = get_u32(from)?;
+        let flags = get_u32(from)?;
+        let (gpu_start, cpu_start) = if wire_version >= 5 {
+            (get_u64(from)?, get_u64(from)?)
+        } else {
+            (0, 0)
+        };
         Ok(Self {
-            ptr: get_u64(from)? as usize,
-            ty: get_u32(from)?,
-            count: get_u32(from)?,
-            flags: get_u32(from)?,
+            ptr,
+            ty,
+            count,
+            flags,
+            gpu_start,
+            cpu_start,
         })
     }
 }
 
-/// One PresentX plane resource (+ optional source rect) for v4 present tails.
+/// One PresentX plane resource (+ optional source rect) for v4+ present tails.
+///
+/// v5 adds resource `GetDesc` width/height/format (0 when unknown) toward VICFRAME `Present`
+/// picture metadata; full `present.bin` texel dump is still same-process / offline-absent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PresentPlane {
     pub resource: usize,
     pub rect: Option<[i32; 4]>,
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
 }
 
 impl PresentPlane {
-    fn put(&self, out: &mut Vec<u8>) {
+    fn put(&self, out: &mut Vec<u8>, wire_version: u32) {
         put_u64(out, self.resource as u64);
         match self.rect {
             Some(r) => {
@@ -235,9 +271,14 @@ impl PresentPlane {
             }
             None => out.push(0),
         }
+        if wire_version >= 5 {
+            put_u32(out, self.width);
+            put_u32(out, self.height);
+            put_u32(out, self.format);
+        }
     }
 
-    fn get(from: &mut Dec<'_>) -> Result<Self, Bad> {
+    fn get(from: &mut Dec<'_>, wire_version: u32) -> Result<Self, Bad> {
         let resource = get_u64(from)? as usize;
         let has = *from.take(1)?.first().ok_or(Bad("plane rect flag"))?;
         let rect = if has != 0 {
@@ -245,7 +286,18 @@ impl PresentPlane {
         } else {
             None
         };
-        Ok(Self { resource, rect })
+        let (width, height, format) = if wire_version >= 5 {
+            (get_u32(from)?, get_u32(from)?, get_u32(from)?)
+        } else {
+            (0, 0, 0)
+        };
+        Ok(Self {
+            resource,
+            rect,
+            width,
+            height,
+            format,
+        })
     }
 }
 
@@ -366,7 +418,7 @@ impl WireEvent {
                     put_u64(out, *queue as u64);
                     put_u32(out, planes.len() as u32);
                     for p in planes {
-                        p.put(out);
+                        p.put(out, wire_version);
                     }
                 }
             }
@@ -374,7 +426,7 @@ impl WireEvent {
                 out.push(tag::HEAP_SNAP);
                 put_u32(out, heaps.len() as u32);
                 for h in heaps {
-                    h.put(out);
+                    h.put(out, wire_version);
                 }
             }
             Self::ListMeta {
@@ -470,7 +522,7 @@ impl WireEvent {
                     let n = get_u32(from)? as usize;
                     let mut planes = Vec::with_capacity(n);
                     for _ in 0..n {
-                        planes.push(PresentPlane::get(from)?);
+                        planes.push(PresentPlane::get(from, wire_version)?);
                     }
                     (queue, planes)
                 } else {
@@ -488,7 +540,7 @@ impl WireEvent {
                 let n = get_u32(from)? as usize;
                 let mut heaps = Vec::with_capacity(n);
                 for _ in 0..n {
-                    heaps.push(HeapEntry::get(from)?);
+                    heaps.push(HeapEntry::get(from, wire_version)?);
                 }
                 Self::HeapSnap { heaps }
             }
@@ -594,6 +646,9 @@ pub fn read_frame(path: &Path) -> Result<Vec<WireEvent>, String> {
 }
 
 /// Compact kind tags inside a [`WireEvent::ListPayload`] `ops` blob.
+///
+/// Not a byte-compatible CGBJ `Cmd` stream: draw/dispatch/indirect/mesh tags cover the live
+/// ring XCL can observe; barriers/roots/views stay in the XLST bind/VA snap only.
 pub mod list_op {
     pub const DRAW: u8 = 1;
     pub const DISPATCH: u8 = 2;
@@ -605,6 +660,12 @@ pub mod list_op {
     pub const BIND_IDS: u8 = 7;
     /// `D3D12_COMMAND_LIST_TYPE` for the mapped list (u32 LE).
     pub const LIST_KIND: u8 = 8;
+    /// ExecuteIndirect spine: sig, max, args ptr, args_off, count ptr, count_off.
+    pub const INDIRECT: u8 = 9;
+    /// DispatchMesh group counts (x,y,z).
+    pub const DISPATCH_MESH: u8 = 10;
+    /// Draw with `first_instance` (VICFRAME Draw / DrawIndexed completeness).
+    pub const DRAW_EX: u8 = 11;
     pub const SNAP_MAGIC: &[u8; 4] = b"XLST";
     pub const SNAP_VER: u8 = 1;
 }
@@ -660,6 +721,8 @@ mod tests {
                     ty: 0,
                     count: 64,
                     flags: 1,
+                    gpu_start: 0x1000,
+                    cpu_start: 0x2000,
                 }],
             },
             WireEvent::Signal {
@@ -675,6 +738,9 @@ mod tests {
                 planes: vec![PresentPlane {
                     resource: 0xABCD,
                     rect: Some([0, 0, 1920, 1080]),
+                    width: 1920,
+                    height: 1080,
+                    format: 28,
                 }],
             },
         ];
@@ -737,18 +803,54 @@ mod tests {
                     ty: 1,
                     count: 8,
                     flags: 0,
+                    gpu_start: 0x11,
+                    cpu_start: 0x22,
                 },
                 HeapEntry {
                     ptr: 0x200,
                     ty: 0,
                     count: 2048,
                     flags: 2,
+                    gpu_start: 0,
+                    cpu_start: 0,
                 },
             ],
         };
         let bytes = encode_frame(&[ev.clone()]);
         let back = decode_frame(&bytes).unwrap();
         assert_eq!(back, vec![ev]);
+    }
+
+    #[test]
+    fn decodes_v4_heap_and_plane_without_v5_tails() {
+        let events = vec![
+            WireEvent::HeapSnap {
+                heaps: vec![HeapEntry {
+                    ptr: 1,
+                    ty: 0,
+                    count: 4,
+                    flags: 0,
+                    gpu_start: 0,
+                    cpu_start: 0,
+                }],
+            },
+            WireEvent::Present {
+                frame: 1,
+                token: 2,
+                submits: 1,
+                queue: 3,
+                planes: vec![PresentPlane {
+                    resource: 9,
+                    rect: None,
+                    width: 0,
+                    height: 0,
+                    format: 0,
+                }],
+            },
+        ];
+        let bytes = encode_frame_version(&events, 4);
+        let back = decode_frame(&bytes).unwrap();
+        assert_eq!(back, events);
     }
 
     #[test]

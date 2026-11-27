@@ -1911,28 +1911,86 @@ impl Decoder {
     }
 
     /// Decode one XMA frame bit blob (`frame` from [`frames::read_frame`]) without resetting overlap.
+    /// Prefer [`Self::decode_frame_exact`] for ACPHAL mid-packet seek (bit-exact length, no re-packetize).
     pub fn decode_frame_blob(&mut self, frame: &frames::Frame) -> Result<Vec<i16>, String> {
-        let mut pkt = [0u8; PACKET_SIZE];
-        pkt[0..4].copy_from_slice(&(1u32 << 26).to_be_bytes());
-        let n = frame.data.len().min(PACKET_SIZE - 4);
-        pkt[4..4 + n].copy_from_slice(&frame.data[..n]);
-        self.current_stream = 0;
-        let floats = self.decode_packets_f32(&pkt, false)?;
-        let mut pcm = Vec::with_capacity(floats.len());
-        for s in floats {
-            let scaled = (s * 32768.0_f32).round().clamp(-32768.0, 32767.0) as i16;
-            pcm.push(scaled);
+        self.decode_frame_exact(&frame.data, frame.bits)
+    }
+
+    /// Bit-exact single-frame decode: `data` holds `bits` MSB-first (length field included).
+    /// Carries IMDCT overlap across calls; does not apply packet-path initial skip.
+    pub fn decode_frame_exact(&mut self, data: &[u8], bits: usize) -> Result<Vec<i16>, String> {
+        if self.streams.is_empty() {
+            return Err("no XMA streams".into());
+        }
+        let stream = &mut self.streams[0];
+        let end = bits.min(data.len().saturating_mul(8));
+        if end == 0 {
+            return Ok(Vec::new());
+        }
+        stream.reservoir.reset();
+        stream.frame_offset = 0;
+        stream.num_saved_bits = 0;
+        stream.reservoir.copy_aligned_bits(data, end);
+        stream.num_saved_bits = end;
+        // Frame-at-a-time path (ACPHAL): every decode yields samples; no encoder-delay skip.
+        stream.skip_frame = false;
+        stream.packet_loss = false;
+        let mut out_frame = [[0.0f32; SAMPLES_PER_FRAME]; MAX_CHANNELS_PER_STREAM];
+        let (_more, got) = stream.decode_frame(&mut out_frame);
+        // Frame-at-a-time seeks own continuity; clear packet_loss from FFmpeg len_prefix tally.
+        stream.packet_loss = false;
+        stream.has_decoded = true;
+        if !got {
+            return Err("XMA frame did not decode".into());
+        }
+        let channels = stream.nb_channels;
+        let mut pcm = Vec::with_capacity(SAMPLES_PER_FRAME * channels);
+        for i in 0..SAMPLES_PER_FRAME {
+            for c in 0..channels {
+                let s = out_frame[c][i];
+                pcm.push((s * 32768.0_f32).round().clamp(-32768.0, 32767.0) as i16);
+            }
         }
         Ok(pcm)
     }
 
+    /// Clear IMDCT overlap (new stream / hard seek). Loop bit-cursor seeks keep overlap.
+    pub fn reset_overlap(&mut self) {
+        for s in &mut self.streams {
+            for c in 0..s.nb_channels {
+                s.channel[c].out.fill(0.0);
+                s.channel[c].prev_block_len = SAMPLES_PER_FRAME;
+            }
+            s.skip_frame = true;
+            s.has_decoded = false;
+        }
+    }
+
     /// Append overlap tail after input ends (half frame per channel).
     pub fn flush_tail_i16(&mut self) -> Vec<i16> {
-        let floats = self.decode_packets_f32(&[], true).unwrap_or_default();
-        floats
-            .into_iter()
-            .map(|s| (s * 32768.0_f32).round().clamp(-32768.0, 32767.0) as i16)
-            .collect()
+        if self.streams.is_empty() {
+            return Vec::new();
+        }
+        let mut pcm = Vec::new();
+        for stream in &mut self.streams {
+            if !stream.has_decoded {
+                continue;
+            }
+            let channels = stream.nb_channels;
+            for i in 0..SAMPLES_PER_FRAME / 2 {
+                for c in 0..channels {
+                    let s = stream.channel[c].out[i];
+                    pcm.push((s * 32768.0_f32).round().clamp(-32768.0, 32767.0) as i16);
+                }
+            }
+            for c in 0..channels {
+                stream.channel[c].out.fill(0.0);
+                stream.channel[c].prev_block_len = SAMPLES_PER_FRAME;
+            }
+            stream.has_decoded = false;
+            stream.skip_frame = true;
+        }
+        pcm
     }
 }
 

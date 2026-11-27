@@ -4,15 +4,17 @@
 //! emit `lane_heap_index`) is GPL-3; this module reimplements the **subset** XCL can prove on
 //! decoded RDNA2 without CGBJ's SSA `Value` / full Structured BDD IR:
 //! - waterfall loops via [`scan_waterfall_loops`] (`v_readfirstlane` + `v_cmp_eq` + `s_cbranch_execnz`);
-//!   CGBJ `SPLIT` when readfirstlanes and the access live in different blocks (nested / multi-block)
+//!   whole-loop `SPLIT` when reads/accesses span blocks; [`peel_same_block_waterfalls`] still meets
+//!   self-contained per-block sites (CGBJ proves `waterfall` per CFG block)
 //! - selected/remaining/retry structural meet, strengthened when [`lane_masks::analyze`] succeeds
+//!   (per-`v_cmp_eq` pairing when `masks_ok`; guarded PCs refuse)
 //! - `Fetched` / `Lanes` / `LanePhi` / SCC `Select` origins (arms may differ)
 //! - per-access [`LaneHeapExpr`] for DXIL/HLSL `NonUniformResourceIndex` (lane_heap_index analogue)
 //! - per-lane T# dwords 0..3 from waterfall `v_readfirstlane` sources (not only dword0)
 //! - join `only_edge` + lane_masks BDD polarity + Structured-style `guarded` PCs
 //!
-//! Nested single-access-block waterfalls may still `meet_ok` when `!split`; per-compare pairing +
-//! `guarded` refusal approximate Structured `meet`. IR-level phi reconstruction remains subset.
+//! Nested / multi-block natural loops may still whole-loop `split`; peeled same-block accesses can
+//! `meet_ok`. Full IR-level Structured BDD `meet` remains subset (no CGBJ SSA Bools).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -415,13 +417,68 @@ fn compare_uses_readfirstlane(insts: &[Decoded], cmp_pc: u64, reads: &[(u64, u64
     })
 }
 
+/// CGBJ proves waterfalls **per CFG block**. When a natural loop spans blocks (XCL `split`),
+/// peel same-block read/compare/access subsets so single-block waterfalls nested in a larger
+/// loop can still meet (CGBJ `waterfall(block, …)` call sites).
+fn peel_same_block_waterfalls(wf: &ScannedWaterfall, insts: &[Decoded]) -> Vec<ScannedWaterfall> {
+    if !wf.split {
+        return vec![wf.clone()];
+    }
+    let blocks = build_cfg_blocks(insts);
+    let by_pc: HashMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
+    let access_blocks: BTreeSet<usize> = wf.accesses.iter().map(|&(_, b)| b).collect();
+    let mut peels = Vec::new();
+    for &ab in &access_blocks {
+        let reads: Vec<_> = wf.reads.iter().copied().filter(|r| r.1 == ab).collect();
+        let accesses: Vec<_> = wf.accesses.iter().copied().filter(|a| a.1 == ab).collect();
+        let compares: Vec<_> = wf
+            .compares
+            .iter()
+            .copied()
+            .filter(|&c| by_pc.get(&c).and_then(|&i| inst_block(&blocks, i)) == Some(ab))
+            .collect();
+        if reads.is_empty() || compares.is_empty() || accesses.is_empty() {
+            continue;
+        }
+        let (ls, le) = blocks[ab];
+        let mut saveexec_at = None;
+        let mut retry_restore = false;
+        for (pi, d) in insts[ls..le].iter().enumerate() {
+            let idx = ls + pi;
+            match d.inst.name {
+                "S_AND_SAVEEXEC_B32" | "S_AND_SAVEEXEC_B64" => saveexec_at = Some(idx),
+                "S_XOR_B32" | "S_XOR_B64" | "S_ANDN2_B32" | "S_ANDN2_B64" => {
+                    let (r, w) = rdna2::sgpr_uses(d);
+                    if w.contains(&126) || r.contains(&126) {
+                        retry_restore = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        peels.push(ScannedWaterfall {
+            loop_blocks: BTreeSet::from([ab]),
+            header_pc: wf.header_pc,
+            body_start: ls,
+            body_end: le,
+            reads,
+            compares,
+            accesses,
+            saveexec_at,
+            retry_restore,
+            split: false,
+            nested: wf.nested,
+        });
+    }
+    if peels.is_empty() {
+        vec![wf.clone()]
+    } else {
+        peels
+    }
+}
+
 /// Each compare pairs with a distinct readfirstlane (per-compare BDD subset when masks_ok).
 fn compares_pair_reads(wf: &ScannedWaterfall, insts: &[Decoded]) -> bool {
-    let reads_flat: Vec<(u64, u64, u64)> = wf
-        .reads
-        .iter()
-        .map(|&(pc, _, dst, v)| (pc, dst, v))
-        .collect();
     let mut used = vec![false; wf.reads.len()];
     for &cmp in &wf.compares {
         let mut hit = false;
@@ -494,66 +551,74 @@ fn prove_waterfalls(
     out: &mut DescTrace,
 ) {
     let by_pc: HashMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
-    for wf in scan_waterfall_loops(insts) {
+    for wf_raw in scan_waterfall_loops(insts) {
         out.waterfall
             .reads
-            .extend(wf.reads.iter().map(|r| r.0));
-        out.waterfall.compares.extend(wf.compares.iter().copied());
-        let apcs: Vec<u64> = wf.accesses.iter().map(|&(p, _)| p).collect();
-        out.waterfall.accesses.extend(apcs.iter().copied());
-        let meet = waterfall_meet_ok(insts, &wf, masks_ok, guarded);
-        if meet {
-            out.waterfall.meet_ok.extend(apcs.iter().copied());
-        }
-        if wf.split {
-            out.waterfall.split_refused.extend(apcs.iter().copied());
-        } else if wf.nested {
-            out.waterfall.split_refused.extend(
-                apcs
-                    .iter()
-                    .copied()
-                    .filter(|pc| !out.waterfall.meet_ok.contains(pc)),
-            );
-        }
-        let reads_flat: Vec<(u64, u64, u64)> = wf
-            .reads
-            .iter()
-            .map(|&(pc, _, dst, v)| (pc, dst, v))
-            .collect();
-        for &apc in &apcs {
+            .extend(wf_raw.reads.iter().map(|r| r.0));
+        out.waterfall
+            .compares
+            .extend(wf_raw.compares.iter().copied());
+        let raw_apcs: Vec<u64> = wf_raw.accesses.iter().map(|&(p, _)| p).collect();
+        out.waterfall.accesses.extend(raw_apcs.iter().copied());
+
+        let peels = peel_same_block_waterfalls(&wf_raw, insts);
+        let mut peeled_met = BTreeSet::new();
+        for wf in &peels {
+            let apcs: Vec<u64> = wf.accesses.iter().map(|&(p, _)| p).collect();
+            let meet = waterfall_meet_ok(insts, wf, masks_ok, guarded);
+            if meet {
+                out.waterfall.meet_ok.extend(apcs.iter().copied());
+                peeled_met.extend(apcs.iter().copied());
+            }
             if wf.split {
+                out.waterfall.split_refused.extend(apcs.iter().copied());
                 continue;
             }
-            let Some(ai) = by_pc.get(&apc) else { continue };
-            let ad = &insts[*ai];
-            let srsrc = f(ad, "SRSRC").map(|v| v * rdna2::register_scale("SRSRC"));
-            let lane_vgpr = srsrc
-                .and_then(|s| {
-                    reads_flat
-                        .iter()
-                        .find(|&&(_, dst, _)| dst == s)
-                        .map(|&(_, _, v)| v)
-                })
-                .or_else(|| reads_flat.first().map(|r| r.2));
-            let Some(vgpr0) = lane_vgpr else { continue };
+            let reads_flat: Vec<(u64, u64, u64)> = wf
+                .reads
+                .iter()
+                .map(|&(pc, _, dst, v)| (pc, dst, v))
+                .collect();
+            for &apc in &apcs {
+                let Some(ai) = by_pc.get(&apc) else { continue };
+                let ad = &insts[*ai];
+                let srsrc = f(ad, "SRSRC").map(|v| v * rdna2::register_scale("SRSRC"));
+                let lane_vgpr = srsrc
+                    .and_then(|s| {
+                        reads_flat
+                            .iter()
+                            .find(|&&(_, dst, _)| dst == s)
+                            .map(|&(_, _, v)| v)
+                    })
+                    .or_else(|| reads_flat.first().map(|r| r.2));
+                let Some(vgpr0) = lane_vgpr else { continue };
 
-            let mut tsharp = lane_tsharp_from_reads(srsrc, &reads_flat);
-            if tsharp.iter().all(|x| x.is_none()) {
-                tsharp = lane_tsharp_from_srsrc(insts, apc, srsrc);
-            }
-            merge_lane_tsharp(out, apc, tsharp);
+                let mut tsharp = lane_tsharp_from_reads(srsrc, &reads_flat);
+                if tsharp.iter().all(|x| x.is_none()) {
+                    tsharp = lane_tsharp_from_srsrc(insts, apc, srsrc);
+                }
+                merge_lane_tsharp(out, apc, tsharp);
 
-            let origin = classify_vgpr(insts, vgpr0, &out.only_edge, join_pol);
-            out.origins.insert(apc, origin.clone());
-            let sampler = ad.enc.name == "ENC_MIMG" && f(ad, "SSAMP").is_some();
-            if let Some(expr) = heap_expr_from_source(&origin, sampler) {
-                out.lane_heap.insert(apc, expr);
-            } else {
-                out.lane_heap.insert(apc, LaneHeapExpr::VgprDword0(vgpr0));
+                let origin = classify_vgpr(insts, vgpr0, &out.only_edge, join_pol);
+                out.origins.insert(apc, origin.clone());
+                let sampler = ad.enc.name == "ENC_MIMG" && f(ad, "SSAMP").is_some();
+                if let Some(expr) = heap_expr_from_source(&origin, sampler) {
+                    out.lane_heap.insert(apc, expr);
+                } else {
+                    out.lane_heap.insert(apc, LaneHeapExpr::VgprDword0(vgpr0));
+                }
+                collect_loads(&origin, &mut out.waterfall.loads);
+                let extra = lane_tsharp_from_source(insts, &origin);
+                merge_lane_tsharp(out, apc, extra);
             }
-            collect_loads(&origin, &mut out.waterfall.loads);
-            let extra = lane_tsharp_from_source(insts, &origin);
-            merge_lane_tsharp(out, apc, extra);
+        }
+        if wf_raw.split || wf_raw.nested {
+            out.waterfall.split_refused.extend(
+                raw_apcs
+                    .iter()
+                    .copied()
+                    .filter(|pc| !peeled_met.contains(pc) && !out.waterfall.meet_ok.contains(pc)),
+            );
         }
     }
 }

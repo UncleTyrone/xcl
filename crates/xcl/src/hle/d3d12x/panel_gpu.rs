@@ -1,10 +1,12 @@
 //! GPU diagnostics overlay for the host panel (`XCL_PANEL=1` + `XCL_PANEL_GPU=1`).
 //!
-//! Copies a small CPU-rasterised status box onto the swap-chain back buffer before present.
-//! CGBJ draws glyphs on the title picture via a card-local texture; this is a GPL-2 subset
-//! (5×7 bitmap font + log line; optional window title still runs from [`super::panel`]).
-//! Card-local atlas depth (per-glyph texture tiles on the title heap) is **not** replicated —
-//! only the swap-chain blit path.
+//! Copies a CPU-rasterised status box onto the swap-chain back buffer before present.
+//! CGBJ keeps the painted box in a **card-local DEFAULT** buffer and rotates uploads; this GPL-2
+//! path mirrors that (upload ring → DEFAULT resident buffer → blit to back buffer).
+//!
+//! **Atlas gap (honest PARTIAL):** CGBJ-style per-glyph texture tiles on the title heap are **not**
+//! replicated. Glyphs are CPU-rasterised into the box each refresh; only the completed box lives
+//! on the card. Multi-line + height scale + common swap formats are supported.
 
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,9 +15,12 @@ use std::sync::{Mutex, OnceLock};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-const CELL_W: u32 = 6;
-const GLYPH_W: u32 = 5;
+const GLYPH: (u32, u32) = (5, 7);
+const CELL: (u32, u32) = (6, 9);
+const COLUMNS: u32 = 40;
+const LINES: u32 = 4;
 const RIM: u32 = 3;
+const UPLOADS: usize = 4;
 
 fn panel_gpu_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -30,11 +35,22 @@ pub(crate) fn gpu_wanted() -> bool {
     super::panel::visible() && panel_gpu_on()
 }
 
-static OVERLAY_TEXT: Mutex<String> = Mutex::new(String::new());
+static OVERLAY_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 pub(crate) fn set_overlay_text(line: impl Into<String>) {
-    if let Ok(mut g) = OVERLAY_TEXT.lock() {
-        *g = line.into();
+    let s = line.into();
+    let lines: Vec<String> = s
+        .lines()
+        .map(|l| l.chars().take(COLUMNS as usize).collect())
+        .filter(|l: &String| !l.is_empty())
+        .take(LINES as usize)
+        .collect();
+    if let Ok(mut g) = OVERLAY_LINES.lock() {
+        *g = if lines.is_empty() {
+            vec![s.chars().take(COLUMNS as usize).collect()]
+        } else {
+            lines
+        };
     }
 }
 
@@ -87,54 +103,105 @@ fn glyph_rows(c: u8) -> [u8; 7] {
     }
 }
 
-fn paint_rgba8(line: &str) -> (u32, u32, u32, Vec<u8>) {
-    let cols = line.len().min(38).max(1) as u32;
-    let w = RIM * 2 + cols * CELL_W;
-    let h = RIM * 2 + 9;
-    let pitch = (w * 4).div_ceil(256) * 256;
-    let mut buf = vec![0u8; (pitch * h) as usize];
-    let bg = [0u8, 0u8, 0u8, 200];
-    let fg = [240, 240, 240, 255];
-    for y in 0..h {
-        for x in 0..w {
-            let i = y as usize * pitch as usize + x as usize * 4;
-            buf[i..i + 4].copy_from_slice(&bg);
-        }
+fn scale_for(height: u32) -> u32 {
+    (height / 540).max(1).min(4)
+}
+
+fn box_size(scale: u32, line_count: u32) -> (u32, u32) {
+    let lines = line_count.max(1).min(LINES);
+    (
+        (COLUMNS * CELL.0 + 2 * RIM) * scale,
+        (lines * CELL.1 + 2 * RIM) * scale,
+    )
+}
+
+fn colours(format: DXGI_FORMAT) -> Option<[&'static [u8]; 2]> {
+    Some(match format {
+        DXGI_FORMAT_R8G8B8A8_UNORM
+        | DXGI_FORMAT_B8G8R8A8_UNORM
+        | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+        | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => [&[0, 0, 0, 0xFF], &[0xFF; 4]],
+        DXGI_FORMAT_R10G10B10A2_UNORM => [&[0, 0, 0, 0xC0], &[0xFF; 4]],
+        DXGI_FORMAT_R16G16B16A16_FLOAT => [
+            &[0, 0, 0, 0, 0, 0, 0, 0x3C],
+            &[0, 0x3C, 0, 0x3C, 0, 0x3C, 0, 0x3C],
+        ],
+        _ => return None,
+    })
+}
+
+fn lit(lines: &[String], x: u32, y: u32) -> bool {
+    let (Some(x), Some(y)) = (x.checked_sub(RIM), y.checked_sub(RIM)) else {
+        return false;
+    };
+    if x % CELL.0 >= GLYPH.0 || y % CELL.1 >= GLYPH.1 || x / CELL.0 >= COLUMNS {
+        return false;
     }
-    for (ci, ch) in line.bytes().take(38).enumerate() {
-        let rows = glyph_rows(ch);
-        let ox = RIM + ci as u32 * CELL_W;
-        let oy = RIM;
-        for (ry, row) in rows.iter().enumerate() {
-            for gx in 0..GLYPH_W {
-                if row & (1 << (GLYPH_W - 1 - gx)) != 0 {
-                    let px = ox + gx;
-                    let py = oy + ry as u32;
-                    if px < w && py < h {
-                        let i = py as usize * pitch as usize + px as usize * 4;
-                        buf[i..i + 4].copy_from_slice(&fg);
-                    }
+    let Some(&c) = lines
+        .get((y / CELL.1) as usize)
+        .and_then(|l| l.as_bytes().get((x / CELL.0) as usize))
+    else {
+        return false;
+    };
+    (glyph_rows(c)[(y % CELL.1) as usize] >> (GLYPH.0 - 1 - x % CELL.0)) & 1 != 0
+}
+
+fn painted(lines: &[String], scale: u32, colours: [&[u8]; 2], pitch: usize) -> Vec<u8> {
+    let (width, height) = box_size(scale, lines.len() as u32);
+    let bytes = colours[0].len();
+    let mut out = vec![0u8; pitch * height as usize];
+    for y in 0..height / scale {
+        let top = pitch * (y * scale) as usize;
+        for x in 0..width / scale {
+            let colour = colours[usize::from(lit(lines, x, y))];
+            for i in 0..scale {
+                let at = top + (x * scale + i) as usize * bytes;
+                if at + bytes <= out.len() {
+                    out[at..at + bytes].copy_from_slice(colour);
                 }
             }
         }
+        for i in 1..scale as usize {
+            let src = top..top + pitch;
+            let dst_start = top + i * pitch;
+            if dst_start + pitch <= out.len() {
+                out.copy_within(src, dst_start);
+            }
+        }
     }
-    (w, h, pitch, buf)
+    out
 }
 
-fn simple_hash(s: &str) -> u64 {
+fn simple_hash(lines: &[String], scale: u32, fmt: i32) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
-    for b in s.bytes() {
-        h ^= u64::from(b);
+    h ^= u64::from(scale);
+    h = h.wrapping_mul(0x100000001b3);
+    h ^= u64::from(fmt as u32);
+    h = h.wrapping_mul(0x100000001b3);
+    for line in lines {
+        for b in line.bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h ^= 0x0A;
         h = h.wrapping_mul(0x100000001b3);
     }
     h
 }
 
 struct GpuOverlay {
-    upload: ID3D12Resource,
+    uploads: Vec<ID3D12Resource>,
+    /// Card-local DEFAULT buffer holding the last painted box (CGBJ panel role).
+    card: ID3D12Resource,
+    turn: usize,
     w: u32,
     h: u32,
     pitch: u32,
+    format: DXGI_FORMAT,
+    scale: u32,
+    /// `card` already holds a copy and sits in COPY_SOURCE.
+    uploaded: bool,
+    fresh: bool,
 }
 
 static OVERLAY: Mutex<Option<(u64, GpuOverlay)>> = Mutex::new(None);
@@ -155,23 +222,62 @@ unsafe fn barrier(res: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3
     }
 }
 
-unsafe fn refresh_upload(dev: &ID3D12Device, line: &str) -> Option<()> {
-    let hash = simple_hash(line);
+unsafe fn ensure_overlay(
+    dev: &ID3D12Device,
+    lines: &[String],
+    fmt: DXGI_FORMAT,
+    scale: u32,
+) -> Option<()> {
+    let hash = simple_hash(lines, scale, fmt.0);
     let mut g = OVERLAY.lock().ok()?;
-    if g.as_ref().is_some_and(|(h, _)| *h == hash) {
+    if g.as_ref().is_some_and(|(h, o)| *h == hash && o.format == fmt && o.scale == scale) {
         return Some(());
     }
-    let (w, h, pitch, pixels) = paint_rgba8(line);
-    let mut upload: Option<ID3D12Resource> = None;
+    let colours = colours(fmt)?;
+    let (w, h) = box_size(scale, lines.len() as u32);
+    let pitch = (w * colours[0].len() as u32).div_ceil(256) * 256;
+    let pixels = painted(lines, scale, colours, pitch as usize);
+    let bytes = pixels.len() as u64;
+
+    let mut uploads = Vec::with_capacity(UPLOADS);
+    for _ in 0..UPLOADS {
+        let mut upload: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_UPLOAD,
+                ..Default::default()
+            },
+            D3D12_HEAP_FLAG_NONE,
+            &D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: bytes,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_UNKNOWN,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_NONE,
+                ..Default::default()
+            },
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            None,
+            &mut upload,
+        )
+        .ok()?;
+        uploads.push(upload?);
+    }
+
+    let mut card: Option<ID3D12Resource> = None;
     dev.CreateCommittedResource(
         &D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_UPLOAD,
+            Type: D3D12_HEAP_TYPE_DEFAULT,
             ..Default::default()
         },
         D3D12_HEAP_FLAG_NONE,
         &D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: pixels.len() as u64,
+            Width: bytes,
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
@@ -181,36 +287,34 @@ unsafe fn refresh_upload(dev: &ID3D12Device, line: &str) -> Option<()> {
             Flags: D3D12_RESOURCE_FLAG_NONE,
             ..Default::default()
         },
-        D3D12_RESOURCE_STATE_GENERIC_READ,
+        D3D12_RESOURCE_STATE_COMMON,
         None,
-        &mut upload,
+        &mut card,
     )
     .ok()?;
-    let upload = upload?;
+    let card = card?;
+
     let mut mapped = std::ptr::null_mut();
-    upload.Map(0, None, Some(&mut mapped)).ok()?;
+    uploads[0].Map(0, None, Some(&mut mapped)).ok()?;
     std::ptr::copy_nonoverlapping(pixels.as_ptr(), mapped.cast(), pixels.len());
-    upload.Unmap(0, None);
+    uploads[0].Unmap(0, None);
+
     *g = Some((
         hash,
         GpuOverlay {
-            upload,
+            uploads,
+            card,
+            turn: 0,
             w,
             h,
             pitch,
+            format: fmt,
+            scale,
+            uploaded: false,
+            fresh: true,
         },
     ));
     Some(())
-}
-
-fn overlay_format_ok(fmt: DXGI_FORMAT) -> bool {
-    matches!(
-        fmt,
-        DXGI_FORMAT_R8G8B8A8_UNORM
-            | DXGI_FORMAT_B8G8R8A8_UNORM
-            | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
-            | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
-    )
 }
 
 /// Copy the status box onto `back` (must already be in `before`; restored to `before` on return).
@@ -226,45 +330,77 @@ pub(crate) unsafe fn draw(
     if !gpu_wanted() {
         return;
     }
-    if !overlay_format_ok(fmt) {
+    if colours(fmt).is_none() {
         if !WARNED_FMT.swap(true, Ordering::Relaxed) {
             crate::xlog_info!(
-                "D3D12.X: XCL_PANEL_GPU skipped — swap format {:?} needs 8-bit RGBA (log/title panel still on)",
+                "D3D12.X: XCL_PANEL_GPU skipped — swap format {:?} unsupported (need 8-bit RGBA / 10:10:10:2 / half RGBA; log/title panel still on). Card-local per-glyph atlas not implemented.",
                 fmt.0
             );
         }
         return;
     }
-    let line = OVERLAY_TEXT.lock().ok().map(|g| g.clone()).unwrap_or_default();
-    if line.is_empty() {
+    let lines = OVERLAY_LINES.lock().ok().map(|g| g.clone()).unwrap_or_default();
+    if lines.is_empty() || lines.iter().all(|l| l.is_empty()) {
         return;
     }
-    if refresh_upload(dev, &line).is_none() {
+    let scale = scale_for(back_h);
+    if ensure_overlay(dev, &lines, fmt, scale).is_none() {
         return;
     }
-    let ov = OVERLAY.lock().ok().and_then(|g| g.as_ref().map(|(_, o)| (o.w, o.h, o.pitch, o.upload.clone())));
-    let Some((ow, oh, pitch, upload)) = ov else {
+    let mut guard = match OVERLAY.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let Some((_, ov)) = guard.as_mut() else {
         return;
     };
-    let copy_w = ow.min(back_w);
-    let copy_h = oh.min(back_h);
+    let copy_w = ov.w.min(back_w);
+    let copy_h = ov.h.min(back_h);
     if copy_w == 0 || copy_h == 0 {
         return;
     }
 
+    if std::mem::take(&mut ov.fresh) {
+        if ov.uploaded {
+            list.ResourceBarrier(&[barrier(
+                &ov.card,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )]);
+        }
+        list.CopyResource(&ov.card, &ov.uploads[ov.turn]);
+        list.ResourceBarrier(&[barrier(
+            &ov.card,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        )]);
+        ov.uploaded = true;
+    }
+
     list.ResourceBarrier(&[barrier(back, before, D3D12_RESOURCE_STATE_COPY_DEST)]);
     let src = D3D12_TEXTURE_COPY_LOCATION {
-        pResource: ManuallyDrop::new(Some(upload)),
+        pResource: ManuallyDrop::new(Some(ov.card.clone())),
         Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
             PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                 Offset: 0,
                 Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    Format: if matches!(
+                        fmt,
+                        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+                    ) {
+                        DXGI_FORMAT_B8G8R8A8_UNORM
+                    } else if fmt == DXGI_FORMAT_R10G10B10A2_UNORM {
+                        DXGI_FORMAT_R10G10B10A2_UNORM
+                    } else if fmt == DXGI_FORMAT_R16G16B16A16_FLOAT {
+                        DXGI_FORMAT_R16G16B16A16_FLOAT
+                    } else {
+                        DXGI_FORMAT_R8G8B8A8_UNORM
+                    },
                     Width: copy_w,
                     Height: copy_h,
                     Depth: 1,
-                    RowPitch: pitch,
+                    RowPitch: ov.pitch,
                 },
             },
         },

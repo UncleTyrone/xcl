@@ -7,8 +7,10 @@
 //! each enabled context's 256-byte PCM output ring from its input packets via
 //! [`crate::hle::xma2::Decoder`].
 //!
-//! Frame-at-a-time decode via [`crate::hle::xma2::frames::read_frame`]; loop boundaries reset
-//! the bit cursor from context word 3; overlap is carried across frames on each voice decoder.
+//! Frame-at-a-time decode via [`crate::hle::xma2::frames::read_frame`] +
+//! [`crate::hle::xma2::Decoder::decode_frame_exact`] (bit-exact mid-packet seek).
+//! Loop boundaries reset the bit cursor from context word 3; IMDCT overlap is carried across
+//! frames on each voice decoder (word 8 hardware overlap buffer is unused, matching CGBJ).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -233,12 +235,11 @@ fn decode_packets(context: Context, voice: &mut Voice) -> bool {
             context.set_field(2, 31, 1, 1);
             return !voice.pcm.is_empty();
         }
+        // Dual-input ping-pong: reset the bit cursor only. Keep decoder overlap so
+        // consecutive buffers of one voice seam cleanly (CGBJ does not flush here).
         current = 1 - current;
         context.set_field(4, 31, 1, current);
         context.set_field(2, 0, 26, 0);
-        if let Some(decoder) = &mut voice.decoder {
-            decoder.flush();
-        }
     }
     let (address, packets) = match current {
         0 => (context.get(5), context.field(0, 0, 12)),
@@ -277,15 +278,15 @@ fn decode_packets(context: Context, voice: &mut Voice) -> bool {
             }
         }
     };
-    let mut at_bits = context.field(2, 0, 26) as usize;
-    if at_bits < 32 {
-        at_bits = xma2::frames::default_frame_start(data);
-    }
+    // Mid-packet seek: word-2 bit cursor may land past the packet header inside a frame chain.
+    let at_bits = xma2::frames::seek_bit(data, context.field(2, 0, 26) as usize);
     let Some(frame) = xma2::frames::read_frame(data, at_bits) else {
         context.set_field(0, 20 + current, 1, 0);
         return true;
     };
-    let mut pcm = decoder.decode_frame_blob(&frame).unwrap_or_default();
+    let mut pcm = decoder
+        .decode_frame_exact(&frame.data, frame.bits)
+        .unwrap_or_default();
     let mut next = frame.next.unwrap_or(0);
     let loops = context.field(0, 12, 8);
     let loop_end = context.field(4, 0, 26) as usize;
@@ -298,6 +299,7 @@ fn decode_packets(context: Context, voice: &mut Voice) -> bool {
         if pcm.len() > keep {
             pcm.truncate(keep);
         }
+        // Seek to loop start bit (context word 3); keep IMDCT overlap across the loop edge.
         next = context.field(3, 0, 26) as usize;
         if loops != 255 {
             context.set_field(0, 12, 8, loops - 1);

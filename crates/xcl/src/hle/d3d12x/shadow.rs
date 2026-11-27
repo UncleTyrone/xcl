@@ -5,12 +5,14 @@
 //! are current; a turn-robin sweep compares held bytes to title for diagnostics.
 //!
 //! GPL-2 reimplementation from understanding of CGBJ `victory-gpu` shadow @ `80e8619`
-//! (study only — not a paste). Card staging metadata, `copy_back` / `merge_under_writes`, and
-//! loose / by-address copies extend the core held/copied journal (full D3D12 card twins optional).
+//! (study only — not a paste). Card staging metadata, `copy_back` / `merge_under_writes`,
+//! `card_merge` / relay skip, wide snapshot pool, and idle let-go of loose windows deepen the
+//! core held/copied journal (full D3D12 card twins optional).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use super::card_shadow;
 use super::land;
@@ -58,10 +60,15 @@ pub(crate) struct Shadow {
     card: Option<card_shadow::CardSide>,
     window: bool,
     by_address: bool,
+    /// Last touch for loose-window idle reclaim (`let_go_idle`).
+    used: Mutex<Option<Instant>>,
 }
 
 static LOOSE: RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = RwLock::new(BTreeMap::new());
-static SNAPS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
+/// Deferred wide snapshots: `(shadow_id, from_off, len)` copied held→before in [`apply_wide_snapshots`].
+static SNAPS: Mutex<Vec<(u64, usize, usize)>> = Mutex::new(Vec::new());
+/// Pooled `before` snapshot buffers (`XCL_SNAPSHOT_POOL`).
+static SNAP_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
 struct Entry {
     end: u64,
@@ -232,7 +239,12 @@ impl Shadow {
             card,
             window: false,
             by_address: false,
+            used: Mutex::new(Some(Instant::now())),
         })
+    }
+
+    fn touch(&self) {
+        *self.used.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
     }
 
     /// Offsets in the copy for title `[address, address+len)`.
@@ -386,17 +398,25 @@ impl Shadow {
 
     fn snapshot_before(&self) {
         let held = self.held.lock().unwrap_or_else(|e| e.into_inner());
-        *self.before.lock().unwrap_or_else(|e| e.into_inner()) = Some(held.clone());
-        if super::wide_back::enabled() {
-            let (off0, off1) = (0usize, held.len());
-            if off1 > off0 {
-                let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
-                snaps.push((self.start as usize + off0, off0, off1 - off0));
-            }
+        let n = held.len();
+        if super::wide_back::enabled() && n > 0 {
+            let mut before = pooled_snap(n);
+            before.resize(n, 0);
+            *self.before.lock().unwrap_or_else(|e| e.into_inner()) = Some(before);
+            SNAPS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((self.id, 0, n));
+            return;
         }
+        let mut snap = pooled_snap(n);
+        snap.clear();
+        snap.extend_from_slice(&held);
+        *self.before.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap);
     }
 
     /// After shaders ran: merge card-held bytes that changed since the snapshot into title memory.
+    /// Differing 64 KiB pieces are trimmed to first/last change; title gets dword-level `put_changed`.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
         let before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let Some(ref snap) = *before else {
@@ -406,23 +426,158 @@ impl Shadow {
         if off0 >= off1 || snap.len() < off1 {
             return 0;
         }
-        let held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
         let pieces = differing_pieces(self.start as usize, off0, off1, &held[off0..off1], &snap[off0..off1]);
         let mut written = 0usize;
+        let mut title_scratch = Vec::new();
         for (at, n) in pieces {
-            let title_va = self.start as usize + at;
-            let card = &held[at..at + n];
-            if unsafe { merge_if_covered(title_va, card, n) }.is_some() {
-                written += n;
+            let host = &mut held[at..at + n];
+            let old = &snap[at..at + n];
+            let Some(first) = first_difference(host, old) else {
+                continue;
+            };
+            let last = last_difference(host, old).unwrap_or(first);
+            let piece = last + 1 - first;
+            let title_va = self.start as usize + at + first;
+            let Some((base, boff)) = super::real::uma_window_buffer(title_va, piece) else {
+                if unsafe { merge_if_covered(title_va, &host[first..first + piece], piece) }.is_some() {
+                    written += piece;
+                }
+                continue;
+            };
+            let dst = (base + boff as usize) as *mut u8;
+            title_scratch.clear();
+            title_scratch.resize(piece, 0);
+            // SAFETY: UMA window covers `piece` bytes at `dst`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(dst, title_scratch.as_mut_ptr(), piece);
+            }
+            let mut differs = 0u8;
+            let was = title_scratch.clone();
+            for i in 0..piece {
+                let gpu = if (host[first + i] != old[first + i]) & (title_scratch[i] == old[first + i]) {
+                    0xffu8
+                } else {
+                    0
+                };
+                let merged = (title_scratch[i] & !gpu) | (host[first + i] & gpu);
+                differs |= merged ^ title_scratch[i];
+                title_scratch[i] = merged;
+                host[first + i] = merged;
+            }
+            if differs == 0 {
                 continue;
             }
-            if let Some((base, off)) = super::real::uma_window_buffer(title_va, n) {
-                let mut h = card.to_vec();
-                let (nb, _) = unsafe { land::merge_range(base + off as usize, card, &mut h, n) };
-                written += nb.max(n);
+            if unsafe { super::safecopy::put_changed(dst, &was, &title_scratch) } {
+                written += piece;
             }
         }
         written
+    }
+
+    /// Card-sided buffer: merge fetched GPU bytes at copy offset `at` into held and title.
+    pub(crate) fn card_merge(&self, at: usize, gpu: &[u8]) -> usize {
+        if self.card.is_none() || at + gpu.len() > self.len as usize {
+            return 0;
+        }
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(old) = held.get_mut(at..at + gpu.len()) else {
+            return 0;
+        };
+        let Some(first) = first_difference(gpu, old) else {
+            return 0;
+        };
+        let last = last_difference(gpu, old).unwrap_or(first);
+        let (at, n) = (at + first, last + 1 - first);
+        let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
+        let title_va = self.start as usize + at;
+        let mut title = vec![0u8; n];
+        let mut written = 0usize;
+        if let Some((base, boff)) = super::real::uma_window_buffer(title_va, n) {
+            let dst = (base + boff as usize) as *mut u8;
+            unsafe {
+                std::ptr::copy_nonoverlapping(dst, title.as_mut_ptr(), n);
+            }
+            let mut differs = 0u8;
+            let was = title.clone();
+            for i in 0..n {
+                let wrote = if gpu[i] != old[i] { 0xffu8 } else { 0 };
+                let merged = (title[i] & !wrote) | (gpu[i] & wrote);
+                differs |= merged ^ title[i];
+                title[i] = merged;
+                old[i] = merged;
+            }
+            if differs != 0 && unsafe { super::safecopy::put_changed(dst, &was, &title) } {
+                written = n;
+            }
+        } else {
+            old.copy_from_slice(gpu);
+        }
+        if let Some(card) = &self.card {
+            card.note_dirty(at, n);
+        }
+        written
+    }
+
+    /// Relay fetch for a card-sided copy: `gpu` is post-land held bytes; skip dirty / later-sent
+    /// runs; merge into title and the `before` snapshot (CPU-side stand-in for card twin).
+    pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64) -> usize {
+        let Some(card) = &self.card else {
+            return 0;
+        };
+        if at + gpu.len() > self.len as usize {
+            return 0;
+        }
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(ref mut snap) = *before else {
+            return 0;
+        };
+        let Some(old) = snap.get_mut(at..at + gpu.len()) else {
+            return 0;
+        };
+        let Some(first) = first_difference(gpu, old) else {
+            return 0;
+        };
+        let last = last_difference(gpu, old).unwrap_or(first);
+        let (at, n) = (at + first, last + 1 - first);
+        let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
+        let skip = card.skip_for_relay(fetched_after, at, n);
+        let mut title = vec![0u8; n];
+        let title_va = self.start as usize + at;
+        let mapped = if let Some((base, boff)) = super::real::uma_window_buffer(title_va, n) {
+            unsafe {
+                std::ptr::copy_nonoverlapping((base + boff as usize) as *const u8, title.as_mut_ptr(), n);
+            }
+            true
+        } else {
+            false
+        };
+        let was = title.clone();
+        let admitted = card_shadow::outside(at, at + n, skip);
+        let mut changed = false;
+        for &(a, b) in &admitted {
+            let (lo, hi) = (a - at, b - at);
+            changed |= card_shadow::merge_piece(&gpu[lo..hi], &mut old[lo..hi], &mut title[lo..hi]);
+        }
+        // Keep held in sync with the merged result on admitted spans.
+        if changed {
+            let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slot) = held.get_mut(at..at + n) {
+                for &(a, b) in &admitted {
+                    let (lo, hi) = (a - at, b - at);
+                    slot[lo..hi].copy_from_slice(&old[lo..hi]);
+                }
+            }
+        }
+        if !mapped || !changed {
+            return 0;
+        }
+        if let Some((base, boff)) = super::real::uma_window_buffer(title_va, n) {
+            if unsafe { super::safecopy::put_changed((base + boff as usize) as *mut u8, &was, &title) } {
+                return n;
+            }
+        }
+        0
     }
 
     /// Title memory under declared shader writes: pull title bytes into `held` where the title moved.
@@ -472,9 +627,10 @@ impl Shadow {
         wait
     }
 
-    /// Relay flight: one piece that changed on the card since the snapshot.
+    /// Relay flight: one piece that changed on the PC-side copy since the snapshot.
+    /// Card-sided copies use [`Shadow::card_merge_relay`] instead.
     pub(crate) fn relay_merge(&self, at: usize, n: usize) -> usize {
-        if n == 0 || at + n > self.len as usize {
+        if self.card.is_some() || n == 0 || at + n > self.len as usize {
             return 0;
         }
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -498,9 +654,16 @@ impl Shadow {
         let dst = unsafe {
             std::slice::from_raw_parts_mut((base + boff as usize) as *mut u8, piece)
         };
-        dst.copy_from_slice(&now[first..first + piece]);
-        snap[at + first..at + first + piece].copy_from_slice(&now[first..first + piece]);
-        piece
+        let was = dst.to_vec();
+        let mut title = was.clone();
+        if !card_shadow::merge_piece(&now[first..first + piece], &mut snap[at + first..at + first + piece], &mut title) {
+            return 0;
+        }
+        if unsafe { super::safecopy::put_changed(dst.as_mut_ptr(), &was, &title) } {
+            piece
+        } else {
+            0
+        }
     }
 
     /// Copy title bytes into held for whole pages marked stale vs `now` / `written`.
@@ -651,6 +814,7 @@ pub(crate) fn declare_gpu_writes(ranges: &[(usize, usize)]) {
             s.declare_write(lo, hi - lo);
         }
     }
+    apply_wide_snapshots();
 }
 
 /// After land-back: copy card deltas back and clear declared write spans.
@@ -704,6 +868,16 @@ pub(crate) fn finish_gpu_writes(ranges: &[(usize, usize)]) {
         }
     }
     SNAPS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    // Return finished snapshots to the pool.
+    for entry in map.values() {
+        if let Some(s) = entry.shadow.as_ref() {
+            if let Ok(mut before) = s.before.lock() {
+                if let Some(v) = before.take() {
+                    give_back_snap(v);
+                }
+            }
+        }
+    }
 }
 
 /// Exact relay: land deferred flights through shadow merge / copy-back.
@@ -711,7 +885,6 @@ pub(crate) fn relay_finish_ranges(ranges: &[(usize, usize)], order: u64) {
     if !enabled() || !super::relay::exact() {
         return;
     }
-    let _ = order;
     for &(va, n) in ranges {
         if n == 0 {
             continue;
@@ -721,9 +894,16 @@ pub(crate) fn relay_finish_ranges(ranges: &[(usize, usize)], order: u64) {
         let start = s.start as usize;
         let mut at = va.max(start);
         while at < end.min(start + s.len as usize) {
-            let n = (PIECE - at % PIECE).min(end - at);
-            let _ = s.relay_merge(at - start, n);
-            at += n;
+            let piece = (PIECE - at % PIECE).min(end - at);
+            let off = at - start;
+            if s.card.is_some() {
+                if let Some(gpu) = s.held_span(off, piece) {
+                    let _ = s.card_merge_relay(off, &gpu, order.saturating_sub(1));
+                }
+            } else {
+                let _ = s.relay_merge(off, piece);
+            }
+            at += piece;
         }
         if let Some(card) = &s.card {
             card.clear_sent_through(order);
@@ -738,17 +918,43 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     }
     let key = (start, len);
     if let Some(s) = LOOSE.read().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        s.touch();
         return Some(s.clone());
     }
-    let shadow = find(start, 1)?;
-    if shadow.len < len {
+    let covering = find(start, 1)?;
+    if covering.len < len {
         return None;
     }
     let mut m = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = m.get(&key) {
+        s.touch();
         return Some(s.clone());
     }
-    let arc = shadow.clone();
+    let arc = Arc::new(Shadow {
+        start,
+        len,
+        id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        held: Mutex::new(vec![0u8; len as usize]),
+        before: Mutex::new(None),
+        copied: Mutex::new(vec![0u64; pages_for(start, len)]),
+        pending: Mutex::default(),
+        landings: Mutex::default(),
+        landing: AtomicBool::new(false),
+        card: None,
+        window: true,
+        by_address: true,
+        used: Mutex::new(Some(Instant::now())),
+    });
+    LIVE.fetch_add(1, Ordering::Relaxed);
+    if let Ok(src) = covering.held.lock() {
+        let off = (start.saturating_sub(covering.start)) as usize;
+        let n = (len as usize).min(src.len().saturating_sub(off));
+        if n > 0 {
+            if let Ok(mut dst) = arc.held.lock() {
+                dst[..n].copy_from_slice(&src[off..off + n]);
+            }
+        }
+    }
     m.insert(key, arc.clone());
     Some(arc)
 }
@@ -764,9 +970,11 @@ pub(crate) fn find_for_read(address: u64, len: u64, loose: bool) -> Option<Arc<S
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         for ((s, l), shadow) in map.range((cell, 0)..=(address, u64::MAX)) {
             if *s + *l >= end {
+                shadow.touch();
                 return Some(shadow.clone());
             }
         }
+        drop(map);
         if let Some(s) = by_address(address, end - address) {
             return Some(s);
         }
@@ -774,8 +982,134 @@ pub(crate) fn find_for_read(address: u64, len: u64, loose: bool) -> Option<Arc<S
     peek(address, len).or_else(|| find(address, len))
 }
 
-pub(crate) fn take_wide_snapshots() -> Vec<(usize, usize, usize)> {
+fn pooled_snap(n: usize) -> Vec<u8> {
+    if !super::misc_env::snapshot_pool() || n == 0 {
+        return Vec::with_capacity(n);
+    }
+    let mut pool = SNAP_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let most = n.saturating_mul(4).max(1 << 20);
+    let fit = pool
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
+        .min_by_key(|(_, v)| v.capacity())
+        .map(|(i, _)| i);
+    match fit {
+        Some(i) => {
+            let mut v = pool.swap_remove(i);
+            v.clear();
+            v
+        }
+        None => Vec::with_capacity(n),
+    }
+}
+
+fn give_back_snap(v: Vec<u8>) {
+    if !super::misc_env::snapshot_pool() || v.capacity() == 0 {
+        return;
+    }
+    const KEPT_BYTES: usize = 512 << 20;
+    let mut pool = SNAP_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    pool.push(v);
+    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+    let mut total = 0usize;
+    let keep = 1024usize;
+    let mut cut = pool.len();
+    for (i, v) in pool.iter().enumerate() {
+        if i >= keep || total.saturating_add(v.capacity()) > KEPT_BYTES {
+            cut = i;
+            break;
+        }
+        total = total.saturating_add(v.capacity());
+    }
+    let n = pool.len();
+    pool.truncate(cut.max(1).min(n));
+}
+
+/// Copy deferred wide snapshots (held → before) on join workers when enabled.
+pub(crate) fn apply_wide_snapshots() {
+    let snaps = std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()));
+    if snaps.is_empty() {
+        return;
+    }
+    let jobs = snaps.len();
+    super::wide_back::parallel_for(jobs, &|i| {
+        let (id, from, len) = snaps[i];
+        let Some(s) = by_copy_id(id) else {
+            return;
+        };
+        let held = s.held.lock().unwrap_or_else(|e| e.into_inner());
+        let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(ref mut snap) = *before else {
+            return;
+        };
+        let end = (from + len).min(held.len()).min(snap.len());
+        if from < end {
+            snap[from..end].copy_from_slice(&held[from..end]);
+        }
+    });
+}
+
+/// Drain deferred snapshot notes (tests / diagnostics).
+pub(crate) fn take_wide_snapshots() -> Vec<(u64, usize, usize)> {
     std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Drop loose window copies held only by the directory and idle past the window policy.
+pub(crate) fn let_go_idle() {
+    const IDLE_FRAMES: u64 = 4;
+    let idle_ms = super::window_env::window_idle_effective(60_000);
+    let gone: Vec<Arc<Shadow>> = {
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        if map.is_empty() {
+            return;
+        }
+        let idle: Vec<(u64, u64)> = map
+            .iter()
+            .filter(|(_, s)| {
+                if Arc::strong_count(s) != 1 {
+                    return false;
+                }
+                let used = s.used.lock().unwrap_or_else(|e| e.into_inner());
+                match *used {
+                    Some(t) => t.elapsed() >= Duration::from_millis(idle_ms) && IDLE_FRAMES > 0,
+                    None => true,
+                }
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        idle.into_iter().filter_map(|k| map.remove(&k)).collect()
+    };
+    for shadow in gone {
+        LIVE.fetch_sub(1, Ordering::Relaxed);
+        if let Ok(mut before) = shadow.before.lock() {
+            if let Some(v) = before.take() {
+                give_back_snap(v);
+            }
+        }
+    }
+}
+
+/// Harvest card dirty runs for upload (joined); journals them as sent under `sent_as`.
+pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+    if !enabled() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let map = BUFFERS.read().unwrap_or_else(|e| e.into_inner());
+    for entry in map.values() {
+        let Some(shadow) = entry.shadow.as_ref() else { continue };
+        let Some(card) = shadow.card.as_ref() else { continue };
+        if !card.touched() {
+            continue;
+        }
+        let ranges = card.take_dirty(Some(sent_as), 0);
+        if !ranges.is_empty() {
+            let lens: Vec<(usize, usize)> = ranges.into_iter().map(|(a, b)| (a, b.saturating_sub(a))).collect();
+            out.push((shadow.clone(), lens));
+        }
+    }
+    out
 }
 
 /// Note landed ranges onto covering shadows (sparse beside path).
@@ -895,6 +1229,9 @@ mod tests {
     fn clear_dir() {
         BUFFERS.write().unwrap().clear();
         BY_RES.lock().unwrap().clear();
+        LOOSE.write().unwrap().clear();
+        SNAPS.lock().unwrap().clear();
+        SNAP_POOL.lock().unwrap().clear();
         LIVE.store(0, Ordering::Relaxed);
         ROBIN.store(0, Ordering::Relaxed);
     }

@@ -50,7 +50,7 @@ Usage:
       --direct [--sample N] [--seed S] [--validate] [--compare]: direct DXIL translator
       coverage over a seeded sample (default 200 programs, 0 = all); also
       --timeout, --max-bytes, --threads, --json, --hash H, --dump DIR.
-  xcl translate <file | folder | package.rpf> [--validate] [--pipelines] [--list] [--jobs N]
+  xcl translate <file | folder | package.rpf> [--validate] [--pipelines] [--list] [--json] [--jobs N]
                [--warm <hashes.txt|all>]
       Offline translator pass (forwards to `shaders --recomp`; --validate → --direct --validate).
       --warm hashes.txt|all: DXIL-cache-only warm (CGBJ translate --warm; XCL_WARM_SECONDS caps time).
@@ -147,13 +147,15 @@ fn translate_cmd(path: &std::path::Path, args: &[String]) -> i32 {
     let mut validate = false;
     let mut pipelines = false;
     let mut list = false;
+    let mut json = false;
     let mut warm: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--validate" => validate = true,
             "--pipelines" => pipelines = true,
-            "--list" | "--json" => list = true,
+            "--list" => list = true,
+            "--json" => json = true,
             "--warm" => {
                 i += 1;
                 match args.get(i) {
@@ -195,8 +197,11 @@ fn translate_cmd(path: &std::path::Path, args: &[String]) -> i32 {
             fwd.push("--direct".into());
             fwd.push("--validate".into());
         }
-        if list {
+        if json {
             fwd.push("--json".into());
+        }
+        if list {
+            fwd.push("--list".into());
         }
         return xcl::shaders::run(path, &fwd);
     }
@@ -210,8 +215,11 @@ fn translate_cmd(path: &std::path::Path, args: &[String]) -> i32 {
         fwd.push("--direct".into());
         fwd.push("--validate".into());
     }
-    if list {
+    if json {
         fwd.push("--json".into());
+    }
+    if list {
+        fwd.push("--list".into());
     }
     xcl::shaders::run(path, &fwd)
 }
