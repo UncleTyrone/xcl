@@ -1,9 +1,9 @@
-﻿# src/xcl (main) pareto env — Play-XCL / play.ps1 knobs with safe vs full split.
+﻿# src/xcl (main) play env — Play-XCL / play.ps1 knobs with safe vs full split.
 #
 # Usage:
-#   . .\scripts\pareto-main.ps1            # safe (rate-friendly; thin/join off like Play-XCL.cmd)
-#   . .\scripts\pareto-main.ps1 -Full      # denser residency/heap/awake (may lower presents/2s)
-#   . .\scripts\pareto-main.ps1 -Dev       # play.ps1 non-safe: THIN=1 JOIN_PARTS=8
+#   . .\scripts\play-env-main.ps1            # safe (rate-friendly; thin/join off like Play-XCL.cmd)
+#   . .\scripts\play-env-main.ps1 -Full      # denser residency/heap/awake (may lower presents/2s)
+#   . .\scripts\play-env-main.ps1 -Dev       # play.ps1 non-safe: THIN=1 JOIN_PARTS=8
 #   cargo build --release -p xcl
 
 param(
@@ -11,7 +11,7 @@ param(
     [switch]$Dev
 )
 
-$pareto = @{
+$xclEnv = @{
     XCL_TEXTURE_NO_WAIT         = '1'
     XCL_RELAY                   = '2'
     XCL_RELAY_COPY              = '1'
@@ -45,21 +45,21 @@ $pareto = @{
 }
 
 if ($Dev) {
-    $pareto['XCL_THIN'] = '1'
-    $pareto['XCL_JOIN_PARTS'] = '8'
-    $pareto['XCL_AMBIENT'] = '0.8'
+    $xclEnv['XCL_THIN'] = '1'
+    $xclEnv['XCL_JOIN_PARTS'] = '8'
+    $xclEnv['XCL_AMBIENT'] = '0.8'
 }
 
 if ($Full) {
-    $pareto['XCL_HEAP_STRIDES'] = '1'
-    $pareto['XCL_RESIDENCY'] = '1'
-    $pareto['XCL_FRAME_INTERVAL_MS'] = '16'
-    $pareto['XCL_GPU_AWAKE'] = '1'
+    $xclEnv['XCL_HEAP_STRIDES'] = '1'
+    $xclEnv['XCL_RESIDENCY'] = '1'
+    $xclEnv['XCL_FRAME_INTERVAL_MS'] = '16'
+    $xclEnv['XCL_GPU_AWAKE'] = '1'
 }
 
-foreach ($k in $pareto.Keys) {
-    Set-Item -Path "Env:$k" -Value $pareto[$k]
+foreach ($k in $xclEnv.Keys) {
+    Set-Item -Path "Env:$k" -Value $xclEnv[$k]
 }
 
 $label = if ($Dev) { 'dev' } elseif ($Full) { 'full' } else { 'safe' }
-Write-Host "src/xcl $label pareto env set ($($pareto.Count) XCL_* variables)."
+Write-Host "src/xcl $label play env set ($($xclEnv.Count) XCL_* variables)."

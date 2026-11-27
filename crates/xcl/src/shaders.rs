@@ -1,4 +1,4 @@
-//! `xcl shaders <file|folder> [--top N] [--json] [--recomp] [--compile N]` – statistics over
+﻿//! `xcl shaders <file|folder> [--top N] [--json] [--recomp] [--compile N]` – statistics over
 //! a shader corpus: formats, stages, FSSM variants and the RDNA2 instruction histogram that
 //! sets the recompiler's priorities. Inputs: a single blob, a folder (e.g. `<data>\shaders\`)
 //! or an RPF9 shader pack (records found by scanning, see `gpu::pack`). `--recomp`
@@ -1805,7 +1805,7 @@ fn precompile(
     let unused = AtomicUsize::new(0);
     let warm_skipped = AtomicUsize::new(0);
     let warm_seconds = crate::hle::d3d12x::bench_env::warm_seconds();
-    let done_keys = if pipelines { warm_done_keys(again) } else { Default::default() };
+    let done_keys = if pipelines.is_some() { warm_done_keys(again) } else { Default::default() };
     let done_keys = Mutex::new(done_keys);
     if let Some(u) = used {
         println!("--used-only: {} pipelines earlier runs used (used-pipelines.txt); compute programs of other pipelines are passed over", u.len());
@@ -1816,7 +1816,7 @@ fn precompile(
             Some(set) => println!("--warm: {} hashes asked", set.len()),
         }
     }
-    if pipelines && !again && !done_keys.lock().unwrap().is_empty() {
+    if pipelines.is_some() && !again && !done_keys.lock().unwrap().is_empty() {
         println!("warm resume: {} pipelines already in warm-done.txt ({})", done_keys.lock().unwrap().len(), warm_fingerprint());
     }
     // the compiles run on the DXC pool; these threads translate and keep it fed

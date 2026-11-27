@@ -1,6 +1,6 @@
 //! GPU-side constant/buffer fills before lists run (`XCL_CARD_STEPS=1|2`). Default off.
 //!
-//! Pareto env (see `scripts/pareto-amd.ps1`): `XCL_RELAY=2`, `XCL_CARD_STEPS=2`,
+//! Play env (see `scripts/play-env-amd.ps1`): `XCL_RELAY=2`, `XCL_CARD_STEPS=2`,
 //! `XCL_THIN=1`, `XCL_JOIN_PARTS=8`, `XCL_ASYNC_SUBMIT=1`, `XCL_LAND=1`, `XCL_WIDE_BACK=1`,
 //! `XCL_INDIRECT_BATCH=2`, `XCL_INDIRECT_WINDOW=1`, `XCL_AMBIENT=0.8`, `XCL_AMBIENT_AIR=1.5`,
 //! `XCL_PORT_CONSTANTS=1`, `XCL_PORT_CONSTANTS_ORDER=1`, renderer ports 2/5/6/7 as needed.
