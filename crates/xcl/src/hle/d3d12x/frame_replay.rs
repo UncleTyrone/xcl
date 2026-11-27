@@ -8,13 +8,14 @@
 //! frame; this path tracks queue submits, fence signals, present tokens/planes, structured list
 //! payloads, and title-memory content samples/chunks.
 //!
-//! ## VICFRAME role (GPL-2 `XCLFRAME` v4)
+//! ## VICFRAME role (GPL-2 `XCLFRAME` v5)
 //!
 //! | CGBJ role | XCL stand-in |
 //! |-----------|--------------|
-//! | `List.commands` | `ListPayload` ops blob (`XLST` snapshot + draw/dispatch notes) |
+//! | `List.commands` | `ListPayload` ops blob (`XLST` + draw/dispatch/indirect/mesh notes) |
 //! | `contents.bin` / `Content` | `ContentChunk` + `frames/frame_NNNN.contents.bin` |
-//! | Present picture / PresentX | Present plane tail + optional `XCL_REPLAY_PRESENT` re-issue |
+//! | `DescriptorHeap` spine | `HeapSnap` + GPU/CPU start handles (no slot-run codec) |
+//! | Present picture / PresentX | Present plane tail (resource + rect + GetDesc WH/format) + optional re-issue |
 //! | Offline `victory replay` | `xcl replay` inspect + `--listing` / `--edit` / `--pixel` / `--diverge` |
 //! | `--pixel` / `--diverge` / edit | Offline `frame_tools` on wire blobs (no live GPU texel probe) |
 //!
@@ -38,7 +39,7 @@
 //! | `XCL_RECORD_FRAMES` | Stop after N frames (unless `ALWAYS`) | `1` frame |
 //! | `XCL_RECORD_ALWAYS` | Keep recording every frame | off |
 //! | `XCL_RECORD_REFS` | Sidecar `refs/submit_*.ref.json` (pointer sets) | off |
-//! | `XCL_RECORD_WIRE` | Also write `frames/frame_NNNN.bin` (`XCLFRAME` v4) | off |
+//! | `XCL_RECORD_WIRE` | Also write `frames/frame_NNNN.bin` (`XCLFRAME` v5) | off |
 //! | `XCL_RECORD_CONTENTS` | With wire: title-memory samples/chunks | on when `XCL_RECORD_WIRE` |
 //! | `XCL_RECORD_CONTENTS=0` | Skip content samples (list meta/payload still written) | — |
 //! | `XCL_RECORD_LISTS` | Structured list payloads + draw/dispatch ops | on when `XCL_RECORD_WIRE` |
@@ -62,7 +63,7 @@ use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::{
-    ID3D12CommandList, ID3D12CommandQueue, ID3D12DescriptorHeap, ID3D12Fence,
+    ID3D12CommandList, ID3D12CommandQueue, ID3D12DescriptorHeap, ID3D12Fence, ID3D12Resource,
 };
 
 #[derive(Clone)]
@@ -188,6 +189,12 @@ struct PresentPlaneRec {
     resource: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rect: Option<[i32; 4]>,
+    #[serde(default)]
+    width: u32,
+    #[serde(default)]
+    height: u32,
+    #[serde(default)]
+    format: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +203,10 @@ struct HeapEntry {
     ty: u32,
     count: u32,
     flags: u32,
+    #[serde(default)]
+    gpu_start: u64,
+    #[serde(default)]
+    cpu_start: u64,
 }
 
 impl HeapEntry {
@@ -205,6 +216,8 @@ impl HeapEntry {
             ty: h.ty,
             count: h.count,
             flags: h.flags,
+            gpu_start: h.gpu_start,
+            cpu_start: h.cpu_start,
         }
     }
 
@@ -214,7 +227,32 @@ impl HeapEntry {
             ty: self.ty,
             count: self.count,
             flags: self.flags,
+            gpu_start: self.gpu_start,
+            cpu_start: self.cpu_start,
         }
+    }
+}
+
+fn plane_desc(resource: usize) -> (u32, u32, u32) {
+    if resource == 0 {
+        return (0, 0, 0);
+    }
+    let raw = resource as *mut std::ffi::c_void;
+    unsafe {
+        let Some(res) = ID3D12Resource::from_raw_borrowed(&raw) else {
+            return (0, 0, 0);
+        };
+        let d = res.GetDesc();
+        (d.Width as u32, d.Height, d.Format.0 as u32)
+    }
+}
+
+fn heap_starts(heap: &ID3D12DescriptorHeap) -> (u64, u64) {
+    unsafe {
+        (
+            heap.GetGPUDescriptorHandleForHeapStart().ptr as u64,
+            heap.GetCPUDescriptorHandleForHeapStart().ptr as u64,
+        )
     }
 }
 
@@ -231,13 +269,30 @@ pub fn note_descriptor_heap(ptr: usize, ty: u32, count: u32, flags: u32) {
     if settings().record_dir.is_none() || ptr == 0 {
         return;
     }
+    let (gpu_start, cpu_start) = {
+        let raw = ptr as *mut std::ffi::c_void;
+        unsafe {
+            ID3D12DescriptorHeap::from_raw_borrowed(&raw)
+                .map(|h| heap_starts(h))
+                .unwrap_or((0, 0))
+        }
+    };
     let mut g = KNOWN_HEAPS.lock().unwrap();
     if let Some(e) = g.iter_mut().find(|e| e.ptr == ptr) {
         e.ty = ty;
         e.count = count;
         e.flags = flags;
+        e.gpu_start = gpu_start;
+        e.cpu_start = cpu_start;
     } else {
-        g.push(HeapEntry { ptr, ty, count, flags });
+        g.push(HeapEntry {
+            ptr,
+            ty,
+            count,
+            flags,
+            gpu_start,
+            cpu_start,
+        });
     }
 }
 
@@ -277,9 +332,15 @@ pub fn note_present_context(queue: *mut c_void, planes: &[(usize, Option<[i32; 4
         queue: queue as usize,
         planes: planes
             .iter()
-            .map(|(r, rect)| PresentPlaneRec {
-                resource: *r,
-                rect: *rect,
+            .map(|(r, rect)| {
+                let (width, height, format) = plane_desc(*r);
+                PresentPlaneRec {
+                    resource: *r,
+                    rect: *rect,
+                    width,
+                    height,
+                    format,
+                }
             })
             .collect(),
     };
@@ -294,11 +355,14 @@ fn heap_meta_from_ptr(ptr: usize) -> Option<HeapEntry> {
     unsafe {
         let h = ID3D12DescriptorHeap::from_raw_borrowed(&raw)?;
         let d = h.GetDesc();
+        let (gpu_start, cpu_start) = heap_starts(h);
         Some(HeapEntry {
             ptr,
             ty: d.Type.0 as u32,
             count: d.NumDescriptors,
             flags: d.Flags.0 as u32,
+            gpu_start,
+            cpu_start,
         })
     }
 }
@@ -717,6 +781,9 @@ fn events_to_wire(events: &[RecordedEvent]) -> Vec<super::frame_wire::WireEvent>
                     .map(|p| super::frame_wire::PresentPlane {
                         resource: p.resource,
                         rect: p.rect,
+                        width: p.width,
+                        height: p.height,
+                        format: p.format,
                     })
                     .collect(),
             }),
@@ -820,6 +887,9 @@ fn recorded_from_wire(events: &[super::frame_wire::WireEvent]) -> Vec<RecordedEv
                     .map(|p| PresentPlaneRec {
                         resource: p.resource,
                         rect: p.rect,
+                        width: p.width,
+                        height: p.height,
+                        format: p.format,
                     })
                     .collect(),
             }),
@@ -1543,6 +1613,8 @@ mod tests {
                     ty: 0,
                     count: 16,
                     flags: 1,
+                    gpu_start: 0x1111,
+                    cpu_start: 0x2222,
                 }],
             },
             RecordedEvent::Present {
@@ -1553,6 +1625,9 @@ mod tests {
                 planes: vec![PresentPlaneRec {
                     resource: 0x99,
                     rect: Some([0, 0, 8, 8]),
+                    width: 8,
+                    height: 8,
+                    format: 28,
                 }],
             },
         ];

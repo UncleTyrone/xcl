@@ -13,6 +13,8 @@ use super::frame_wire::{self, list_op, fnv1a32, WireEvent};
 /// One decoded record inside a [`WireEvent::ListPayload`] `ops` blob.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ListOp {
+    /// `D3D12_COMMAND_LIST_TYPE` from the XLST snap (`LIST_KIND`).
+    ListKind(u32),
     BindIds { pso: u64, rs: u64 },
     Heaps(Vec<u64>),
     TouchVa { va: u64, len: u32 },
@@ -23,8 +25,19 @@ pub enum ListOp {
         instances: u32,
         first: u32,
         base: i32,
+        /// Present on `DRAW_EX`; 0 when decoded from legacy `DRAW`.
+        first_instance: u32,
     },
     Dispatch { x: u32, y: u32, z: u32 },
+    Indirect {
+        sig: u64,
+        max: u32,
+        args: u64,
+        args_off: u64,
+        count: u64,
+        count_off: u64,
+    },
+    DispatchMesh { x: u32, y: u32, z: u32 },
     /// Unknown tag kept so edit round-trips do not drop future ops.
     Raw(Vec<u8>),
 }
@@ -44,6 +57,10 @@ pub fn decode_ops(ops: &[u8]) -> Result<Vec<ListOp>, String> {
         let tag = ops[i];
         i += 1;
         match tag {
+            list_op::LIST_KIND => {
+                let kind = take_u32(ops, &mut i)?;
+                out.push(ListOp::ListKind(kind));
+            }
             list_op::BIND_IDS => {
                 let pso = take_u64(ops, &mut i)?;
                 let rs = take_u64(ops, &mut i)?;
@@ -67,19 +84,25 @@ pub fn decode_ops(ops: &[u8]) -> Result<Vec<ListOp>, String> {
                 let end = take_u64(ops, &mut i)?;
                 out.push(ListOp::Written { va, end });
             }
-            list_op::DRAW => {
+            list_op::DRAW | list_op::DRAW_EX => {
                 let indexed = *ops.get(i).ok_or("truncated DRAW")? != 0;
                 i += 1;
                 let count = take_u32(ops, &mut i)?;
                 let instances = take_u32(ops, &mut i)?;
                 let first = take_u32(ops, &mut i)?;
                 let base = take_i32(ops, &mut i)?;
+                let first_instance = if tag == list_op::DRAW_EX {
+                    take_u32(ops, &mut i)?
+                } else {
+                    0
+                };
                 out.push(ListOp::Draw {
                     indexed,
                     count,
                     instances,
                     first,
                     base,
+                    first_instance,
                 });
             }
             list_op::DISPATCH => {
@@ -87,6 +110,22 @@ pub fn decode_ops(ops: &[u8]) -> Result<Vec<ListOp>, String> {
                 let y = take_u32(ops, &mut i)?;
                 let z = take_u32(ops, &mut i)?;
                 out.push(ListOp::Dispatch { x, y, z });
+            }
+            list_op::INDIRECT => {
+                out.push(ListOp::Indirect {
+                    sig: take_u64(ops, &mut i)?,
+                    max: take_u32(ops, &mut i)?,
+                    args: take_u64(ops, &mut i)?,
+                    args_off: take_u64(ops, &mut i)?,
+                    count: take_u64(ops, &mut i)?,
+                    count_off: take_u64(ops, &mut i)?,
+                });
+            }
+            list_op::DISPATCH_MESH => {
+                let x = take_u32(ops, &mut i)?;
+                let y = take_u32(ops, &mut i)?;
+                let z = take_u32(ops, &mut i)?;
+                out.push(ListOp::DispatchMesh { x, y, z });
             }
             other => {
                 // Cannot size unknown tags; stash remainder so callers see the break.
@@ -129,22 +168,59 @@ pub fn encode_ops(ops: &[ListOp]) -> Vec<u8> {
                 out.extend_from_slice(&va.to_le_bytes());
                 out.extend_from_slice(&end.to_le_bytes());
             }
+            ListOp::ListKind(kind) => {
+                out.push(list_op::LIST_KIND);
+                out.extend_from_slice(&kind.to_le_bytes());
+            }
             ListOp::Draw {
                 indexed,
                 count,
                 instances,
                 first,
                 base,
+                first_instance,
             } => {
-                out.push(list_op::DRAW);
-                out.push(u8::from(*indexed));
-                out.extend_from_slice(&count.to_le_bytes());
-                out.extend_from_slice(&instances.to_le_bytes());
-                out.extend_from_slice(&first.to_le_bytes());
-                out.extend_from_slice(&base.to_le_bytes());
+                if *first_instance != 0 {
+                    out.push(list_op::DRAW_EX);
+                    out.push(u8::from(*indexed));
+                    out.extend_from_slice(&count.to_le_bytes());
+                    out.extend_from_slice(&instances.to_le_bytes());
+                    out.extend_from_slice(&first.to_le_bytes());
+                    out.extend_from_slice(&base.to_le_bytes());
+                    out.extend_from_slice(&first_instance.to_le_bytes());
+                } else {
+                    out.push(list_op::DRAW);
+                    out.push(u8::from(*indexed));
+                    out.extend_from_slice(&count.to_le_bytes());
+                    out.extend_from_slice(&instances.to_le_bytes());
+                    out.extend_from_slice(&first.to_le_bytes());
+                    out.extend_from_slice(&base.to_le_bytes());
+                }
             }
             ListOp::Dispatch { x, y, z } => {
                 out.push(list_op::DISPATCH);
+                out.extend_from_slice(&x.to_le_bytes());
+                out.extend_from_slice(&y.to_le_bytes());
+                out.extend_from_slice(&z.to_le_bytes());
+            }
+            ListOp::Indirect {
+                sig,
+                max,
+                args,
+                args_off,
+                count,
+                count_off,
+            } => {
+                out.push(list_op::INDIRECT);
+                out.extend_from_slice(&sig.to_le_bytes());
+                out.extend_from_slice(&max.to_le_bytes());
+                out.extend_from_slice(&args.to_le_bytes());
+                out.extend_from_slice(&args_off.to_le_bytes());
+                out.extend_from_slice(&count.to_le_bytes());
+                out.extend_from_slice(&count_off.to_le_bytes());
+            }
+            ListOp::DispatchMesh { x, y, z } => {
+                out.push(list_op::DISPATCH_MESH);
                 out.extend_from_slice(&x.to_le_bytes());
                 out.extend_from_slice(&y.to_le_bytes());
                 out.extend_from_slice(&z.to_le_bytes());
@@ -216,7 +292,9 @@ pub fn edit_ops(ops: &[ListOp], opts: &EditOpts) -> (Vec<ListOp>, EditReport) {
             ListOp::Draw { .. } if opts.skip_draws || opts.meta_only => {
                 report.draws_dropped += 1;
             }
-            ListOp::Dispatch { .. } if opts.skip_dispatches || opts.meta_only => {
+            ListOp::Dispatch { .. } | ListOp::DispatchMesh { .. } | ListOp::Indirect { .. }
+                if opts.skip_dispatches || opts.meta_only =>
+            {
                 report.dispatches_dropped += 1;
             }
             other => out.push(other.clone()),
@@ -277,6 +355,7 @@ pub fn cli_listing(dir: &Path, frame_filter: Option<u64>, json: bool) -> Result<
             let summary: Vec<String> = decoded
                 .iter()
                 .map(|op| match op {
+                    ListOp::ListKind(k) => format!("list_kind {k}"),
                     ListOp::BindIds { pso, rs } => format!("bind pso={pso:#x} rs={rs:#x}"),
                     ListOp::Heaps(h) => format!("heaps {}", h.len()),
                     ListOp::TouchVa { va, len } => format!("touch {va:#x}+{len}"),
@@ -285,12 +364,15 @@ pub fn cli_listing(dir: &Path, frame_filter: Option<u64>, json: bool) -> Result<
                         indexed,
                         count,
                         instances,
+                        first_instance,
                         ..
                     } => format!(
-                        "draw{} n={count} inst={instances}",
+                        "draw{} n={count} inst={instances} first_inst={first_instance}",
                         if *indexed { "i" } else { "" }
                     ),
                     ListOp::Dispatch { x, y, z } => format!("dispatch {x}x{y}x{z}"),
+                    ListOp::Indirect { max, .. } => format!("indirect max={max}"),
+                    ListOp::DispatchMesh { x, y, z } => format!("dispatch_mesh {x}x{y}x{z}"),
                     ListOp::Raw(r) => format!("raw {} B", r.len()),
                 })
                 .collect();
@@ -817,7 +899,9 @@ pub fn cli_diverge(
                             for op in decoded {
                                 match op {
                                     ListOp::Draw { .. } => draws += 1,
-                                    ListOp::Dispatch { .. } => disp += 1,
+                                    ListOp::Dispatch { .. }
+                                    | ListOp::DispatchMesh { .. }
+                                    | ListOp::Indirect { .. } => disp += 1,
                                     _ => {}
                                 }
                             }
@@ -941,6 +1025,7 @@ mod tests {
 
     fn sample_ops() -> Vec<u8> {
         encode_ops(&[
+            ListOp::ListKind(0),
             ListOp::BindIds { pso: 0xA, rs: 0xB },
             ListOp::Heaps(vec![0x10, 0x20]),
             ListOp::TouchVa { va: 0x1000, len: 0 },
@@ -954,8 +1039,26 @@ mod tests {
                 instances: 1,
                 first: 0,
                 base: 0,
+                first_instance: 0,
+            },
+            ListOp::Draw {
+                indexed: false,
+                count: 6,
+                instances: 2,
+                first: 0,
+                base: 0,
+                first_instance: 4,
             },
             ListOp::Dispatch { x: 8, y: 1, z: 1 },
+            ListOp::DispatchMesh { x: 2, y: 2, z: 1 },
+            ListOp::Indirect {
+                sig: 0x50,
+                max: 8,
+                args: 0x100,
+                args_off: 0,
+                count: 0x200,
+                count_off: 0,
+            },
         ])
     }
 
@@ -963,7 +1066,14 @@ mod tests {
     fn ops_roundtrip() {
         let raw = sample_ops();
         let decoded = decode_ops(&raw).unwrap();
-        assert_eq!(decoded.len(), 6);
+        assert_eq!(decoded.len(), 10);
+        assert!(matches!(
+            &decoded[6],
+            ListOp::Draw {
+                first_instance: 4,
+                ..
+            }
+        ));
         let again = encode_ops(&decoded);
         assert_eq!(decode_ops(&again).unwrap(), decoded);
     }
@@ -979,9 +1089,17 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(rep.draws_dropped, 1);
-        assert_eq!(rep.dispatches_dropped, 1);
-        assert!(edited.iter().all(|o| !matches!(o, ListOp::Draw { .. } | ListOp::Dispatch { .. })));
+        assert_eq!(rep.draws_dropped, 2);
+        assert_eq!(rep.dispatches_dropped, 3);
+        assert!(edited.iter().all(|o| {
+            !matches!(
+                o,
+                ListOp::Draw { .. }
+                    | ListOp::Dispatch { .. }
+                    | ListOp::DispatchMesh { .. }
+                    | ListOp::Indirect { .. }
+            )
+        }));
     }
 
     #[test]
@@ -1039,6 +1157,9 @@ mod tests {
                 planes: vec![frame_wire::PresentPlane {
                     resource: 0x99,
                     rect: Some([0, 0, 64, 64]),
+                    width: 64,
+                    height: 64,
+                    format: 0,
                 }],
             },
         ];

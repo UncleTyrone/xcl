@@ -33,6 +33,7 @@ pub mod resolver;
 pub mod rpf;
 mod rpf_probe;
 pub mod shaders;
+pub mod translate_tally;
 #[cfg(test)]
 mod source_hash;
 pub mod state;

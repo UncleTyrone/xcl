@@ -144,10 +144,41 @@ pub fn default_frame_start(data: &[u8]) -> usize {
     32 + packet(data, 0).map_or(0, |p| p.first_frame_bit as usize)
 }
 
+/// Resolve a hardware bit cursor for seek: values below 32 become the first frame of packet 0;
+/// otherwise the cursor is used as a mid-packet / cross-packet frame start.
+pub fn seek_bit(data: &[u8], cursor: usize) -> usize {
+    if cursor < HEADER_BITS {
+        default_frame_start(data)
+    } else {
+        cursor
+    }
+}
+
+/// Walk frames from `start` until `target` is reached or passed; returns the frame that
+/// contains `target` when `target` falls inside a frame, else the frame beginning at `target`.
+pub fn frame_covering(data: &[u8], start: usize, target: usize) -> Option<Frame> {
+    let mut at = seek_bit(data, start);
+    while let Some(frame) = read_frame(data, at) {
+        if frame.start == target {
+            return Some(frame);
+        }
+        if frame.start < target {
+            if frame.next.is_none_or(|n| target < n) {
+                // Target sits inside this frame's payload (loop-end bit mid-frame).
+                return Some(frame);
+            }
+            at = frame.next?;
+            continue;
+        }
+        return None;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hle::xma2::tests::MONO_48K_PREFIX;
+    use crate::hle::xma2::tests::{pad_packet, MONO_48K_PREFIX};
 
     #[test]
     fn packet_header_and_frame_chain() {
@@ -161,5 +192,33 @@ mod tests {
         if let Some(n) = f.next {
             assert!(read_frame(data, n).is_some());
         }
+    }
+
+    #[test]
+    fn mid_packet_seek_reads_second_frame() {
+        let data = pad_packet(MONO_48K_PREFIX);
+        let start = default_frame_start(&data);
+        let first = read_frame(&data, start).expect("first");
+        let second_at = first.next.expect("second frame exists");
+        assert!(second_at > start);
+        assert!(second_at > HEADER_BITS);
+        let second = read_frame(&data, second_at).expect("mid-packet seek");
+        assert_eq!(second.start, second_at);
+        assert!(second.bits > LENGTH_BITS as usize);
+        // Seek helper: cursor below header → first frame; exact bit → that frame.
+        assert_eq!(seek_bit(&data, 0), start);
+        assert_eq!(seek_bit(&data, second_at), second_at);
+        let covered = frame_covering(&data, start, second_at).expect("cover");
+        assert_eq!(covered.start, second_at);
+    }
+
+    #[test]
+    fn seek_into_frame_payload_returns_containing_frame() {
+        let data = pad_packet(MONO_48K_PREFIX);
+        let start = default_frame_start(&data);
+        let first = read_frame(&data, start).expect("first");
+        let inside = first.start + (first.bits / 2).max(1);
+        let covered = frame_covering(&data, start, inside).expect("inside first");
+        assert_eq!(covered.start, first.start);
     }
 }

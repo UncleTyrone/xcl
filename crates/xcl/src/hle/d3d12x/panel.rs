@@ -2,8 +2,8 @@
 //!
 //! CGBJ draws white bitmap text onto the swap chain (F3 toggles). XCL currently samples the same
 //! counter set into the log twice a second when the latch is on, and toggles visibility with F3
-//! when an XCL/title window is foreground. Set `XCL_PANEL_GPU=1` for a small GPU status box
-//! on the swap-chain back buffer (8-bit RGBA formats only); full CGBJ glyph+scale depth is still open.
+//! when an XCL/title window is foreground. Set `XCL_PANEL_GPU=1` for a GPU status box on the
+//! swap-chain back buffer (card-local DEFAULT blit + multi-line/scale; per-glyph atlas still open).
 //!
 //! Study-only reference: CGBJ `victory-gpu` `host/panel.rs` (GPL-3); this file is GPL-2.
 
@@ -91,12 +91,12 @@ pub(crate) fn on_frame(frame: u64) {
         _ => "vram unknown".into(),
     };
     let line = format!(
-        "FPS {fps:.1}  DRAWS {d_draws:.0}  DISPATCH {d_disp:.0}  frame={frame}  {mem}"
+        "FPS {fps:.1}  DRAWS {d_draws:.0}  DISPATCH {d_disp:.0}  frame={frame}\n{mem}"
     );
     super::panel_gpu::set_overlay_text(&line);
-    crate::xlog_info!("XCL PANEL {line}");
+    crate::xlog_info!("XCL PANEL {}", line.replace('\n', " | "));
     if let Some(hwnd) = super::present::window_hwnd() {
-        let title = format!("XCL | {line}");
+        let title = format!("XCL | {}", line.replace('\n', "  "));
         let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
         unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(hwnd, wide.as_ptr());

@@ -565,6 +565,8 @@ struct Agg {
     /// translate programs (`--recomp`), keep this many complete HLSL samples
     recomp_on: bool,
     keep: usize,
+    /// CGBJ-style translate tally (`--list` / resources / untraced_used).
+    tally: crate::translate_tally::Tally,
     rc: RecompAgg,
     iface_on: bool,
     iface: IfaceAgg,
@@ -620,6 +622,7 @@ impl Agg {
         let keep = self.keep;
         self.rc.merge(o.rc, keep);
         self.iface.merge(o.iface);
+        self.tally.merge(o.tally);
     }
 
     fn add(&mut self, name: &str, blob: &[u8]) {
@@ -630,6 +633,9 @@ impl Agg {
             return;
         }
         let Some(sh) = xbox::parse(blob) else { return };
+        if self.recomp_on {
+            self.tally.note_container();
+        }
         *self.by_stage.entry(sh.stage.clone()).or_default() += 1;
         let mut failed = !sh.notes.is_empty() || sh.fssm.is_empty();
         let mut st = xbox::InstStats::default();
@@ -672,7 +678,38 @@ impl Agg {
                 let mode = recomp::interface(blob, &sh, f).unwrap_or(recomp::Mode::Kernel);
                 for p in &f.programs {
                     let keep = self.keep;
-                    self.rc.add(&format!("{name} FSSM#{fi}"), &f.data[p.offset..p.offset + p.len], keep, mode.clone());
+                    let label = format!("{name} FSSM#{fi}");
+                    let code = &f.data[p.offset..p.offset + p.len];
+                    let before_complete = self.rc.complete;
+                    let before_errors = self.rc.errors;
+                    let before_err_len = self.rc.error_examples.len();
+                    self.rc.add(&label, code, keep, mode.clone());
+                    let stage = match &mode {
+                        recomp::Mode::Vertex(_) => "VS",
+                        recomp::Mode::Pixel(_) => "PS",
+                        recomp::Mode::Mesh(_) => "MS",
+                        recomp::Mode::Compute(_) => "CS",
+                        recomp::Mode::Kernel => "kernel",
+                        recomp::Mode::Geometry(_) => "GS",
+                    };
+                    let complete = self.rc.complete > before_complete;
+                    let err_owned: Option<String> = if self.rc.errors > before_errors {
+                        self.rc.error_examples.get(before_err_len).map(|e| {
+                            e.split_once(": ")
+                                .map(|(_, r)| r.to_string())
+                                .unwrap_or_else(|| e.clone())
+                        })
+                    } else {
+                        None
+                    };
+                    self.tally.observe_program(
+                        &label,
+                        stage,
+                        f,
+                        code,
+                        complete,
+                        err_owned.as_deref(),
+                    );
                     // `--example name=…`: FSSM header (up to the code) as dwords, once
                     if EXAMPLE_FOR.get().is_some_and(|w| w.starts_with("name=")) && !HEADER_SHOWN.swap(true, Ordering::Relaxed) {
                         let end = f.code.map(|c| c.0).unwrap_or(0x400).min(f.data.len()).min(0x800);
@@ -742,7 +779,7 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn analyze(input: &Input, recomp_on: bool, keep: usize, iface_on: bool) -> Agg {
+fn analyze(input: &Input, recomp_on: bool, keep: usize, iface_on: bool, list: bool) -> Agg {
     let n = input.len();
     let next = AtomicUsize::new(0);
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(32);
@@ -750,7 +787,16 @@ fn analyze(input: &Input, recomp_on: bool, keep: usize, iface_on: bool) -> Agg {
         let handles: Vec<_> = (0..threads)
             .map(|_| {
                 s.spawn(|| {
-                    let mut a = Agg { recomp_on, keep, iface_on, ..Default::default() };
+                    let mut a = Agg {
+                        recomp_on,
+                        keep,
+                        iface_on,
+                        tally: crate::translate_tally::Tally {
+                            list,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= n {
@@ -767,7 +813,16 @@ fn analyze(input: &Input, recomp_on: bool, keep: usize, iface_on: bool) -> Agg {
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    let mut agg = Agg { recomp_on, keep, iface_on, ..Default::default() };
+    let mut agg = Agg {
+        recomp_on,
+        keep,
+        iface_on,
+        tally: crate::translate_tally::Tally {
+            list,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     for p in parts {
         agg.merge(p);
     }
@@ -798,6 +853,8 @@ fn coverage(agg: &Agg, order: &[String], ks: &[usize]) -> Vec<(usize, usize)> {
 struct ShadersOptions {
     top: usize,
     json: bool,
+    /// Per-program outcome lines + resource/untraced_used summary (CGBJ `translate --list`).
+    list: bool,
     compile: usize,
     recomp: bool,
     iface: bool,
@@ -837,6 +894,7 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
     let mut opts = ShadersOptions {
         top: 60,
         json: false,
+        list: false,
         compile: 0,
         recomp: false,
         iface: false,
@@ -874,6 +932,10 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
         match arg {
             "--top" => opts.top = p.parse_usize("--top")?,
             "--json" => opts.json = true,
+            "--list" => {
+                opts.list = true;
+                opts.recomp = true; // tally needs translation survey
+            }
             "--compile" => opts.compile = p.parse_usize("--compile")?,
             "--recomp" => opts.recomp = true,
             "--iface" => opts.iface = true,
@@ -930,8 +992,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     };
     let top = opts.top;
     let json = opts.json;
+    let list = opts.list;
     let compile = opts.compile;
-    let recomp_on = compile > 0 || opts.recomp;
+    let recomp_on = compile > 0 || opts.recomp || list;
     let iface_on = opts.iface;
     if let Some(m) = &opts.example {
         let _ = EXAMPLE_FOR.set(m.clone());
@@ -959,9 +1022,18 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             // one shader file: the record to export or measure
             (Input::Files(vec![path.to_path_buf()]), "single file".to_string())
         } else {
-            let mut a = Agg { recomp_on, keep: compile, iface_on, ..Default::default() };
+            let mut a = Agg {
+                recomp_on,
+                keep: compile,
+                iface_on,
+                tally: crate::translate_tally::Tally {
+                    list,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
             a.add(&path.display().to_string(), &data);
-            return print(path, "single file", a, top, json, t0, compile);
+            return print(path, "single file", a, top, json, list, t0, compile);
         }
     };
     if let Some(dir) = &opts.export_hlsl {
@@ -1016,9 +1088,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     if opts.direct {
         return direct_sweep(&input, &opts, t0);
     }
-    let agg = analyze(&input, recomp_on, compile, iface_on);
+    let agg = analyze(&input, recomp_on, compile, iface_on, list);
     drop(input);
-    print(path, &what, agg, top, json, t0, compile)
+    print(path, &what, agg, top, json, list, t0, compile)
 }
 
 #[cfg(test)]
@@ -2199,7 +2271,16 @@ fn compile_samples(samples: &[(String, String, &'static str)]) -> (usize, Vec<St
 }
 
 #[allow(clippy::too_many_arguments)]
-fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::time::Instant, compile: usize) -> i32 {
+fn print(
+    path: &Path,
+    what: &str,
+    agg: Agg,
+    top: usize,
+    json: bool,
+    list: bool,
+    t0: std::time::Instant,
+    compile: usize,
+) -> i32 {
     let rc = &agg.rc;
     let compiled = if compile > 0 && !rc.samples.is_empty() { Some(compile_samples(&rc.samples)) } else { None };
     let mut missing: Vec<(&String, &(usize, usize))> = rc.missing.iter().collect();
@@ -2238,6 +2319,7 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
             "implementation_order": order,
             "coverage_top_k": cov.iter().map(|(k, c)| serde_json::json!({ "k": k, "shaders": c })).collect::<Vec<_>>(),
             "mnemonics": mnemonics,
+            "translate_tally": agg.recomp_on.then(|| agg.tally.to_json()),
             "recomp": agg.recomp_on.then(|| serde_json::json!({
                 "programs": rc.programs,
                 "complete": rc.complete,
@@ -2255,6 +2337,12 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
         });
         println!("{}", serde_json::to_string_pretty(&v).unwrap());
         return 0;
+    }
+
+    if list || agg.recomp_on {
+        // CGBJ `translate` summary block (resources / untraced_used / structured).
+        agg.tally.print_summary();
+        println!();
     }
 
     println!("{} – {what}", path.display());
@@ -2628,7 +2716,7 @@ mod tests {
         let data = std::fs::read(&p).unwrap();
         let mut records = pack::scan(&data, 0x40);
         records.truncate(300);
-        let agg = analyze(&Input::Pack { data, records }, false, 0, false);
+        let agg = analyze(&Input::Pack { data, records }, false, 0, false, false);
         assert_eq!(agg.inflate_errors, 0);
         assert_eq!(agg.by_kind.get("xbox-native"), Some(&agg.total), "{:?}", agg.by_kind);
         assert_eq!(agg.failed_count, 0, "{:?}", agg.failed);
