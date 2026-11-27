@@ -81,7 +81,12 @@ fn should_enable(mode: Mode, vendor_id: u32) -> bool {
 
 fn configured_mode() -> Mode {
     static MODE: OnceLock<Mode> = OnceLock::new();
-    *MODE.get_or_init(|| parse_mode(std::env::var("XCL_GPU_AWAKE").ok().as_deref()))
+    *MODE.get_or_init(|| parse_mode(
+            std::env::var("XCL_GPU_AWAKE")
+                .or_else(|_| std::env::var("XCL_CARD_AWAKE"))
+                .ok()
+                .as_deref(),
+        ))
 }
 
 static STARTED: OnceLock<()> = OnceLock::new();

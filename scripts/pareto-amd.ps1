@@ -31,6 +31,10 @@ $pareto = @{
     XCL_TEXTURE_NO_WAIT         = '1'
     XCL_UPLOAD_AHEAD            = '1'
     XCL_LEVELS_ON_DEMAND        = '1'
+    XCL_HEAP_STRIDES            = '1'
+    XCL_GPU_AWAKE               = 'auto'
+    XCL_RESIDENCY               = '1'
+    XCL_FRAME_INTERVAL_MS       = '16'
 }
 
 foreach ($k in $pareto.Keys) {
