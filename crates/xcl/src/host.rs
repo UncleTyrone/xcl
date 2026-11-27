@@ -22,6 +22,10 @@ pub fn host_main(boot_path: &Path) -> i32 {
         boot.config.log_to_stderr,
     );
     crate::log::log_panics();
+    if crate::log_window::wanted(boot.config.log_window) {
+        let name = crate::launcher::display_name(&boot.game_root).unwrap_or_else(|| boot.title.clone());
+        crate::log_window::open(&name, &boot.logs_dir().join("xcl.log"));
+    }
     crate::xlog_info!("XCL {} – host for '{}'", env!("CARGO_PKG_VERSION"), boot.title);
     crate::xlog_info!("game: {} (read-only folder: {})", boot.exe_path.display(), boot.game_root.display());
     crate::xlog_info!("XCL data: {}", boot.data_dir.display());
@@ -107,6 +111,31 @@ pub fn host_main(boot_path: &Path) -> i32 {
             }
         });
     }
+    // The console's timer is fine-grained: a title's `Sleep(1)` and short timed waits take about
+    // a millisecond there. A Windows process gets 15.6 ms steps unless it asks (per process since
+    // Windows 10 2004), and a retail title's audio thread then asked for a 20 ms packet only every
+    // 45 – 62 ms (three or four steps): a third of its audio. `XCL_TIMER_RESOLUTION=0` leaves the
+    // system default.
+    if std::env::var("XCL_TIMER_RESOLUTION").map_or(true, |v| v.trim() != "0") {
+        #[link(name = "winmm", kind = "raw-dylib")]
+        extern "system" {
+            fn timeBeginPeriod(period: u32) -> u32;
+        }
+        let r = unsafe { timeBeginPeriod(1) };
+        crate::xlog_info!("timer resolution: 1 ms asked for the process (timeBeginPeriod: {r})");
+    }
+    // `XCL_RUN_SECONDS=n`: the title ends itself after n seconds – the GPU drained, the log and
+    // report written (a process killed from outside with GPU work in flight can hang in the driver)
+    if let Some(secs) = std::env::var("XCL_RUN_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            let (shown, presented) = crate::hle::d3d12x::present::counters();
+            crate::xlog_info!("XCL_RUN_SECONDS: {secs} s – ending the title ({shown} frames shown, {presented} PresentX calls)");
+            crate::report::write_final(None);
+            crate::log::flush();
+            crate::hle::d3d12x::real::end_title(0);
+        });
+    }
     crate::stubs::init_db(&boot.config.stub_returns);
     crate::hle::init(&boot.config);
     crate::hle::kernelx::fine_timer();
@@ -132,20 +161,14 @@ pub fn host_main(boot_path: &Path) -> i32 {
     }
     crate::eh::install_crash_handler();
     crate::eh::start_probes();
-    crate::hle::d3d12x::backend_before_guest();
     HOST_MODE.store(true, Ordering::Release);
 
-    // `XCL_RUN_SECONDS=n`: the title ends itself after n seconds – the GPU drained, the log and
-    // report written (a process killed from outside with GPU work in flight can hang in the driver)
-    if let Some(secs) = std::env::var("XCL_RUN_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()) {
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(secs));
-            let (shown, presented) = crate::hle::d3d12x::present::counters();
-            crate::xlog_info!("XCL_RUN_SECONDS: {secs} s – ending the title ({shown} frames shown, {presented} PresentX calls)");
-            crate::report::write_final(None);
-            crate::log::flush();
-            crate::hle::d3d12x::real::end_title(0);
-        });
+    let title_dir = boot.game_root.as_path();
+    if let Err(e) = crate::loader::title_preflight::check_or_bail(&boot.exe_path, title_dir) {
+        crate::xlog_error!("{e}");
+        eprintln!("xcl: {e}");
+        crate::report::write_final(Some(e.clone()));
+        return 0x7C1_0003;
     }
 
     let main = match crate::loader::load_main(&boot.exe_path) {
@@ -157,6 +180,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
         }
     };
     unsafe { crate::hle::kernelx::adopt_title_hooks(&main) };
+    crate::boot_diag::start_after_main(main.base, main.size, &boot.cache_dir());
     crate::report::write_final(None);
     let code = crate::loader::run_main(&main);
     crate::xlog_info!("game entry point returned code {code}");

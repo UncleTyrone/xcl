@@ -9,6 +9,7 @@
 pub mod log;
 pub mod manifest;
 pub(crate) mod cli;
+pub mod boot_diag;
 pub mod config;
 pub mod disasm;
 pub mod eh;
