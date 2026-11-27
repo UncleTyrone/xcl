@@ -8,14 +8,14 @@ pub fn enabled() -> bool {
     super::port::thin()
 }
 
-/// Parallel translate workers when thin is on (`XCL_JOIN_PARTS`, default 8). Ignored when thin is off.
+/// Parallel translate workers when thin is on (`XCL_JOIN_PARTS`, else `XCL_THIN_THREADS`, default 8).
 pub fn join_parts() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
         let n = std::env::var("XCL_JOIN_PARTS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(8);
+            .unwrap_or_else(|| super::render_env::thin_threads());
         n.clamp(1, 64)
     })
 }

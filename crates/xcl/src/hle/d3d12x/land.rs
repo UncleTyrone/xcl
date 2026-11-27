@@ -72,13 +72,19 @@ pub fn taken() -> bool {
     super::render_env::land_taken()
 }
 
-/// Worker count (`XCL_LAND_THREADS`, default ~cpus/4 clamped 1–4).
+/// Worker count (`XCL_LAND_THREADS`, else `XCL_UNDER_THREADS`, else ~cpus/4 clamped 1–4).
 pub fn threads() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("XCL_LAND_THREADS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
+            .or_else(|| {
+                let n = super::render_env::under_threads();
+                (std::env::var_os("XCL_UNDER_THREADS").is_some()
+                    || std::env::var_os("VICTORY_UNDER_THREADS").is_some())
+                .then_some(n)
+            })
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get() / 4).clamp(1, 4))
             .clamp(1, 16)
     })
