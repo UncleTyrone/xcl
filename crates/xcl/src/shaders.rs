@@ -1252,6 +1252,8 @@ struct Pipelines {
     most: usize,
     /// DXIL bytes a pipeline is still handed to the driver (`XCL_PIPELINE_MAX_KB`, 8 MiB; 0: off)
     max_dxil: usize,
+    /// Offline warm telemetry (`warm-done.txt` / `warm-bad.txt` / `slow-pipelines.txt`).
+    warm: Option<std::sync::Mutex<WarmBook>>,
     #[cfg(test)]
     cache_dir: Option<PathBuf>,
 }
@@ -1484,6 +1486,7 @@ impl Pipelines {
                 running: (Mutex::new(0), std::sync::Condvar::new()),
                 most,
                 max_dxil,
+                warm: None,
                 #[cfg(test)]
                 cache_dir: None,
             })
@@ -1527,7 +1530,14 @@ impl Pipelines {
     }
 
     fn make_one(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], chained: bool, path_override: Option<PathBuf>) {
+        use std::time::Instant;
         use windows::Win32::Graphics::Direct3D12::*;
+        let lib_key = crate::hle::d3d12x::real::compute_library_key(dxil, samplers, 0, chained);
+        if let Some(w) = self.warm.as_ref() {
+            if w.lock().unwrap().skip(&lib_key) {
+                return;
+            }
+        }
         let key: (bool, Vec<u32>) = (chained, samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect());
         let rs = {
             let mut g = self.signatures.lock().unwrap();
@@ -1565,6 +1575,9 @@ impl Pipelines {
                     self.lib_reused.fetch_add(1, Ordering::Relaxed);
                     self.reused.fetch_add(1, Ordering::Relaxed);
                     let done = self.made.fetch_add(1, Ordering::Relaxed) + 1;
+                    if let Some(w) = self.warm.as_ref() {
+                        w.lock().unwrap().note_done(&lib_key);
+                    }
                     drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
                     if done % 25 == 0 {
                         eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
@@ -1599,6 +1612,7 @@ impl Pipelines {
             }
             *n += 1;
         }
+        let compile_start = self.warm.is_some().then(Instant::now);
         let from_cache = cached.as_ref().and_then(|bytes| {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
             // a driver that cannot use the blob may compile from the DXIL itself and still
@@ -1620,6 +1634,7 @@ impl Pipelines {
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
             return;
         }
+        let hit_driver_cache = from_cache.is_some();
         let r = if let Some(pso) = from_cache {
             self.reused.fetch_add(1, Ordering::Relaxed);
             Ok(pso)
@@ -1642,6 +1657,13 @@ impl Pipelines {
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
         let done = match r {
             Ok(pso) => {
+                if let (Some(start), Some(w)) = (compile_start, self.warm.as_ref()) {
+                    if !hit_driver_cache {
+                        let ms = start.elapsed().as_secs_f64() * 1000.0;
+                        w.lock().unwrap().note_slow(&lib_key, ms);
+                    }
+                    w.lock().unwrap().note_done(&lib_key);
+                }
                 if !has_override {
                     if let Some(lib) = self.library.as_ref() {
                         if unsafe { lib.store(&lib_key, &pso) } {
@@ -1651,7 +1673,12 @@ impl Pipelines {
                 }
                 self.made.fetch_add(1, Ordering::Relaxed) + 1
             }
-            Err(_) => self.refused.fetch_add(1, Ordering::Relaxed) + 1,
+            Err(_) => {
+                if let Some(w) = self.warm.as_ref() {
+                    w.lock().unwrap().note_bad(&lib_key);
+                }
+                self.refused.fetch_add(1, Ordering::Relaxed) + 1
+            }
         };
         if done % 25 == 0 {
             eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
@@ -1749,12 +1776,14 @@ fn warm_done_path() -> PathBuf {
     recomp::dxc::cache_dir().join("warm-done.txt")
 }
 
-fn warm_done_keys(again: bool) -> std::collections::HashSet<String> {
-    if again {
-        return std::collections::HashSet::new();
-    }
-    let fp = warm_fingerprint();
-    std::fs::read_to_string(warm_done_path())
+const WARM_SLOW_MS: f64 = 1000.0;
+
+fn warm_sidecar_path(name: &str) -> PathBuf {
+    recomp::dxc::cache_dir().join(name)
+}
+
+fn warm_recorded_keys(path: &Path, fp: &str) -> std::collections::HashSet<String> {
+    std::fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
         .filter_map(|l| l.split_once(' '))
@@ -1763,14 +1792,76 @@ fn warm_done_keys(again: bool) -> std::collections::HashSet<String> {
         .collect()
 }
 
-fn warm_done_note(key: &str) {
+fn warm_done_keys(again: bool) -> std::collections::HashSet<String> {
+    if again {
+        return std::collections::HashSet::new();
+    }
+    warm_recorded_keys(&warm_done_path(), &warm_fingerprint())
+}
+
+fn warm_bad_keys(again: bool) -> std::collections::HashSet<String> {
+    if again {
+        return std::collections::HashSet::new();
+    }
+    warm_recorded_keys(&warm_sidecar_path("warm-bad.txt"), &warm_fingerprint())
+}
+
+fn warm_append_line(path: &Path, line: &str) {
     use std::io::Write;
-    let path = warm_done_path();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{} {key}", warm_fingerprint());
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+fn warm_done_note(key: &str) {
+    warm_append_line(&warm_done_path(), &format!("{} {key}", warm_fingerprint()));
+}
+
+fn warm_bad_note(key: &str) {
+    warm_append_line(&warm_sidecar_path("warm-bad.txt"), &format!("{} {key}", warm_fingerprint()));
+}
+
+fn warm_slow_note(key: &str, ms: f64) {
+    warm_append_line(&warm_sidecar_path("slow-pipelines.txt"), &format!("{key} {ms:.0}"));
+}
+
+/// Resume lists for offline `xcl warm` / `translate --pipelines` (`warm-done.txt`, `warm-bad.txt`).
+struct WarmBook {
+    done: std::collections::HashSet<String>,
+    bad: std::collections::HashSet<String>,
+}
+
+impl WarmBook {
+    fn new(again: bool) -> Self {
+        Self {
+            done: warm_done_keys(again),
+            bad: warm_bad_keys(again),
+        }
+    }
+
+    fn skip(&self, key: &str) -> bool {
+        self.done.contains(key) || self.bad.contains(key)
+    }
+
+    fn note_done(&mut self, key: &str) {
+        if self.done.insert(key.to_owned()) {
+            warm_done_note(key);
+        }
+    }
+
+    fn note_bad(&mut self, key: &str) {
+        if self.bad.insert(key.to_owned()) {
+            warm_bad_note(key);
+        }
+    }
+
+    fn note_slow(&self, key: &str, ms: f64) {
+        if ms >= WARM_SLOW_MS {
+            warm_slow_note(key, ms);
+        }
     }
 }
 
@@ -1796,6 +1887,9 @@ fn precompile(
         if startup.is_some() && std::env::var_os("XCL_PIPELINE_MAX_KB").is_none() {
             p.max_dxil = 0;
         }
+        if startup.is_none() {
+            p.warm = Some(Mutex::new(WarmBook::new(again)));
+        }
         Some(p)
     } else {
         None
@@ -1811,8 +1905,6 @@ fn precompile(
     let warm_time = warm_limit.is_some_and(|n| n > 0);
     let warm_timed_out = std::sync::atomic::AtomicBool::new(false);
     let warm_seen = warm_hashes.is_some().then(|| Mutex::new(std::collections::HashSet::<String>::new()));
-    let done_keys = if pipelines.is_some() { warm_done_keys(again) } else { Default::default() };
-    let done_keys = Mutex::new(done_keys);
     if let Some(u) = used {
         println!("--used-only: {} pipelines earlier runs used (used-pipelines.txt); compute programs of other pipelines are passed over", u.len());
     }
@@ -1825,8 +1917,18 @@ fn precompile(
     if let Some(secs) = warm_limit.filter(|&n| n > 0) {
         println!("--warm time cap: {secs} s (XCL_WARM_SECONDS)");
     }
-    if pipelines.is_some() && !again && !done_keys.lock().unwrap().is_empty() {
-        println!("warm resume: {} pipelines already in warm-done.txt ({})", done_keys.lock().unwrap().len(), warm_fingerprint());
+    if let Some(p) = pipelines {
+        if let Some(w) = &p.warm {
+            let book = w.lock().unwrap();
+            if !again && !book.done.is_empty() {
+                println!(
+                    "warm resume: {} in warm-done.txt, {} in warm-bad.txt ({})",
+                    book.done.len(),
+                    book.bad.len(),
+                    warm_fingerprint()
+                );
+            }
+        }
     }
     // the compiles run on the DXC pool; these threads translate and keep it fed
     let threads = recomp::dxc::compile_threads() + 2;

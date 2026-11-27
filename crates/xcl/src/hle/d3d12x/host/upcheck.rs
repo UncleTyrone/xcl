@@ -1,8 +1,13 @@
 //! Up-copy freshness check (`XCL_UPCOPY_CHECK=1`).
 //!
 //! Notes CPU-side bytes before a send-up; at rest (frame line) compares noted
-//! ranges with what was recorded as `new`. A full GPU compare pass (CGBJ
-//! compute) is not required for the latch to drive real accounting.
+//! ranges with what was recorded as `new`.
+//!
+//! **GPU compare (PARTIAL):** CGBJ's live pass re-reads card-resident bytes with a small compute
+//! shader after relay staging (`VICTORY_RELAY=2`). Windows has no portable API to mmap title GPU
+//! VAs into a host probe buffer without the full shadow/relay card path, so XCL stops at honest
+//! CPU churn accounting in [`sweep_rest`]. A host-GPU compare would require wiring probe CSO +
+//! mapped staging through `shadow`/`relay` (out of scope for the default spine).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};

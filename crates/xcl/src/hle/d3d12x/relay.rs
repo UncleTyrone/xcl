@@ -62,6 +62,9 @@ fn ensure_worker() {
                 unsafe {
                     if let Some(queue) = ID3D12CommandQueue::from_raw_borrowed(&qptr) {
                         super::sparse::readback_after_execute_sync(queue, &job.ranges);
+                        if exact() {
+                            super::shadow::relay_finish_ranges(&job.ranges, job.order);
+                        }
                     }
                 }
                 LANDED_ORDER.store(job.order, Ordering::Release);

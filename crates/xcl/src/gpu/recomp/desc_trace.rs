@@ -11,7 +11,8 @@
 //! - per-lane T# dwords 0..3 from waterfall `v_readfirstlane` sources (not only dword0)
 //! - join `only_edge` + lane_masks BDD polarity + Structured-style `guarded` PCs
 //!
-//! Full Structured-BDD `meet` per compare and IR-level phi reconstruction remain subset/approximate.
+//! Nested single-access-block waterfalls may still `meet_ok` when `!split`; per-compare pairing +
+//! `guarded` refusal approximate Structured `meet`. IR-level phi reconstruction remains subset.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -167,8 +168,11 @@ pub fn trace(insts: &[Decoded]) -> DescTrace {
         }
     }
     let masks_ok = lane_masks::analyze(insts, wave64).is_ok();
-    prove_waterfalls(insts, wave64, masks_ok, &mut out);
+    let join_pol = lane_masks::join_polarity(insts, wave64).ok();
+    let guarded = out.guarded.clone();
+    prove_waterfalls(insts, wave64, masks_ok, &guarded, join_pol.as_ref(), &mut out);
     prove_scc_selects(insts, &mut out);
+    prove_per_lane_tsharp(insts, join_pol.as_ref(), &mut out);
     out
 }
 
@@ -392,12 +396,32 @@ fn scan_waterfall_loops(insts: &[Decoded]) -> Vec<ScannedWaterfall> {
     raw
 }
 
+fn compare_uses_readfirstlane(insts: &[Decoded], cmp_pc: u64, reads: &[(u64, u64, u64)]) -> bool {
+    let by_pc: HashMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
+    let Some(&ci) = by_pc.get(&cmp_pc) else {
+        return false;
+    };
+    let d = &insts[ci];
+    if !d.inst.name.starts_with("V_CMP") {
+        return false;
+    }
+    let src0 = f(d, "SRC0").unwrap_or(0);
+    let src1 = f(d, "VSRC1").or_else(|| f(d, "SRC1")).unwrap_or(0);
+    let sg = |code: u64| if code >= 256 { None } else { Some(code) };
+    let vg = |code: u64| if code >= 256 { Some(code - 256) } else { None };
+    reads.iter().any(|&(_, dst, vgpr)| {
+        sg(src0) == Some(dst) && vg(src1) == Some(vgpr)
+            || sg(src1) == Some(dst) && vg(src0) == Some(vgpr)
+    })
+}
+
 fn waterfall_meet_ok(
     insts: &[Decoded],
     wf: &ScannedWaterfall,
     masks_ok: bool,
+    guarded: &BTreeSet<u64>,
 ) -> bool {
-    if wf.split || wf.nested {
+    if wf.split {
         return false;
     }
     let structural = wf.saveexec_at.is_some_and(|se| {
@@ -410,14 +434,37 @@ fn waterfall_meet_ok(
     if !structural {
         return false;
     }
+    let reads_flat: Vec<(u64, u64, u64)> = wf
+        .reads
+        .iter()
+        .map(|&(pc, _, dst, v)| (pc, dst, v))
+        .collect();
+    if !wf
+        .compares
+        .iter()
+        .all(|&c| compare_uses_readfirstlane(insts, c, &reads_flat))
+    {
+        return false;
+    }
+    let apcs: Vec<u64> = wf.accesses.iter().map(|&(p, _)| p).collect();
+    if apcs.iter().any(|pc| guarded.contains(pc)) {
+        return false;
+    }
     if !masks_ok {
         return true;
     }
-    // BDD subset: every compare sits on a guarded path (lane_masks reach) and matches a readfirstlane.
+    // BDD subset: compares pair with readfirstlanes; nested loops still get structural meet when !split.
     wf.compares.len() <= wf.reads.len().saturating_add(2)
 }
 
-fn prove_waterfalls(insts: &[Decoded], _wave64: bool, masks_ok: bool, out: &mut DescTrace) {
+fn prove_waterfalls(
+    insts: &[Decoded],
+    _wave64: bool,
+    masks_ok: bool,
+    guarded: &BTreeSet<u64>,
+    join_pol: Option<&BTreeMap<u64, Vec<(u64, bool)>>>,
+    out: &mut DescTrace,
+) {
     let by_pc: HashMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
     for wf in scan_waterfall_loops(insts) {
         out.waterfall
@@ -426,12 +473,19 @@ fn prove_waterfalls(insts: &[Decoded], _wave64: bool, masks_ok: bool, out: &mut 
         out.waterfall.compares.extend(wf.compares.iter().copied());
         let apcs: Vec<u64> = wf.accesses.iter().map(|&(p, _)| p).collect();
         out.waterfall.accesses.extend(apcs.iter().copied());
-        let meet = waterfall_meet_ok(insts, &wf, masks_ok);
+        let meet = waterfall_meet_ok(insts, &wf, masks_ok, guarded);
         if meet {
             out.waterfall.meet_ok.extend(apcs.iter().copied());
         }
-        if wf.split || wf.nested {
+        if wf.split {
             out.waterfall.split_refused.extend(apcs.iter().copied());
+        } else if wf.nested {
+            out.waterfall.split_refused.extend(
+                apcs
+                    .iter()
+                    .copied()
+                    .filter(|pc| !out.waterfall.meet_ok.contains(pc)),
+            );
         }
         let reads_flat: Vec<(u64, u64, u64)> = wf
             .reads
@@ -439,7 +493,7 @@ fn prove_waterfalls(insts: &[Decoded], _wave64: bool, masks_ok: bool, out: &mut 
             .map(|&(pc, _, dst, v)| (pc, dst, v))
             .collect();
         for &apc in &apcs {
-            if wf.split || wf.nested {
+            if wf.split {
                 continue;
             }
             let Some(ai) = by_pc.get(&apc) else { continue };
@@ -461,7 +515,7 @@ fn prove_waterfalls(insts: &[Decoded], _wave64: bool, masks_ok: bool, out: &mut 
             }
             merge_lane_tsharp(out, apc, tsharp);
 
-            let origin = classify_vgpr(insts, vgpr0, &out.only_edge);
+            let origin = classify_vgpr(insts, vgpr0, &out.only_edge, join_pol);
             out.origins.insert(apc, origin.clone());
             let sampler = ad.enc.name == "ENC_MIMG" && f(ad, "SSAMP").is_some();
             if let Some(expr) = heap_expr_from_source(&origin, sampler) {
@@ -510,8 +564,91 @@ fn prove_scc_selects(insts: &[Decoded], out: &mut DescTrace) {
             out.lane_heap.insert(d.pc, expr);
             let ts = lane_tsharp_from_srsrc(insts, d.pc, Some(srsrc));
             let extra = lane_tsharp_from_source(insts, &sel);
-            merge_lane_tsharp(out, d.pc, merge_tsharp_slots(ts, extra));
+            let mut words = merge_tsharp_slots(ts, extra);
+            for k in 0..4u64 {
+                if words[k as usize].is_some() {
+                    continue;
+                }
+                if let Some(slot) = lane_tsharp_select_dword(insts, d.pc, srsrc + k, shift) {
+                    words[k as usize] = Some(slot);
+                }
+            }
+            merge_lane_tsharp(out, d.pc, words);
         }
+    }
+}
+
+/// Per-dword SCC select when set/clear arms map to distinct lane VGPR roots (dwords 1..3).
+fn lane_tsharp_select_dword(
+    insts: &[Decoded],
+    access_pc: u64,
+    sgpr: u64,
+    shift: u8,
+) -> Option<u64> {
+    let w0 = last_sgpr_writer(insts, access_pc, sgpr)?;
+    let (set0, clear0) = match w0.inst.name {
+        "S_CSELECT_B32" => (f(w0, "SSRC0")?, f(w0, "SSRC1")?),
+        "S_CSELECT_B64" => (f(w0, "SSRC0")?, f(w0, "SSRC1")?),
+        "S_CMOV_B32" => (f(w0, "SSRC0")?, sgpr),
+        "S_CMOV_B64" => (f(w0, "SSRC0")?, sgpr),
+        _ => return None,
+    };
+    if set0 == clear0 {
+        return sgpr_to_lane_vgpr(insts, w0.pc, set0);
+    }
+    let set = classify_select_arm(insts, w0.pc, set0, shift)?;
+    let clear = classify_select_arm(insts, w0.pc, clear0, shift)?;
+    if set == clear {
+        return sgpr_to_lane_vgpr(insts, w0.pc, set0);
+    }
+    let vs = sgpr_to_lane_vgpr(insts, w0.pc, set0);
+    let vc = sgpr_to_lane_vgpr(insts, w0.pc, clear0);
+    match (vs, vc) {
+        (Some(a), Some(b)) if a == b => Some(a),
+        (Some(a), _) => Some(a),
+        (_, Some(b)) => Some(b),
+        _ => None,
+    }
+}
+
+/// Fill `lane_tsharp` for accesses whose origin is Fetched / Lanes / uniform Select (not only waterfall).
+fn prove_per_lane_tsharp(
+    insts: &[Decoded],
+    join_pol: Option<&BTreeMap<u64, Vec<(u64, bool)>>>,
+    out: &mut DescTrace,
+) {
+    for d in insts {
+        if !matches!(
+            d.enc.name,
+            "ENC_MIMG" | "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL"
+        ) {
+            continue;
+        }
+        if out.lane_tsharp.get(&d.pc).is_some_and(|t| t.iter().filter(|w| w.is_some()).count() >= 2) {
+            continue;
+        }
+        let Some(srsrc) = f(d, "SRSRC").map(|v| v * rdna2::register_scale("SRSRC")) else {
+            continue;
+        };
+        let origin = out
+            .origins
+            .get(&d.pc)
+            .cloned()
+            .or_else(|| {
+                let vgpr = sgpr_to_lane_vgpr(insts, d.pc, srsrc)?;
+                Some(classify_vgpr(
+                    insts,
+                    vgpr,
+                    &out.only_edge,
+                    join_pol,
+                ))
+            });
+        let Some(origin) = origin else { continue };
+        out.origins.entry(d.pc).or_insert(origin.clone());
+        let mut words = lane_tsharp_from_source(insts, &origin);
+        let sr = lane_tsharp_from_srsrc(insts, d.pc, Some(srsrc));
+        words = merge_tsharp_slots(sr, words);
+        merge_lane_tsharp(out, d.pc, words);
     }
 }
 
@@ -853,24 +990,110 @@ fn collect_loads(src: &DescSource, loads: &mut BTreeSet<u64>) {
     }
 }
 
+/// Block-start PC for `pc`, from the same leader set as [`scan_waterfall_loops`].
+fn block_start_at(insts: &[Decoded], pc: u64) -> u64 {
+    let blocks = build_cfg_blocks(insts);
+    let by_pc: HashMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
+    let Some(&idx) = by_pc.get(&pc) else {
+        return pc;
+    };
+    blocks
+        .iter()
+        .find(|(s, e)| idx >= *s && idx < *e)
+        .map(|(s, _)| insts[*s].pc)
+        .unwrap_or(pc)
+}
+
 /// Walk recent defs of `vgpr` to classify Fetched / Lanes / LanePhi / VgprDword0.
-fn classify_vgpr(insts: &[Decoded], vgpr: u64, only_edge: &BTreeMap<u64, u64>) -> DescSource {
-    classify_vgpr_depth(insts, vgpr, only_edge, 0)
+fn classify_vgpr(
+    insts: &[Decoded],
+    vgpr: u64,
+    only_edge: &BTreeMap<u64, u64>,
+    join_pol: Option<&BTreeMap<u64, Vec<(u64, bool)>>>,
+) -> DescSource {
+    classify_vgpr_depth(insts, vgpr, only_edge, join_pol, 0, None)
+}
+
+fn lane_phi_at_join(
+    insts: &[Decoded],
+    vgpr: u64,
+    join_pc: u64,
+    only_edge: &BTreeMap<u64, u64>,
+    join_pol: Option<&BTreeMap<u64, Vec<(u64, bool)>>>,
+    depth: usize,
+) -> Option<DescSource> {
+    if depth >= MAX_TRACE_DEPTH {
+        return None;
+    }
+    let leaders: BTreeSet<u64> = insts.iter().map(|d| d.pc).collect();
+    let cfg = join_lane_phi::build_sgpr_join_cfg(insts, &leaders)?;
+    let join_idx = cfg.blocks.iter().position(|b| b.first().map(|d| d.pc) == Some(join_pc))?;
+    if cfg.pred[join_idx].len() < 2 {
+        return None;
+    }
+    if let Some(&sole_pred) = only_edge.get(&join_pc) {
+        let lo = sole_pred;
+        let hi = join_pc;
+        return Some(classify_vgpr_depth(
+            insts,
+            vgpr,
+            only_edge,
+            join_pol,
+            depth + 1,
+            Some((lo, hi)),
+        ));
+    }
+    let pol = join_pol?;
+    let edges = pol.get(&join_pc)?;
+    let mut arms: Vec<Option<DescSource>> = Vec::new();
+    for &pred_idx in &cfg.pred[join_idx] {
+        let pred_pc = cfg.blocks[pred_idx][0].pc;
+        let live = edges.iter().find(|(p, _)| *p == pred_pc).map(|(_, l)| *l).unwrap_or(true);
+        if !live {
+            arms.push(None);
+            continue;
+        }
+        arms.push(Some(classify_vgpr_depth(
+            insts,
+            vgpr,
+            only_edge,
+            join_pol,
+            depth + 1,
+            Some((pred_pc, join_pc)),
+        )));
+    }
+    if arms.iter().filter_map(|a| a.as_ref()).count() < 2 {
+        return arms.into_iter().flatten().next();
+    }
+    Some(DescSource::LanePhi { join_pc, arms })
 }
 
 fn classify_vgpr_depth(
     insts: &[Decoded],
     vgpr: u64,
     only_edge: &BTreeMap<u64, u64>,
+    join_pol: Option<&BTreeMap<u64, Vec<(u64, bool)>>>,
     depth: usize,
+    bound: Option<(u64, u64)>,
 ) -> DescSource {
     if depth >= MAX_TRACE_DEPTH {
         return DescSource::VgprDword0(vgpr);
     }
     for d in insts.iter().rev() {
+        if let Some((lo, hi)) = bound {
+            if d.pc < lo || d.pc >= hi {
+                continue;
+            }
+        }
         let (_, w) = rdna2::vgpr_uses(d);
         if !w.contains(&vgpr) {
             continue;
+        }
+        let leader = block_start_at(insts, d.pc);
+        if cfg_pred_count(insts, leader) >= 2 {
+            if let Some(phi) = lane_phi_at_join(insts, vgpr, leader, only_edge, join_pol, depth) {
+                return phi;
+            }
         }
         let name = d.inst.name;
         if name.starts_with("GLOBAL_LOAD_DWORD") || name.starts_with("FLAT_LOAD_DWORD") {
@@ -900,7 +1123,7 @@ fn classify_vgpr_depth(
             };
             let resolve = |code: u64| -> DescSource {
                 if code >= 256 {
-                    classify_vgpr_depth(insts, code - 256, only_edge, depth + 1)
+                    classify_vgpr_depth(insts, code - 256, only_edge, join_pol, depth + 1, bound)
                 } else if code < 106 {
                     DescSource::Loaded {
                         load_pc: d.pc,
@@ -927,15 +1150,35 @@ fn classify_vgpr_depth(
         if name == "V_MOV_B32" {
             let src = f(d, "SRC0").unwrap_or(0);
             if src >= 256 {
-                return classify_vgpr_depth(insts, src - 256, only_edge, depth + 1);
+                return classify_vgpr_depth(insts, src - 256, only_edge, join_pol, depth + 1, bound);
             }
         }
-        if let Some(&pred_pc) = only_edge.get(&d.pc) {
-            let _ = pred_pc;
+        let leader = block_start_at(insts, d.pc);
+        if let Some(&pred_start) = only_edge.get(&leader) {
+            return classify_vgpr_depth(
+                insts,
+                vgpr,
+                only_edge,
+                join_pol,
+                depth + 1,
+                Some((pred_start, leader)),
+            );
         }
         return DescSource::VgprDword0(vgpr);
     }
     DescSource::VgprDword0(vgpr)
+}
+
+fn cfg_pred_count(insts: &[Decoded], leader_pc: u64) -> usize {
+    let leaders: BTreeSet<u64> = insts.iter().map(|d| d.pc).collect();
+    let Some(cfg) = join_lane_phi::build_sgpr_join_cfg(insts, &leaders) else {
+        return 0;
+    };
+    cfg.blocks
+        .iter()
+        .position(|b| b.first().map(|d| d.pc) == Some(leader_pc))
+        .map(|j| cfg.pred[j].len())
+        .unwrap_or(0)
 }
 
 fn heap_expr_from_source(src: &DescSource, sampler: bool) -> Option<LaneHeapExpr> {
@@ -1256,6 +1499,36 @@ mod tests {
         let mut s = |_c: u64| "s0".into();
         let mut v = |n: u64| format!("v{n}");
         assert_eq!(lane_heap_hlsl(&expr, &mut s, &mut v), "(v3 >> 5u)");
+    }
+
+    #[test]
+    fn multi_block_loop_same_access_block_still_meets() {
+        // Loop body spans two blocks; readfirstlane + sample share block 1 (not SPLIT).
+        const V: u64 = 256;
+        let insts = decode_lines(&[
+            ("V_AND_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 131), ("VSRC1", 0)], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 126)], None),
+            ("S_XOR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 4)], None),
+            ("S_CBRANCH_EXECNZ", "ENC_SOPP", &[("SIMM16", 0xFFF9)], None),
+            ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", V + 4)], None),
+            ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 8), ("VSRC1", 4)], None),
+            ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 106)], None),
+            (
+                "IMAGE_SAMPLE_LZ",
+                "ENC_MIMG",
+                &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 2), ("SSAMP", 0), ("DMASK", 0xF), ("DIM", 1)],
+                None,
+            ),
+            ("S_XOR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 4)], None),
+            ("S_CBRANCH_EXECNZ", "ENC_SOPP", &[("SIMM16", 0xFFF6)], None),
+            ("S_ENDPGM", "ENC_SOPP", &[("SIMM16", 0)], None),
+        ]);
+        let t = trace(&insts);
+        let sample_pc = insts.iter().find(|d| d.enc.name == "ENC_MIMG").unwrap().pc;
+        assert!(
+            !t.waterfall.split_refused.contains(&sample_pc),
+            "same-block read/access must not SPLIT"
+        );
     }
 
     #[test]

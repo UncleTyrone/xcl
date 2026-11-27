@@ -57,7 +57,9 @@ Usage:
   xcl warm <file | folder | package.rpf> [--jobs N] [--used-only] [--limit N] [--again] [--no-book]
       Precompile + build pipelines into DXIL / driver / .plib caches (`shaders --precompile --pipelines`).
       --limit caps how many; --again rebuilds even when warm-done.txt already lists them.
+      Resume skips keys in warm-done.txt / warm-bad.txt; slow compiles (≥1s) append to slow-pipelines.txt.
       Enables XCL_PIPELINE_BOOK for pipeline-library warm unless --no-book.
+      No `--these` child processes (CGBJ AT_ONCE isolation): in-process warm only — see inventory §3.5.
   xcl replay <capture-dir> [--json] [--frame N] [--listing] [--wire] [--fences] [--present]
            [--no-execute] [--at N] [--run <game>] [-- args]
            [--edit] [--skip-draws] [--skip-dispatches] [--meta-only] [--lists A..B] [--out DIR]
