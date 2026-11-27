@@ -174,8 +174,16 @@ pub unsafe fn merge_range(dst: usize, src: &[u8], held: &mut [u8], len: usize) -
             if taken() {
                 watch::mark_landed_current(b);
             }
+            super::shadow::note_watch_block(b);
+        }
+        if super::faultbook::recording() {
+            let lo = blocks.first().copied().unwrap_or(0);
+            let hi = blocks.last().copied().unwrap_or(lo).saturating_add(1);
+            super::faultbook::note(super::faultbook::What::Taken, lo, hi, new_bytes as u64);
         }
     }
+    // Longer-lived card view: keep registered shadows' held bytes in sync with this land.
+    super::shadow::capture_after_land(dst, src, len);
     if skip() && new_bytes == 0 {
         return (0, 0);
     }
@@ -192,7 +200,7 @@ pub fn note_sparse_landed(ranges: &[(usize, usize)]) {
         return;
     }
     count(S_PIECES, ranges.len() as u64);
-  if beside() {
+    if beside() {
         for &(va, n) in ranges {
             if n == 0 {
                 continue;
@@ -204,6 +212,7 @@ pub fn note_sparse_landed(ranges: &[(usize, usize)]) {
             }
         }
     }
+    super::shadow::note_landed_ranges(ranges);
 }
 
 /// Per-frame stats for the activity line.

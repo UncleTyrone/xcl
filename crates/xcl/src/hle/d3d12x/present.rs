@@ -150,6 +150,8 @@ unsafe fn raw_plane_words(plane_count: u32, planes: *const u8) -> Vec<u64> {
 
 unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) {
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
+    super::faultbook::on_frame(frames);
+    super::panel::on_frame(frames);
     if frames % 300 == 0 {
         // the title's frame rate, for comparing runs (every 300 frames)
         static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
@@ -158,6 +160,7 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
             crate::xlog_info!("D3D12.X: {frames} frames presented, {:.1} fps over the last 300", 300.0 / (now - t).as_secs_f64());
             super::late_wait::log_frame_stats(300.0);
             super::relay::note_frame(300.0);
+            super::land::log_stats(300.0);
         }
     }
     super::real::stop_if_device_removed();

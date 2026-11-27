@@ -2973,6 +2973,8 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
         *s.pinned.entry(tile).or_default() += 1;
     }
     s.buffers.insert(raw as usize, tiles.iter().map(|x| x.1).collect());
+    // Host shadow directory: title buffer at the window-aligned start (shaders reach by VA).
+    super::shadow::register(raw as usize, start as u64, (delta + bytes) as u64);
     // (no signal of its own: the next submit's `before_execute` gives one for all the mappings
     // queued since – a retail title placed 165 buffers in 6 ms, each with a mapping and a signal,
     // right before its GPU stopped)
@@ -3014,6 +3016,7 @@ pub fn forget_buffer(res: usize) {
 
 fn forget_in(s: &mut State, res: usize) {
     let Some(tiles) = s.buffers.remove(&res) else { return };
+    super::shadow::unregister_resource(res);
     for tile in tiles {
         if let Some(c) = s.pinned.get_mut(&tile) {
             *c -= 1;

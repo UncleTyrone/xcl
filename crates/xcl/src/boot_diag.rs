@@ -25,43 +25,57 @@ fn read_image_word(base: usize, word: &Word, size: usize) -> Option<u64> {
     if word.offset.checked_add(word.bytes).is_none_or(|end| end > size) {
         return None;
     }
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut value = [0u8; 8];
-    // SAFETY: caller checked the range lies in the mapped main image.
-    unsafe {
-        std::ptr::copy_nonoverlapping((base + word.offset) as *const u8, value.as_mut_ptr(), word.bytes);
-    }
-    Some(u64::from_le_bytes(value))
+    // SAFETY: kernel copies at most eight bytes; fails where nothing is mapped.
+    let ok = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            (base + word.offset) as *const _,
+            value.as_mut_ptr().cast(),
+            word.bytes,
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then(|| u64::from_le_bytes(value))
 }
 
 /// `XCL_IMAGE_WATCH=used=98d26d8:8,failed=98d26d0:1` — log named fields once per second when they change.
+/// Also accepts `VICTORY_IMAGE_WATCH` for CGBJ parity.
 pub fn start_image_watch(base: usize, size: usize) {
-    let Ok(text) = std::env::var("XCL_IMAGE_WATCH") else {
+    let text = std::env::var("XCL_IMAGE_WATCH")
+        .or_else(|_| std::env::var("VICTORY_IMAGE_WATCH"));
+    let Ok(text) = text else {
         return;
     };
     let words = parse_image_words(&text);
-    if words.is_empty() {
+    if base == 0 || words.is_empty() {
         return;
     }
-    crate::xlog_info!("XCL_IMAGE_WATCH: {} word(s)", words.len());
-    let _ = std::thread::Builder::new().name("xcl-image-watch".into()).spawn(move || {
-        let mut last = Vec::new();
-        loop {
-            std::thread::sleep(Duration::from_secs(1));
-            let now: Vec<Option<u64>> = words.iter().map(|w| read_image_word(base, w, size)).collect();
-            if now == last {
-                continue;
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        crate::xlog_info!("XCL_IMAGE_WATCH: {} word(s)", words.len());
+        let _ = std::thread::Builder::new().name("xcl-image-watch".into()).spawn(move || {
+            let mut last = Vec::new();
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                let now: Vec<Option<u64>> = words.iter().map(|w| read_image_word(base, w, size)).collect();
+                if now == last {
+                    continue;
+                }
+                let line: Vec<String> = words
+                    .iter()
+                    .zip(&now)
+                    .map(|(w, v)| match v {
+                        Some(v) => format!("{}={v:#x}", w.name),
+                        None => format!("{}=?", w.name),
+                    })
+                    .collect();
+                crate::xlog_info!("title image: {}", line.join(" "));
+                last = now;
             }
-            let line: Vec<String> = words
-                .iter()
-                .zip(&now)
-                .map(|(w, v)| match v {
-                    Some(v) => format!("{}={v:#x}", w.name),
-                    None => format!("{}=?", w.name),
-                })
-                .collect();
-            crate::xlog_info!("title image: {}", line.join(" "));
-            last = now;
-        }
+        });
     });
 }
 
@@ -166,4 +180,31 @@ pub fn start_after_main(base: usize, size: usize, cache_dir: &Path) {
     start_image_watch(base, size);
     start_title_watch(base, size);
     start_poke(base, size);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_watch_words_parse() {
+        let all = parse_image_words("used=98d26d8:8, failed = 0x10:1,odd=3:3,none");
+        assert_eq!(all.len(), 2);
+        assert_eq!((all[0].name.as_str(), all[0].offset, all[0].bytes), ("used", 0x98d_26d8, 8));
+        assert_eq!((all[1].name.as_str(), all[1].offset, all[1].bytes), ("failed", 0x10, 1));
+    }
+
+    #[test]
+    fn image_watch_reads_via_process_memory() {
+        let memory = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let base = memory.as_ptr() as usize;
+        let word = |offset, bytes| Word {
+            name: String::new(),
+            offset,
+            bytes,
+        };
+        assert_eq!(read_image_word(base, &word(0, 4), 8), Some(0x4433_2211));
+        assert_eq!(read_image_word(base, &word(2, 1), 8), Some(0x33));
+        assert_eq!(read_image_word(base, &word(0, 8), 4), None);
+    }
 }

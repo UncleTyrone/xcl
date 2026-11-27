@@ -449,7 +449,12 @@ where
     for a in old_arrays.into_iter().filter(|&a| a != 0) {
         ApuFree(a as *mut c_void);
     }
-    crate::xlog_info!("acphal: SHAPE contexts {:?} (they do not run: no audio from the console's mixer)", c.counts);
+    crate::hle::shape_xma::on_shape_allocated(&new_arrays, &c.counts);
+    crate::xlog_info!(
+        "acphal: SHAPE contexts {:?} (mixer units idle; XMA kind {} armed when count > 0)",
+        c.counts,
+        crate::hle::shape_xma::XMA_KIND
+    );
     S_OK
 }
 

@@ -54,9 +54,12 @@ Usage:
       Offline translator pass (forwards to `shaders --recomp`; --validate → --direct --validate).
   xcl warm <file | folder | package.rpf> [--jobs N] [--used-only]
       Precompile + build pipelines into the DXIL / driver caches (`shaders --precompile --pipelines`).
-  xcl replay <capture-dir> [--json] [--frame N] [--wire] [--fences] [--present]
+  xcl replay <capture-dir> [--json] [--frame N] [--listing] [--wire] [--fences] [--present]
            [--no-execute] [--at N] [--run <game>] [-- args]
+           [--edit] [--skip-draws] [--skip-dispatches] [--meta-only] [--lists A..B] [--out DIR]
+           [--pixel x,y] [--of WxH] [--compare DIR] [--diverge] [--against DIR]
       Inspect an XCL_RECORD / XCLFRAME capture (list payloads, contents.bin, planes).
+      Offline edit / pixel / diverge tooling rewrites or compares wire blobs (no GPU).
       With --run, set XCL_REPLAY (+ optional PresentX re-issue) and start the title
       (same-process only — not a cross-process VICFRAME player).
   xcl rpf <package.rpf> [--top N] [--find NAME] [--extract NAME --out DIR]
