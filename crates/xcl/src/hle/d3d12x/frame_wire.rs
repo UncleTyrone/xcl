@@ -603,6 +603,8 @@ pub mod list_op {
     pub const TOUCH_VA: u8 = 5;
     pub const WRITTEN: u8 = 6;
     pub const BIND_IDS: u8 = 7;
+    /// `D3D12_COMMAND_LIST_TYPE` for the mapped list (u32 LE).
+    pub const LIST_KIND: u8 = 8;
     pub const SNAP_MAGIC: &[u8; 4] = b"XLST";
     pub const SNAP_VER: u8 = 1;
 }

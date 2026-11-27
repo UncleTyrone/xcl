@@ -146,6 +146,23 @@ pub(crate) fn live_count() -> u64 {
     LIVE.load(Ordering::Relaxed)
 }
 
+/// Copy shadow by [`Shadow::id`] (upcheck / diagnostics).
+pub(crate) fn by_copy_id(id: u64) -> Option<Arc<Shadow>> {
+    for entry in BUFFERS.read().unwrap_or_else(|e| e.into_inner()).values() {
+        if let Some(s) = entry.shadow.as_ref() {
+            if s.id == id {
+                return Some(s.clone());
+            }
+        }
+    }
+    for s in LOOSE.read().unwrap_or_else(|e| e.into_inner()).values() {
+        if s.id == id {
+            return Some(s.clone());
+        }
+    }
+    None
+}
+
 /// Copy of the innermost title buffer holding `[address, address+len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if !enabled() {
@@ -341,6 +358,15 @@ impl Shadow {
     }
 
     /// Snapshot of the held card view.
+    /// Snapshot of `held[off..off+len)` when in bounds (relay / upcheck proxy for card side).
+    pub(crate) fn held_span(&self, off: usize, len: usize) -> Option<Vec<u8>> {
+        let held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        if len == 0 || off.saturating_add(len) > held.len() {
+            return None;
+        }
+        Some(held[off..off + len].to_vec())
+    }
+
     pub(crate) fn held_bytes(&self) -> Vec<u8> {
         self.held.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }

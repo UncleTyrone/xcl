@@ -599,9 +599,18 @@ pub(super) fn frame_bound_heaps(list: *mut c_void) -> Vec<usize> {
 /// Structured list payload for `XCLFRAME` `ListPayload` (VICFRAME `List.commands` role).
 pub(super) fn frame_list_payload(list: *mut c_void) -> Vec<u8> {
     use super::frame_wire::list_op;
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D12::ID3D12CommandList;
     let mut out = Vec::with_capacity(128);
     out.extend_from_slice(list_op::SNAP_MAGIC);
     out.push(list_op::SNAP_VER);
+    let kind = unsafe {
+        ID3D12CommandList::from_raw_borrowed(&list)
+            .map(|cl| cl.GetType().0 as u32)
+            .unwrap_or(u32::MAX)
+    };
+    out.push(list_op::LIST_KIND);
+    out.extend_from_slice(&kind.to_le_bytes());
     let (pso, rs) = super::bind::frame_bind_ids(list);
     out.push(list_op::BIND_IDS);
     out.extend_from_slice(&(pso as u64).to_le_bytes());
