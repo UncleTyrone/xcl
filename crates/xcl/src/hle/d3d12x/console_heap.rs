@@ -296,6 +296,11 @@ pub unsafe fn settle_for_fence() {
     }
 }
 
+/// CGBJ `release_tables` name: same fence-driven dynamic descriptor recycle as [`settle_for_fence`].
+pub unsafe fn release_tables() {
+    settle_for_fence();
+}
+
 /// Ranges held until the submit fence that recorded them has completed.
 pub unsafe fn drain_completed_dynamic_slots() {
     if !super::residency::defer_dynamic_slots() {

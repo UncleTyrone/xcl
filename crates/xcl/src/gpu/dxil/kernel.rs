@@ -530,6 +530,7 @@ impl Lw {
             scratch: None,
             static_samplers: Default::default(),
             static_srsrc: Default::default(),
+            lane_heap: Default::default(),
             static_used: Vec::new(),
             sampler_base: o.sampler_base,
             dyn_rm: false,
@@ -592,6 +593,7 @@ impl Lw {
         let follow_sgpr = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_) | Entry::Compute(_) | Entry::Kernel | Entry::Mesh(_));
         lw.static_samplers = crate::gpu::recomp::constant_samplers(insts, leaders, follow_sgpr);
         lw.static_srsrc = crate::gpu::recomp::constant_srsrc(insts, leaders, follow_sgpr);
+        lw.lane_heap = crate::gpu::recomp::desc_trace::trace(insts).lane_heap;
         let group_threads: Option<u32> = match entry {
             Entry::Vertex(_) | Entry::Pixel(_) => None,
             Entry::Kernel => None,

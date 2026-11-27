@@ -92,7 +92,10 @@ pub fn threads() -> usize {
 
 /// Merge `src` over title `[dst, dst+len)` when bytes differ from `held` (last known card view).
 /// Respects watch claims per 64 KiB block. Returns (new bytes, dwords stored).
-pub unsafe fn merge_range(dst: usize, src: &[u8], held: &[u8], len: usize) -> (usize, usize) {
+///
+/// With [`super::safecopy`] (default on), stores go through fault-safe copies and `held` is
+/// updated in place so the next land sees the card snapshot.
+pub unsafe fn merge_range(dst: usize, src: &[u8], held: &mut [u8], len: usize) -> (usize, usize) {
     let len = len.min(src.len()).min(held.len());
     if len == 0 {
         return (0, 0);
@@ -103,24 +106,52 @@ pub unsafe fn merge_range(dst: usize, src: &[u8], held: &[u8], len: usize) -> (u
     let n_blocks = blocks.len();
     let _claims = watch::claim_blocks(&blocks);
 
+    let take = taken() || echo();
+    let use_safe = super::safecopy::on();
+    // Capture addresses as usize so the parallel wide_back closure stays Sync.
+    let held_addr = held.as_mut_ptr() as usize;
+    let src_addr = src.as_ptr() as usize;
+    let src_len = src.len();
+
     let apply_piece = |lo: usize, hi: usize| -> (usize, usize) {
-        let mut nb = 0usize;
-        let mut dw = 0usize;
-        let mut i = lo;
-        while i + DWORD <= hi {
-            let cur = std::slice::from_raw_parts((dst + i) as *const u8, DWORD);
-            let card = &src[i..i + DWORD];
-            let snap = &held[i..i + DWORD];
-            if card != snap {
-                nb += DWORD;
-                if cur != card {
-                    std::ptr::copy_nonoverlapping(card.as_ptr(), (dst + i) as *mut u8, DWORD);
-                    dw += 1;
+        let held_ptr = held_addr as *mut u8;
+        let src = unsafe { std::slice::from_raw_parts(src_addr as *const u8, src_len) };
+        if use_safe {
+            let m = super::safecopy::merge(
+                (dst + lo) as *mut u8,
+                src[lo..hi].as_ptr(),
+                unsafe { held_ptr.add(lo) },
+                hi - lo,
+                take,
+            );
+            // `Merged::new` counts changed dwords (and byte tails as 1).
+            (m.new as usize * DWORD, m.dwords as usize)
+        } else {
+            let mut nb = 0usize;
+            let mut dw = 0usize;
+            let mut i = lo;
+            while i + DWORD <= hi {
+                let cur = unsafe { std::slice::from_raw_parts((dst + i) as *const u8, DWORD) };
+                let card = &src[i..i + DWORD];
+                let snap = unsafe { std::slice::from_raw_parts(held_ptr.add(i), DWORD) };
+                if card != snap {
+                    nb += DWORD;
+                    if cur != card {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(card.as_ptr(), (dst + i) as *mut u8, DWORD);
+                        }
+                        dw += 1;
+                    }
+                    if take {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(card.as_ptr(), held_ptr.add(i), DWORD);
+                        }
+                    }
                 }
+                i += DWORD;
             }
-            i += DWORD;
+            (nb, dw)
         }
-        (nb, dw)
     };
 
     let (new_bytes, dwords) = if super::wide_back::enabled() && len > 256 << 10 {
@@ -141,8 +172,7 @@ pub unsafe fn merge_range(dst: usize, src: &[u8], held: &[u8], len: usize) -> (u
         for &b in &blocks {
             watch::note_landed_block(b);
             if taken() {
-                // Beside landing: copy already holds these bytes (skip next full-block reupload).
-                let _ = echo();
+                watch::mark_landed_current(b);
             }
         }
     }
@@ -194,6 +224,7 @@ pub fn log_stats(frames: f64) {
         bytes,
         dw
     );
+    super::safecopy::log_stats(frames);
 }
 
 #[cfg(test)]
@@ -205,7 +236,8 @@ mod tests {
         let mut mem = [0u8; 64];
         let src = [0u8; 64];
         let held = [0u8; 64];
-        let (n, d) = unsafe { merge_range(mem.as_mut_ptr() as usize, &src, &held, 64) };
+        let mut held = held;
+        let (n, d) = unsafe { merge_range(mem.as_mut_ptr() as usize, &src, &mut held, 64) };
         assert_eq!(n, 0);
         assert_eq!(d, 0);
     }

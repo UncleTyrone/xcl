@@ -716,6 +716,7 @@ impl State {
                 counts.push(run);
                 i += run as usize;
             }
+            let flight_t = std::time::Instant::now();
             self.queue.UpdateTileMappings(
                 res,
                 coords.len() as u32,
@@ -728,6 +729,7 @@ impl State {
                 Some(counts.as_ptr()),
                 D3D12_TILE_MAPPING_FLAG_NONE,
             );
+            super::flight::tile_map("sparse", windows::core::Interface::as_raw(&self.queue) as usize, counts.iter().map(|&c| c as u64).sum(), flight_t.elapsed());
         }
     }
 
@@ -754,6 +756,7 @@ impl State {
             counts.push(run);
             i += run as usize;
         }
+        let flight_t = std::time::Instant::now();
         self.queue.UpdateTileMappings(
             res,
             coords.len() as u32,
@@ -766,6 +769,7 @@ impl State {
             Some(counts.as_ptr()),
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
+        super::flight::tile_map("sparse", windows::core::Interface::as_raw(&self.queue) as usize, counts.iter().map(|&c| c as u64).sum(), flight_t.elapsed());
     }
 
     /// tiles of `[a, a + n)` get video memory (mapped in their window); `initial_holes` supplies
@@ -827,6 +831,7 @@ impl State {
     unsafe fn signal(&mut self) {
         self.value += 1;
         let _ = self.queue.Signal(&self.fence, self.value);
+        super::flight::signaled("sparse", windows::core::Interface::as_raw(&self.queue) as usize, &self.fence, self.value);
     }
 
     #[inline]

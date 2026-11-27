@@ -5,14 +5,22 @@
 //! on a live queue when pointers are still valid (same process).
 //!
 //! **Not** `XCL_CAPTURE_FRAME`: that path records title command streams and shader dumps for one
-//! frame; this path only tracks queue submits, fence signals, and present tokens.
+//! frame; this path tracks queue submits, fence signals, present tokens/planes, structured list
+//! payloads, and title-memory content samples/chunks.
 //!
-//! **Gaps vs CGBJ `victory-gpu/replay/*`:** no full heap/PSO/resource snap, no cross-process
-//! list rehydration from command-byte blobs, no `PresentX` re-issue (token logged only), no CLI
-//! player. Binary `XCLFRAME` v3 blobs (`XCL_RECORD_WIRE=1`) add heap metadata, bind ids, title
-//! GPU VAs, per-list bind meta, and optional title-memory content samples (VICFRAME role, not
-//! layout) so same-process boot debugging can round-trip enough state to re-issue live lists and
-//! verify VA digests.
+//! ## VICFRAME role (GPL-2 `XCLFRAME` v4)
+//!
+//! | CGBJ role | XCL stand-in |
+//! |-----------|--------------|
+//! | `List.commands` | `ListPayload` ops blob (`XLST` snapshot + draw/dispatch notes) |
+//! | `contents.bin` / `Content` | `ContentChunk` + `frames/frame_NNNN.contents.bin` |
+//! | Present picture / PresentX | Present plane tail + optional `XCL_REPLAY_PRESENT` re-issue |
+//! | Offline `victory replay` | Minimal `xcl replay <dir>` inspect CLI (no GPU player) |
+//!
+//! **Honest limits:** full cross-process list rehydration from payload bytes alone is not
+//! supported — Windows COM command-list handles and title GPU VAs are process-local. Same-process
+//! replay re-issues live lists when pointers remain readable. CGBJ-scale resource/PSO/descriptor
+//! snaps and offline command rebuild are still out of scope here.
 //!
 //! ### Environment (default off)
 //!
@@ -23,17 +31,20 @@
 //! | `XCL_RECORD_FRAMES` | Stop after N frames (unless `ALWAYS`) | `1` frame |
 //! | `XCL_RECORD_ALWAYS` | Keep recording every frame | off |
 //! | `XCL_RECORD_REFS` | Sidecar `refs/submit_*.ref.json` (pointer sets) | off |
-//! | `XCL_RECORD_WIRE` | Also write `frames/frame_NNNN.bin` (`XCLFRAME` v3) | off |
-//! | `XCL_RECORD_CONTENTS` | With wire: title-memory `ContentSample` events | on when `XCL_RECORD_WIRE` |
-//! | `XCL_RECORD_CONTENTS=0` | Skip content samples (list meta still written) | — |
+//! | `XCL_RECORD_WIRE` | Also write `frames/frame_NNNN.bin` (`XCLFRAME` v4) | off |
+//! | `XCL_RECORD_CONTENTS` | With wire: title-memory samples/chunks | on when `XCL_RECORD_WIRE` |
+//! | `XCL_RECORD_CONTENTS=0` | Skip content samples (list meta/payload still written) | — |
+//! | `XCL_RECORD_LISTS` | Structured list payloads + draw/dispatch ops | on when `XCL_RECORD_WIRE` |
 //! | `XCL_REPLAY` | Load `index.jsonl` from directory; hook presents | unset = off |
 //! | `XCL_REPLAY_WIRE` | Prefer `frames/frame_NNNN.bin` over per-frame JSONL | off |
 //! | `XCL_REPLAY_AT` | Skip first N presents before replay | `0` |
 //! | `XCL_REPLAY_EXECUTE` | Re-issue `ExecuteCommandLists` on live queue | on when `XCL_REPLAY` set |
 //! | `XCL_REPLAY_EXECUTE=0` | Log-only replay | — |
 //! | `XCL_REPLAY_FENCES` | Re-issue recorded queue `SignalX` fences | off |
-//! | `XCL_REPLAY_CONTENTS` | Re-hash live title memory vs wire samples | on when `XCL_REPLAY_WIRE` |
+//! | `XCL_REPLAY_CONTENTS` | Re-hash live title memory vs wire samples/chunks | on when `XCL_REPLAY_WIRE` |
+//! | `XCL_REPLAY_PRESENT` | Re-issue `PresentX` with recorded planes (same process) | off |
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -58,14 +69,18 @@ struct Settings {
     write_refs: bool,
     /// Binary `XCLFRAME` beside JSONL (`XCL_RECORD_WIRE=1`).
     write_wire: bool,
-    /// Title-memory content samples in the wire blob (`XCL_RECORD_CONTENTS`).
+    /// Title-memory content samples/chunks (`XCL_RECORD_CONTENTS`).
     write_contents: bool,
+    /// Structured list payloads + live draw/dispatch ops (`XCL_RECORD_LISTS`).
+    write_lists: bool,
     /// Load per-frame `XCLFRAME` blobs when replaying (`XCL_REPLAY_WIRE=1`).
     replay_wire: bool,
-    /// Re-hash live title memory against wire `ContentSample` events.
+    /// Re-hash live title memory against wire content events.
     replay_contents: bool,
     replay_execute: bool,
     replay_fences: bool,
+    /// Re-issue PresentX from recorded planes (`XCL_REPLAY_PRESENT=1`).
+    replay_present: bool,
     replay_skip_presents: u64,
 }
 
@@ -75,6 +90,12 @@ fn parse_u64(name: &str) -> Option<u64> {
 
 fn env_on(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+}
+
+fn env_off_explicit(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .is_some_and(|v| matches!(v.trim(), "0" | "false" | "no" | "off"))
 }
 
 fn settings() -> &'static Settings {
@@ -93,26 +114,23 @@ fn settings() -> &'static Settings {
         let always = env_on("XCL_RECORD_ALWAYS");
         let write_wire = env_on("XCL_RECORD_WIRE");
         let replay_wire = env_on("XCL_REPLAY_WIRE");
-        // With `XCL_REPLAY` set, GPU re-issue is on unless `XCL_REPLAY_EXECUTE=0`.
         let replay_execute = if replay_dir.is_some() {
-            !std::env::var("XCL_REPLAY_EXECUTE")
-                .ok()
-                .is_some_and(|v| matches!(v.trim(), "0" | "false" | "no" | "off"))
+            !env_off_explicit("XCL_REPLAY_EXECUTE")
         } else {
             env_on("XCL_REPLAY_EXECUTE")
         };
-        // Content samples default on with wire; explicit `=0` disables.
         let write_contents = if write_wire {
-            !std::env::var("XCL_RECORD_CONTENTS")
-                .ok()
-                .is_some_and(|v| matches!(v.trim(), "0" | "false" | "no" | "off"))
+            !env_off_explicit("XCL_RECORD_CONTENTS")
         } else {
             env_on("XCL_RECORD_CONTENTS")
         };
+        let write_lists = if write_wire {
+            !env_off_explicit("XCL_RECORD_LISTS")
+        } else {
+            env_on("XCL_RECORD_LISTS")
+        };
         let replay_contents = if replay_wire {
-            !std::env::var("XCL_REPLAY_CONTENTS")
-                .ok()
-                .is_some_and(|v| matches!(v.trim(), "0" | "false" | "no" | "off"))
+            !env_off_explicit("XCL_REPLAY_CONTENTS")
         } else {
             env_on("XCL_REPLAY_CONTENTS")
         };
@@ -125,10 +143,12 @@ fn settings() -> &'static Settings {
             write_refs: env_on("XCL_RECORD_REFS"),
             write_wire,
             write_contents,
+            write_lists,
             replay_wire,
             replay_contents,
             replay_execute,
             replay_fences: env_on("XCL_REPLAY_FENCES"),
+            replay_present: env_on("XCL_REPLAY_PRESENT"),
             replay_skip_presents: parse_u64("XCL_REPLAY_AT").unwrap_or(0),
         }
     })
@@ -143,9 +163,25 @@ static WRITER: Mutex<Option<std::fs::File>> = Mutex::new(None);
 
 static FRAME_BUF: Mutex<Vec<RecordedEvent>> = Mutex::new(Vec::new());
 static FRAME_BOUND_HEAP_PTRS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static FRAME_CONTENTS_BIN: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 static KNOWN_HEAPS: Mutex<Vec<HeapEntry>> = Mutex::new(Vec::new());
+static LIST_OPS: OnceLock<Mutex<HashMap<usize, Vec<u8>>>> = OnceLock::new();
+static PENDING_PRESENT: Mutex<Option<PendingPresent>> = Mutex::new(None);
 static REPLAY_FRAMES: OnceLock<Mutex<ReplayCatalog>> = OnceLock::new();
 static REPLAY_CURSOR: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug)]
+struct PendingPresent {
+    queue: usize,
+    planes: Vec<PresentPlaneRec>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PresentPlaneRec {
+    resource: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rect: Option<[i32; 4]>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct HeapEntry {
@@ -196,6 +232,51 @@ pub fn note_descriptor_heap(ptr: usize, ty: u32, count: u32, flags: u32) {
     } else {
         g.push(HeapEntry { ptr, ty, count, flags });
     }
+}
+
+/// Whether draw/dispatch hooks should append into the list-op ring.
+pub(super) fn list_ops_recording() -> bool {
+    settings().record_dir.is_some() && settings().write_lists && recording_active()
+}
+
+fn list_ops() -> &'static Mutex<HashMap<usize, Vec<u8>>> {
+    LIST_OPS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(super) fn append_list_op(list: usize, bytes: &[u8]) {
+    if list == 0 || bytes.is_empty() {
+        return;
+    }
+    let mut g = list_ops().lock().unwrap();
+    let slot = g.entry(list).or_default();
+    // Cap per-list op ring so a long frame cannot balloon process memory.
+    const CAP: usize = 1 << 20;
+    if slot.len() + bytes.len() > CAP {
+        return;
+    }
+    slot.extend_from_slice(bytes);
+}
+
+pub(super) fn take_list_ops(list: usize) -> Vec<u8> {
+    list_ops().lock().unwrap().remove(&list).unwrap_or_default()
+}
+
+/// Called from `PresentX` before `mark_flipped` so the next present event carries planes.
+pub fn note_present_context(queue: *mut c_void, planes: &[(usize, Option<[i32; 4]>)]) {
+    if settings().record_dir.is_none() && settings().replay_dir.is_none() {
+        return;
+    }
+    let rec = PendingPresent {
+        queue: queue as usize,
+        planes: planes
+            .iter()
+            .map(|(r, rect)| PresentPlaneRec {
+                resource: *r,
+                rect: *rect,
+            })
+            .collect(),
+    };
+    *PENDING_PRESENT.lock().unwrap() = Some(rec);
 }
 
 fn heap_meta_from_ptr(ptr: usize) -> Option<HeapEntry> {
@@ -279,40 +360,67 @@ fn list_meta_events(mapped: &[*mut c_void]) -> Vec<RecordedEvent> {
     out
 }
 
-/// Sample title memory at `va` for wire digests (CGBJ `Content` role, capped).
-fn content_sample_at(va: u64) -> Option<RecordedEvent> {
-    const HASH_CAP: usize = 4096;
+fn list_payload_events(mapped: &[*mut c_void]) -> Vec<RecordedEvent> {
+    let mut out = Vec::with_capacity(mapped.len());
+    for &pc in mapped {
+        let mut ops = super::list_x::frame_list_payload(pc);
+        let live = super::list_x::take_frame_ops(pc);
+        if !live.is_empty() {
+            ops.extend_from_slice(&live);
+        }
+        out.push(RecordedEvent::ListPayload {
+            list: pc as usize,
+            list_kind: list_kind(pc),
+            ops,
+        });
+    }
+    out
+}
+
+/// Sample title memory at `va` for wire digests (CGBJ `Content` role).
+fn content_events_at(va: u64, contents_bin: &mut Vec<u8>) -> Vec<RecordedEvent> {
     let p = va as usize;
     if p == 0 {
-        return None;
+        return Vec::new();
     }
-    let hash_len = if crate::gpu::shader::readable(p, HASH_CAP) {
-        HASH_CAP
+    let want = super::frame_wire::CONTENT_CHUNK_CAP;
+    let hash_len = if crate::gpu::shader::readable(p, want) {
+        want
     } else if crate::gpu::shader::readable(p, super::frame_wire::CONTENT_SAMPLE_CAP) {
         super::frame_wire::CONTENT_SAMPLE_CAP
     } else if crate::gpu::shader::readable(p, 64) {
         64
     } else {
-        return None;
+        return Vec::new();
     };
     let bytes = unsafe { std::slice::from_raw_parts(p as *const u8, hash_len) };
     let hash = super::frame_wire::fnv1a32(bytes);
     let sample = bytes[..hash_len.min(super::frame_wire::CONTENT_SAMPLE_CAP)].to_vec();
-    Some(RecordedEvent::ContentSample {
+    let mut out = vec![RecordedEvent::ContentSample {
         va,
         len: hash_len as u32,
         hash,
         sample,
-    })
+    }];
+    if contents_bin.len() + hash_len <= super::frame_wire::CONTENTS_BIN_SOFT_CAP {
+        let file_off = contents_bin.len() as u64;
+        contents_bin.extend_from_slice(bytes);
+        out.push(RecordedEvent::ContentChunk {
+            va,
+            len: hash_len as u32,
+            hash,
+            file_off,
+        });
+    }
+    out
 }
 
 fn content_sample_events(vas: &[u64]) -> Vec<RecordedEvent> {
-    const MAX_VAS: usize = 64;
+    const MAX_VAS: usize = 128;
+    let mut bin = FRAME_CONTENTS_BIN.lock().unwrap();
     let mut out = Vec::new();
     for &va in vas.iter().take(MAX_VAS) {
-        if let Some(ev) = content_sample_at(va) {
-            out.push(ev);
-        }
+        out.extend(content_events_at(va, &mut bin));
     }
     out
 }
@@ -365,6 +473,13 @@ enum RecordedEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         vas: Vec<u64>,
     },
+    #[serde(rename = "listpayload")]
+    ListPayload {
+        list: usize,
+        list_kind: u32,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ops: Vec<u8>,
+    },
     #[serde(rename = "contentsample")]
     ContentSample {
         va: u64,
@@ -372,6 +487,13 @@ enum RecordedEvent {
         hash: u32,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         sample: Vec<u8>,
+    },
+    #[serde(rename = "contentchunk")]
+    ContentChunk {
+        va: u64,
+        len: u32,
+        hash: u32,
+        file_off: u64,
     },
     #[serde(rename = "heapsnap")]
     HeapSnap { heaps: Vec<HeapEntry> },
@@ -384,11 +506,19 @@ enum RecordedEvent {
         frame: u64,
         token: u64,
         submits: u64,
+        #[serde(default, skip_serializing_if = "is_zero_usize")]
+        queue: usize,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        planes: Vec<PresentPlaneRec>,
     },
 }
 
+fn is_zero_usize(v: &usize) -> bool {
+    *v == 0
+}
+
 struct ReplayCatalog {
-  frames: Vec<Vec<RecordedEvent>>,
+    frames: Vec<Vec<RecordedEvent>>,
 }
 
 fn write_session_meta(dir: &Path) {
@@ -396,15 +526,20 @@ fn write_session_meta(dir: &Path) {
         return;
     }
     let body = serde_json::json!({
-        "format": 3,
+        "format": 4,
         "kind": "xcl_frame_replay",
         "distinct_from": "XCL_CAPTURE_FRAME",
-        "events": ["submit", "listmeta", "contentsample", "heapsnap", "signal", "present"],
+        "events": [
+            "submit", "listmeta", "listpayload", "contentsample", "contentchunk",
+            "heapsnap", "signal", "present"
+        ],
         "wire": super::frame_wire::VERSION,
         "contents": settings().write_contents,
+        "lists": settings().write_lists,
+        "cross_process": "unsupported — COM list handles and title GPU VAs are process-local; ListPayload is diagnostic / same-process only",
     });
     let _ = std::fs::write(dir.join("session.json"), body.to_string());
-    append_line(&serde_json::json!({"kind":"session","format":3}).to_string());
+    append_line(&serde_json::json!({"kind":"session","format":4}).to_string());
 }
 
 fn ensure_log() {
@@ -432,11 +567,12 @@ fn ensure_log() {
                     let n = cat.frames.len();
                     let _ = REPLAY_FRAMES.get_or_init(|| Mutex::new(cat));
                     crate::xlog_info!(
-                        "D3D12.X: XCL_REPLAY={} ({} frame(s), execute={}, fences={}, wire={})",
+                        "D3D12.X: XCL_REPLAY={} ({} frame(s), execute={}, fences={}, present={}, wire={})",
                         dir.display(),
                         n,
                         settings().replay_execute,
                         settings().replay_fences,
+                        settings().replay_present,
                         settings().replay_wire
                     );
                 }
@@ -528,11 +664,27 @@ fn events_to_wire(events: &[RecordedEvent]) -> Vec<super::frame_wire::WireEvent>
                 heaps: heaps.clone(),
                 vas: vas.clone(),
             }),
+            RecordedEvent::ListPayload { list, list_kind, ops } => Some(WireEvent::ListPayload {
+                list: *list,
+                kind: *list_kind,
+                ops: ops.clone(),
+            }),
             RecordedEvent::ContentSample { va, len, hash, sample } => Some(WireEvent::ContentSample {
                 va: *va,
                 len: *len,
                 hash: *hash,
                 sample: sample.clone(),
+            }),
+            RecordedEvent::ContentChunk {
+                va,
+                len,
+                hash,
+                file_off,
+            } => Some(WireEvent::ContentChunk {
+                va: *va,
+                len: *len,
+                hash: *hash,
+                file_off: *file_off,
             }),
             RecordedEvent::HeapSnap { heaps } => Some(WireEvent::HeapSnap {
                 heaps: heaps.iter().map(HeapEntry::to_wire).collect(),
@@ -542,10 +694,24 @@ fn events_to_wire(events: &[RecordedEvent]) -> Vec<super::frame_wire::WireEvent>
                 fence: *fence,
                 value: *value,
             }),
-            RecordedEvent::Present { frame, token, submits } => Some(WireEvent::Present {
+            RecordedEvent::Present {
+                frame,
+                token,
+                submits,
+                queue,
+                planes,
+            } => Some(WireEvent::Present {
                 frame: *frame,
                 token: *token,
                 submits: *submits,
+                queue: *queue,
+                planes: planes
+                    .iter()
+                    .map(|p| super::frame_wire::PresentPlane {
+                        resource: p.resource,
+                        rect: p.rect,
+                    })
+                    .collect(),
             }),
         })
         .collect()
@@ -597,6 +763,13 @@ fn recorded_from_wire(events: &[super::frame_wire::WireEvent]) -> Vec<RecordedEv
                 heaps: heaps.clone(),
                 vas: vas.clone(),
             }),
+            super::frame_wire::WireEvent::ListPayload { list, kind, ops } => {
+                Some(RecordedEvent::ListPayload {
+                    list: *list,
+                    list_kind: *kind,
+                    ops: ops.clone(),
+                })
+            }
             super::frame_wire::WireEvent::ContentSample { va, len, hash, sample } => {
                 Some(RecordedEvent::ContentSample {
                     va: *va,
@@ -605,6 +778,17 @@ fn recorded_from_wire(events: &[super::frame_wire::WireEvent]) -> Vec<RecordedEv
                     sample: sample.clone(),
                 })
             }
+            super::frame_wire::WireEvent::ContentChunk {
+                va,
+                len,
+                hash,
+                file_off,
+            } => Some(RecordedEvent::ContentChunk {
+                va: *va,
+                len: *len,
+                hash: *hash,
+                file_off: *file_off,
+            }),
             super::frame_wire::WireEvent::HeapSnap { heaps } => Some(RecordedEvent::HeapSnap {
                 heaps: heaps.iter().map(HeapEntry::from_wire).collect(),
             }),
@@ -613,10 +797,24 @@ fn recorded_from_wire(events: &[super::frame_wire::WireEvent]) -> Vec<RecordedEv
                 fence: *fence,
                 value: *value,
             }),
-            super::frame_wire::WireEvent::Present { frame, token, submits } => Some(RecordedEvent::Present {
+            super::frame_wire::WireEvent::Present {
+                frame,
+                token,
+                submits,
+                queue,
+                planes,
+            } => Some(RecordedEvent::Present {
                 frame: *frame,
                 token: *token,
                 submits: *submits,
+                queue: *queue,
+                planes: planes
+                    .iter()
+                    .map(|p| PresentPlaneRec {
+                        resource: p.resource,
+                        rect: p.rect,
+                    })
+                    .collect(),
             }),
         })
         .collect()
@@ -626,6 +824,7 @@ fn flush_frame_file(frame: u64) {
     let s = settings();
     let Some(dir) = &s.record_dir else { return };
     let events = std::mem::take(&mut *FRAME_BUF.lock().unwrap());
+    let contents = std::mem::take(&mut *FRAME_CONTENTS_BIN.lock().unwrap());
     if events.is_empty() {
         return;
     }
@@ -642,6 +841,12 @@ fn flush_frame_file(frame: u64) {
         let wire = events_to_wire(&events);
         if let Err(e) = super::frame_wire::write_frame(&wire_path, &wire) {
             crate::xlog_warn!("D3D12.X: XCL_RECORD_WIRE write {}: {e}", wire_path.display());
+        }
+    }
+    if s.write_contents && !contents.is_empty() {
+        let bin_path = dir.join("frames").join(format!("frame_{frame:04}.contents.bin"));
+        if let Err(e) = std::fs::write(&bin_path, &contents) {
+            crate::xlog_warn!("D3D12.X: contents.bin write {}: {e}", bin_path.display());
         }
     }
 }
@@ -751,26 +956,32 @@ fn write_ref_file(dir: &Path, name: &str, title: &[usize], pc: &[usize], backing
     Some(path.strip_prefix(dir).ok()?.display().to_string())
 }
 
-/// Pick PC command lists to re-submit: recorded segments, list-meta ptrs, re-expand title wrappers, or backing.
+/// Pick PC command lists to re-submit: recorded segments, list-meta/payload ptrs, re-expand title wrappers, or backing.
 fn resolve_replay_lists(
     addrs: &[usize],
     pc_addrs: &[usize],
     backing: &[usize],
-    list_meta_ptrs: &[usize],
-) -> Vec<*mut c_void> {
+    list_ptrs: &[usize],
+) -> (Vec<*mut c_void>, &'static str) {
     if !pc_addrs.is_empty() && pc_addrs.iter().all(|&a| pointer_live(a)) {
-        return pc_addrs.iter().map(|&a| a as *mut c_void).collect();
+        return (
+            pc_addrs.iter().map(|&a| a as *mut c_void).collect(),
+            "pc_addrs",
+        );
     }
-    if !list_meta_ptrs.is_empty() && list_meta_ptrs.iter().all(|&a| pointer_live(a)) {
-        return list_meta_ptrs.iter().map(|&a| a as *mut c_void).collect();
+    if !list_ptrs.is_empty() && list_ptrs.iter().all(|&a| pointer_live(a)) {
+        return (
+            list_ptrs.iter().map(|&a| a as *mut c_void).collect(),
+            "list_meta",
+        );
     }
-    let live_meta: Vec<*mut c_void> = list_meta_ptrs
+    let live_meta: Vec<*mut c_void> = list_ptrs
         .iter()
         .filter(|&&a| pointer_live(a))
         .map(|&a| a as *mut c_void)
         .collect();
     if !live_meta.is_empty() {
-        return live_meta;
+        return (live_meta, "list_meta_partial");
     }
     let mut expanded = Vec::new();
     for &title in addrs {
@@ -782,13 +993,17 @@ fn resolve_replay_lists(
         }
     }
     if !expanded.is_empty() && expanded.iter().all(|&p| pointer_live(p as usize)) {
-        return expanded;
+        return (expanded, "thin_expand");
     }
-    backing
+    let backing_live: Vec<*mut c_void> = backing
         .iter()
         .filter(|&&b| pointer_live(b))
         .map(|&b| b as *mut c_void)
-        .collect()
+        .collect();
+    if !backing_live.is_empty() {
+        return (backing_live, "backing");
+    }
+    (Vec::new(), "none")
 }
 
 /// Title `ExecuteCommandLists` after `thin::map_lists` (title lists + PC segments).
@@ -831,10 +1046,14 @@ pub fn on_submit(queue: *mut c_void, title_lists: &[*mut c_void], mapped: &[*mut
             bound_heaps,
         };
         append_event(&ev);
-        // List meta always accompanies wire-capable records (cheap; helps re-issue).
-        if settings().write_wire || settings().write_contents {
+        if settings().write_wire || settings().write_contents || settings().write_lists {
             for meta in list_meta_events(mapped) {
                 append_event(&meta);
+            }
+        }
+        if settings().write_lists {
+            for payload in list_payload_events(mapped) {
+                append_event(&payload);
             }
         }
         if settings().write_contents {
@@ -854,6 +1073,7 @@ pub fn on_present(token: u64) {
         return;
     }
 
+    let pending = PENDING_PRESENT.lock().unwrap().take();
     let p = PRESENTS.fetch_add(1, Ordering::Relaxed) + 1;
     if record && p > settings().skip_presents && recording_active() {
         {
@@ -865,10 +1085,16 @@ pub fn on_present(token: u64) {
                     append_event(&RecordedEvent::HeapSnap { heaps });
                 }
             }
+            let (queue, planes) = pending
+                .as_ref()
+                .map(|p| (p.queue, p.planes.clone()))
+                .unwrap_or((0, Vec::new()));
             let ev = RecordedEvent::Present {
                 frame,
                 token,
                 submits: SUBMITS.load(Ordering::Relaxed),
+                queue,
+                planes,
             };
             append_event(&ev);
             flush_frame_file(frame);
@@ -916,7 +1142,7 @@ fn try_replay_frame(frame_idx: usize, token: u64) {
         return;
     };
 
-    if !settings().replay_execute {
+    if !settings().replay_execute && !settings().replay_present {
         crate::xlog_info!(
             "D3D12.X: XCL_REPLAY: frame {frame_idx} (token {token}): {} event(s) — execute off (XCL_REPLAY_EXECUTE=0)",
             events.len()
@@ -930,13 +1156,16 @@ fn try_replay_frame(frame_idx: usize, token: u64) {
     let mut content_ok = 0u32;
     let mut content_bad = 0u32;
     let mut content_skip = 0u32;
-    let mut list_meta_ptrs: Vec<usize> = Vec::new();
-    // Collect list-meta ptrs for the whole frame first so submits can fall back to them.
+    let mut presents = 0u32;
+    let mut list_ptrs: Vec<usize> = Vec::new();
     for ev in events.iter() {
-        if let RecordedEvent::ListMeta { list, .. } = ev {
-            if *list != 0 && !list_meta_ptrs.contains(list) {
-                list_meta_ptrs.push(*list);
+        match ev {
+            RecordedEvent::ListMeta { list, .. } | RecordedEvent::ListPayload { list, .. } => {
+                if *list != 0 && !list_ptrs.contains(list) {
+                    list_ptrs.push(*list);
+                }
             }
+            _ => {}
         }
     }
 
@@ -949,13 +1178,22 @@ fn try_replay_frame(frame_idx: usize, token: u64) {
                 backing,
                 ..
             } => {
-                if !pointer_live(*queue) {
-                    skipped += 1;
+                if !settings().replay_execute {
                     continue;
                 }
-                let live = resolve_replay_lists(addrs, pc_addrs, backing, &list_meta_ptrs);
+                if !pointer_live(*queue) {
+                    skipped += 1;
+                    crate::xlog_info!(
+                        "D3D12.X: XCL_REPLAY: submit skipped — queue {queue:#x} not live (cross-process / freed handle)"
+                    );
+                    continue;
+                }
+                let (live, how) = resolve_replay_lists(addrs, pc_addrs, backing, &list_ptrs);
                 if live.is_empty() {
                     skipped += 1;
+                    crate::xlog_info!(
+                        "D3D12.X: XCL_REPLAY: submit skipped — no live lists (need same-process pointers; payload bytes alone cannot rebuild COM lists)"
+                    );
                     continue;
                 }
                 unsafe {
@@ -964,6 +1202,10 @@ fn try_replay_frame(frame_idx: usize, token: u64) {
                     });
                 }
                 submits += 1;
+                crate::xlog_info!(
+                    "D3D12.X: XCL_REPLAY: frame {frame_idx}: re-issued {} list(s) via {how}",
+                    live.len()
+                );
             }
             RecordedEvent::Signal { queue, fence, value } => {
                 if !settings().replay_fences {
@@ -983,10 +1225,50 @@ fn try_replay_frame(frame_idx: usize, token: u64) {
                     }
                 }
             }
-            RecordedEvent::Present { frame, token: t, .. } => {
-                crate::xlog_info!(
-                    "D3D12.X: XCL_REPLAY: replayed frame idx {frame_idx} (recorded frame {frame}, token {t}); PresentX not re-issued"
-                );
+            RecordedEvent::Present {
+                frame,
+                token: t,
+                queue,
+                planes,
+                ..
+            } => {
+                if settings().replay_present {
+                    if *queue != 0 && pointer_live(*queue) && !planes.is_empty() {
+                        let plane_refs: Vec<(usize, Option<[i32; 4]>)> = planes
+                            .iter()
+                            .filter(|p| pointer_live(p.resource))
+                            .map(|p| (p.resource, p.rect))
+                            .collect();
+                        if !plane_refs.is_empty() {
+                            unsafe {
+                                super::present::reissue_present_x(
+                                    *queue as *mut c_void,
+                                    *t,
+                                    &plane_refs,
+                                );
+                            }
+                            presents += 1;
+                            crate::xlog_info!(
+                                "D3D12.X: XCL_REPLAY: PresentX re-issued frame idx {frame_idx} (recorded {frame}, token {t}, {} plane(s))",
+                                plane_refs.len()
+                            );
+                        } else {
+                            skipped += 1;
+                            crate::xlog_info!(
+                                "D3D12.X: XCL_REPLAY: PresentX not re-issued — plane resources not live (same-process only)"
+                            );
+                        }
+                    } else {
+                        skipped += 1;
+                        crate::xlog_info!(
+                            "D3D12.X: XCL_REPLAY: PresentX not re-issued — missing queue/planes or queue not live"
+                        );
+                    }
+                } else {
+                    crate::xlog_info!(
+                        "D3D12.X: XCL_REPLAY: replayed frame idx {frame_idx} (recorded frame {frame}, token {t}); PresentX not re-issued (set XCL_REPLAY_PRESENT=1)"
+                    );
+                }
             }
             RecordedEvent::HeapSnap { heaps } => {
                 crate::xlog_info!(
@@ -1000,7 +1282,15 @@ fn try_replay_frame(frame_idx: usize, token: u64) {
                     pointer_live(*list)
                 );
             }
-            RecordedEvent::ContentSample { va, len, hash, .. } => {
+            RecordedEvent::ListPayload { list, list_kind, ops } => {
+                crate::xlog_info!(
+                    "D3D12.X: XCL_REPLAY: frame {frame_idx}: list payload ptr={list:#x} list_kind={list_kind} ops={} live={}",
+                    ops.len(),
+                    pointer_live(*list)
+                );
+            }
+            RecordedEvent::ContentSample { va, len, hash, .. }
+            | RecordedEvent::ContentChunk { va, len, hash, .. } => {
                 if !settings().replay_contents {
                     continue;
                 }
@@ -1014,10 +1304,111 @@ fn try_replay_frame(frame_idx: usize, token: u64) {
         }
     }
 
-    if submits > 0 || signals > 0 || skipped > 0 || content_ok + content_bad + content_skip > 0 {
+    if submits > 0 || signals > 0 || skipped > 0 || presents > 0 || content_ok + content_bad + content_skip > 0 {
         crate::xlog_info!(
-            "D3D12.X: XCL_REPLAY: frame {frame_idx}: {submits} submit(s), {signals} signal(s), {skipped} skipped; content ok={content_ok} mismatch={content_bad} unread={content_skip}"
+            "D3D12.X: XCL_REPLAY: frame {frame_idx}: {submits} submit(s), {signals} signal(s), {presents} present(s), {skipped} skipped; content ok={content_ok} mismatch={content_bad} unread={content_skip}"
         );
+    }
+}
+
+/// Offline inspect for `xcl replay <dir>` (no GPU device).
+pub fn cli_inspect(dir: &Path, json: bool, frame_filter: Option<u64>) -> Result<String, String> {
+    let index = dir.join("index.jsonl");
+    if !index.is_file() {
+        return Err(format!("missing {}", index.display()));
+    }
+    let session = std::fs::read_to_string(dir.join("session.json")).unwrap_or_default();
+    let mut frames = Vec::new();
+    let mut n = 0u64;
+    loop {
+        n += 1;
+        let bin = dir.join("frames").join(format!("frame_{n:04}.bin"));
+        let jsonl = dir.join("frames").join(format!("frame_{n:04}.jsonl"));
+        let contents = dir.join("frames").join(format!("frame_{n:04}.contents.bin"));
+        if !bin.is_file() && !jsonl.is_file() {
+            break;
+        }
+        if frame_filter.is_some_and(|f| f != n) {
+            continue;
+        }
+        let (source, events) = if bin.is_file() {
+            let wire = super::frame_wire::read_frame(&bin)?;
+            ("bin", recorded_from_wire(&wire))
+        } else {
+            let ev = load_jsonl_frame(dir, n).ok_or_else(|| format!("empty frame {n}"))?;
+            ("jsonl", ev)
+        };
+        let mut submits = 0u32;
+        let mut list_meta = 0u32;
+        let mut list_payload = 0u32;
+        let mut samples = 0u32;
+        let mut chunks = 0u32;
+        let mut signals = 0u32;
+        let mut planes = 0u32;
+        let mut payload_bytes = 0usize;
+        for ev in &events {
+            match ev {
+                RecordedEvent::Submit { .. } => submits += 1,
+                RecordedEvent::ListMeta { .. } => list_meta += 1,
+                RecordedEvent::ListPayload { ops, .. } => {
+                    list_payload += 1;
+                    payload_bytes += ops.len();
+                }
+                RecordedEvent::ContentSample { .. } => samples += 1,
+                RecordedEvent::ContentChunk { .. } => chunks += 1,
+                RecordedEvent::Signal { .. } => signals += 1,
+                RecordedEvent::Present { planes: p, .. } => planes += p.len() as u32,
+                _ => {}
+            }
+        }
+        frames.push(serde_json::json!({
+            "frame": n,
+            "source": source,
+            "events": events.len(),
+            "submits": submits,
+            "list_meta": list_meta,
+            "list_payload": list_payload,
+            "payload_bytes": payload_bytes,
+            "content_samples": samples,
+            "content_chunks": chunks,
+            "signals": signals,
+            "present_planes": planes,
+            "contents_bin_bytes": contents.metadata().map(|m| m.len()).unwrap_or(0),
+        }));
+    }
+    if frames.is_empty() {
+        return Err("no frames/frame_*.bin or frame_*.jsonl found".into());
+    }
+    if json {
+        Ok(serde_json::json!({
+            "dir": dir.display().to_string(),
+            "session": serde_json::from_str::<serde_json::Value>(&session).unwrap_or(serde_json::Value::Null),
+            "wire_version_writer": super::frame_wire::VERSION,
+            "cross_process": "unsupported",
+            "frames": frames,
+        })
+        .to_string())
+    } else {
+        let mut out = format!(
+            "xcl replay inspect {}\nwire writer v{} · {} frame(s)\ncross-process list rebuild: unsupported (COM handles are process-local)\n",
+            dir.display(),
+            super::frame_wire::VERSION,
+            frames.len()
+        );
+        for f in &frames {
+            out.push_str(&format!(
+                "  frame {}: {} events, {} submit(s), {} listpayload ({} B ops), {} content chunk(s), contents.bin {} B, {} present plane(s)\n",
+                f["frame"],
+                f["events"],
+                f["submits"],
+                f["list_payload"],
+                f["payload_bytes"],
+                f["content_chunks"],
+                f["contents_bin_bytes"],
+                f["present_planes"],
+            ));
+        }
+        Ok(out)
     }
 }
 
@@ -1053,7 +1444,7 @@ mod tests {
     }
 
     #[test]
-    fn wire_recorded_roundtrip_v3_fields() {
+    fn wire_recorded_roundtrip_v4_fields() {
         let recorded = vec![
             RecordedEvent::Submit {
                 n: 2,
@@ -1076,11 +1467,22 @@ mod tests {
                 heaps: vec![0x80],
                 vas: vec![0x5000],
             },
+            RecordedEvent::ListPayload {
+                list: 2,
+                list_kind: 0,
+                ops: vec![1, 2, 3],
+            },
             RecordedEvent::ContentSample {
                 va: 0x5000,
                 len: 4,
                 hash: super::super::frame_wire::fnv1a32(&[9, 8, 7, 6]),
                 sample: vec![9, 8, 7, 6],
+            },
+            RecordedEvent::ContentChunk {
+                va: 0x5000,
+                len: 4,
+                hash: super::super::frame_wire::fnv1a32(&[9, 8, 7, 6]),
+                file_off: 0,
             },
             RecordedEvent::HeapSnap {
                 heaps: vec![HeapEntry {
@@ -1088,6 +1490,16 @@ mod tests {
                     ty: 0,
                     count: 16,
                     flags: 1,
+                }],
+            },
+            RecordedEvent::Present {
+                frame: 1,
+                token: 7,
+                submits: 2,
+                queue: 0x40,
+                planes: vec![PresentPlaneRec {
+                    resource: 0x99,
+                    rect: Some([0, 0, 8, 8]),
                 }],
             },
         ];

@@ -59,6 +59,9 @@ pub(super) struct Em {
     pub static_ss: BTreeMap<u64, [u32; 4]>,
     /// Memory instruction address → SRSRC words when built from constants ([`constant_srsrc`])
     pub static_sr: BTreeMap<u64, [u32; 4]>,
+    /// Access PC → per-lane heap index when [`super::desc_trace`] proves a waterfall / Fetched
+    /// descriptor (CGBJ `lane_heap_index` analogue).
+    pub lane_heap: BTreeMap<u64, super::desc_trace::LaneHeapExpr>,
     /// the static samplers sampled with: (S#, comparison), in register order
     pub static_used: Vec<([u32; 4], bool)>,
     /// highest VGPR the program references (v_movrel* ranges)
@@ -620,6 +623,7 @@ impl Em {
             cur_pc: 0,
             static_ss: BTreeMap::new(),
             static_sr: BTreeMap::new(),
+            lane_heap: BTreeMap::new(),
             static_used: Vec::new(),
             max_vgpr: 0,
             has_f16_round_op: false,
@@ -788,6 +792,26 @@ impl Em {
                 format!("{}u", w[1]),
                 format!("{}u", w[2]),
                 format!("{}u", w[3]),
+            );
+        }
+        // Waterfall / Fetched: dword0 is each lane's own heap index (lane_heap_index analogue).
+        let lane_tw0 = self.lane_heap.get(&pc).cloned().map(|expr| {
+            let mut sfn = |c: u64| {
+                self.sgprs.insert(c);
+                sname(c).unwrap_or_else(|| "0u".into())
+            };
+            let mut vfn = |n: u64| {
+                self.vgprs.insert(n);
+                format!("v{n}")
+            };
+            super::desc_trace::lane_heap_hlsl(&expr, &mut sfn, &mut vfn)
+        });
+        if let Some(tw0) = lane_tw0 {
+            return (
+                tw0,
+                self.sreg(srsrc + 1),
+                self.sreg(srsrc + 2),
+                self.sreg(srsrc + 3),
             );
         }
         (

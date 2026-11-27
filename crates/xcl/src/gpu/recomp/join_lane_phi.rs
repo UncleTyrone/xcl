@@ -1,25 +1,29 @@
 //! LanePhi-inspired join handling for constant SGPR descriptor tracking (GPL-2).
 //!
 //! CGBJ `victory-shader` `Source::LanePhi`, Tracer [`only_edge`], and emit `lane_heap_index`
-//! lowering are study-only (GPL-3); XCL implements the **constant-SGPR subset** behind
-//! [`super::strict_joins`] (`XCL_STRICT_JOINS`, default on): lane-dead predecessor edges at
-//! a join do not intersect away constants the sole live arm defines, matching transmission /
-//! alpha-prefilter patterns.
+//! lowering are study-only (GPL-3); XCL implements the constant-SGPR subset behind
+//! [`super::strict_joins`] (`XCL_STRICT_JOINS`, default on) plus per-lane descriptor tracing in
+//! [`super::desc_trace`] (Fetched / Lanes / LanePhi origins, waterfall structural proof,
+//! lane_heap_index HLSL/DXIL expressions).
 //!
-//! Depth vs earlier XCL pass:
+//! Depth:
 //! - [`only_edge`]-style sole-live predecessor (loop headers refused)
 //! - Dead edges do **not** seed join state (CGBJ `None` on unused edges)
 //! - [`live_peel_known`]: nested sole-live peel at record time (Tracer `live` analogue)
 //! - SGPR copies / same-arm `s_cselect` / const SALU followed through blocks
+//! - Exec/lane polarity + optional [`lane_masks`] BDD join-edge liveness (meet subset)
 //!
-//! **Not ported (honest gap vs full CGBJ):** per-lane heap-index `LanePhi` phis in DXIL/HLSL,
-//! `Source::Lanes` / `Fetched`, waterfall tracing, Structured `meet` / `lanes.guards`, and
-//! SCC-dependent `Source::Select` when arms differ.
+//! **Still out of scope vs full CGBJ:** Structured BDD `meet` over nested multi-block
+//! waterfalls, SCC-dependent `Source::Select` when arms differ, and full IR-level phi
+//! reconstruction (XCL uses decoded RDNA2 + structural waterfall proof instead).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::rdna2::{self, Decoded};
-use super::{block_rpo, join_lane_dead_pred, merge_known_at_join, scalar_constant, strict_joins};
+use super::{
+    block_rpo, join_lane_dead_pred_polarity, lane_masks, merge_known_at_join, scalar_constant,
+    strict_joins,
+};
 
 pub(crate) type SgprKnown = HashMap<u64, u32>;
 
@@ -78,8 +82,16 @@ pub(crate) fn build_sgpr_join_cfg<'a>(
 }
 
 /// CGBJ `only_edge` analogue for constant propagation: the unique predecessor that is not
-/// lane-dead at this join (loop headers excluded).
+/// lane-dead at this join (loop headers excluded). Optional BDD polarity strengthens dead edges.
 pub(crate) fn join_sole_live_predecessor(cfg: &SgprJoinCfg, join_idx: usize) -> Option<usize> {
+    join_sole_live_predecessor_polarity(cfg, join_idx, None)
+}
+
+pub(crate) fn join_sole_live_predecessor_polarity(
+    cfg: &SgprJoinCfg,
+    join_idx: usize,
+    polarity: Option<&BTreeMap<u64, Vec<(u64, bool)>>>,
+) -> Option<usize> {
     if !strict_joins() {
         return None;
     }
@@ -93,7 +105,14 @@ pub(crate) fn join_sole_live_predecessor(cfg: &SgprJoinCfg, join_idx: usize) -> 
     let join_pc = cfg.blocks[join_idx].first().map(|d| d.pc).unwrap_or(0);
     let mut live = Vec::new();
     for &p in preds {
-        if !join_lane_dead_pred(cfg.blocks[p], join_pc, join_idx, preds, &cfg.rpo) {
+        if !join_lane_dead_pred_polarity(
+            cfg.blocks[p],
+            join_pc,
+            join_idx,
+            preds,
+            &cfg.rpo,
+            polarity,
+        ) {
             live.push(p);
         }
     }
@@ -110,8 +129,20 @@ pub(crate) fn merge_sgpr_known_at_join(
     incoming: &SgprKnown,
     dead_edge: bool,
 ) -> bool {
+    merge_sgpr_known_at_join_polarity(cfg, join_idx, pred_idx, have, incoming, dead_edge, None)
+}
+
+pub(crate) fn merge_sgpr_known_at_join_polarity(
+    cfg: &SgprJoinCfg,
+    join_idx: usize,
+    pred_idx: usize,
+    have: &mut SgprKnown,
+    incoming: &SgprKnown,
+    dead_edge: bool,
+    polarity: Option<&BTreeMap<u64, Vec<(u64, bool)>>>,
+) -> bool {
     if !dead_edge {
-        if let Some(only) = join_sole_live_predecessor(cfg, join_idx) {
+        if let Some(only) = join_sole_live_predecessor_polarity(cfg, join_idx, polarity) {
             if pred_idx == only {
                 let changed = have != incoming;
                 *have = incoming.clone();
@@ -145,8 +176,21 @@ where
 pub(crate) fn live_peel_known<FRun>(
     cfg: &SgprJoinCfg,
     start: &[Option<SgprKnown>],
+    block: usize,
+    run_block: &mut FRun,
+) -> SgprKnown
+where
+    FRun: FnMut(&[Decoded], &mut SgprKnown, bool),
+{
+    live_peel_known_polarity(cfg, start, block, run_block, None)
+}
+
+pub(crate) fn live_peel_known_polarity<FRun>(
+    cfg: &SgprJoinCfg,
+    start: &[Option<SgprKnown>],
     mut block: usize,
     run_block: &mut FRun,
+    polarity: Option<&BTreeMap<u64, Vec<(u64, bool)>>>,
 ) -> SgprKnown
 where
     FRun: FnMut(&[Decoded], &mut SgprKnown, bool),
@@ -156,7 +200,7 @@ where
         return known;
     }
     for _ in 0..MAX_JOINS {
-        let Some(only) = join_sole_live_predecessor(cfg, block) else {
+        let Some(only) = join_sole_live_predecessor_polarity(cfg, block, polarity) else {
             break;
         };
         let arm = block_end_known(cfg, start, only, run_block);
@@ -228,6 +272,16 @@ where
         }
         return out;
     }
+    let wave64 = insts.iter().any(|d| {
+        d.inst.name.contains("SAVEEXEC_B64")
+            || (d.inst.name.ends_with("_B64")
+                && {
+                    let (r, w) = rdna2::sgpr_uses(d);
+                    r.iter().chain(w.iter()).any(|&s| s == 126 || s == 127)
+                })
+    });
+    let polarity = lane_masks::join_polarity(insts, wave64).ok();
+    let pol = polarity.as_ref();
     let mut start: Vec<Option<SgprKnown>> = vec![None; cfg.blocks.len()];
     let mut work: Vec<usize> = Vec::new();
     if !cfg.blocks.is_empty() {
@@ -239,7 +293,14 @@ where
         run_block(&cfg.blocks[k], &mut known, false);
         for &n in &cfg.next[k] {
             let join_pc = cfg.blocks[n].first().map(|d| d.pc).unwrap_or(0);
-            let dead = join_lane_dead_pred(&cfg.blocks[k], join_pc, n, &cfg.pred[n], &cfg.rpo);
+            let dead = join_lane_dead_pred_polarity(
+                &cfg.blocks[k],
+                join_pc,
+                n,
+                &cfg.pred[n],
+                &cfg.rpo,
+                pol,
+            );
             let changed = match &mut start[n] {
                 slot @ None => {
                     // CGBJ LanePhi: dead edges contribute `None` — do not seed the join from them.
@@ -250,7 +311,9 @@ where
                         true
                     }
                 }
-                Some(have) => merge_sgpr_known_at_join(&cfg, n, k, have, &known, dead),
+                Some(have) => {
+                    merge_sgpr_known_at_join_polarity(&cfg, n, k, have, &known, dead, pol)
+                }
             };
             if changed {
                 work.push(n);
@@ -258,7 +321,7 @@ where
         }
     }
     for (k, b) in cfg.blocks.iter().enumerate() {
-        let mut known = live_peel_known(&cfg, &start, k, &mut run_block);
+        let mut known = live_peel_known_polarity(&cfg, &start, k, &mut run_block, pol);
         run_block(b, &mut known, true);
         for d in *b {
             record(d, &known, &mut out);
@@ -465,7 +528,9 @@ mod tests {
             .pred[join]
             .iter()
             .copied()
-            .filter(|&p| join_lane_dead_pred(cfg.blocks[p], join_pc, join, &cfg.pred[join], &cfg.rpo))
+            .filter(|&p| {
+                super::super::join_lane_dead_pred(cfg.blocks[p], join_pc, join, &cfg.pred[join], &cfg.rpo)
+            })
             .collect::<Vec<_>>();
         let live: Vec<_> = cfg.pred[join].iter().copied().filter(|p| !dead.contains(p)).collect();
         assert_eq!(live.len(), 1, "one live arm at transmission join");

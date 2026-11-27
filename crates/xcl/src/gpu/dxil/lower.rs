@@ -210,6 +210,8 @@ pub struct Lw {
     pub static_samplers: std::collections::BTreeMap<u64, [u32; 4]>,
     /// MUBUF/FLAT sites whose SRSRC is constant on every path ([`recomp::constant_srsrc`], LanePhi-inspired joins).
     pub static_srsrc: std::collections::BTreeMap<u64, [u32; 4]>,
+    /// Access PC → per-lane heap index ([`recomp::desc_trace`], CGBJ `lane_heap_index` analogue).
+    pub lane_heap: std::collections::BTreeMap<u64, crate::gpu::recomp::desc_trace::LaneHeapExpr>,
     /// the program writes a non-default MODE[3:2] and has f16 rounding ops (no f64 ones):
     /// f16 results round in software under `VAR_FP16_RM` (the recompiler's `dynamic_f16_rm`)
     pub dyn_rm: bool,
@@ -675,16 +677,62 @@ impl Lw {
     }
 
     /// SRSRC dwords for a memory instruction: immediates when [`Self::static_srsrc`] has `pc`.
+    /// When [`Self::lane_heap`] proves a waterfall / Fetched origin, dword0 is each lane's own
+    /// heap index (CGBJ `lane_heap_index` analogue).
     pub fn buffer_srsrc_words(&mut self, pc: u64, base: u64) -> [Value; 4] {
         if let Some(w) = self.static_srsrc.get(&pc).copied() {
             return [self.c(w[0]), self.c(w[1]), self.c(w[2]), self.c(w[3])];
         }
+        let lane0 = self.lane_heap.get(&pc).cloned().map(|e| self.lane_heap_index(&e));
         [
-            self.sreg(base),
+            lane0.unwrap_or_else(|| self.sreg(base)),
             self.sreg(base + 1),
             self.sreg(base + 2),
             self.sreg(base + 3),
         ]
+    }
+
+    /// DXIL value of a [`crate::gpu::recomp::desc_trace::LaneHeapExpr`].
+    pub fn lane_heap_index(&mut self, expr: &crate::gpu::recomp::desc_trace::LaneHeapExpr) -> Value {
+        use crate::gpu::recomp::desc_trace::LaneHeapExpr as E;
+        match expr {
+            E::Imm(i) => self.c(*i),
+            E::VgprDword0(v) => self.vreg(*v),
+            E::FetchedAddr {
+                addr_vgpr,
+                add,
+                shift,
+            } => {
+                let mut a = self.vreg(*addr_vgpr);
+                if *add != 0 {
+                    let k = self.c(*add);
+                    a = self.add(a, k);
+                }
+                self.lshrc(a, u32::from(*shift))
+            }
+            E::Lanes {
+                mask_sgpr,
+                set,
+                clear,
+            } => {
+                let m = self.sreg(*mask_sgpr);
+                let lane = self.s.wave_lane_index();
+                let bit = self.lshr(m, lane);
+                let one = self.c(1);
+                let bit = self.and(bit, one);
+                let cond = self.nz(bit);
+                let s = self.lane_heap_index(set);
+                let c = self.lane_heap_index(clear);
+                self.sel(cond, s, c)
+            }
+            E::LanePhi { arms } => {
+                let live: Vec<_> = arms.iter().flatten().collect();
+                match live.len() {
+                    0 => self.c(0),
+                    _ => self.lane_heap_index(live[0]),
+                }
+            }
+        }
     }
     pub fn vreg(&mut self, n: u64) -> Value {
         self.rd(VAR_VGPR + n as u32)

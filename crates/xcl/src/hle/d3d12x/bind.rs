@@ -667,10 +667,12 @@ pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices:
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
     if let Some(list) = graphics_bound(this) {
         if draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
+            super::list_x::note_frame_draw(this, false, vertices, instances, first_vertex, 0);
             return;
         }
         super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
         list.DrawInstanced(vertices, instances, first_vertex, first_instance);
+        super::list_x::note_frame_draw(this, false, vertices, instances, first_vertex, 0);
     }
 }
 
@@ -709,6 +711,14 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
     first_instance: u32,
 ) {
     list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
+    super::list_x::note_frame_draw(
+        list.as_raw(),
+        true,
+        indices,
+        instances,
+        first_index,
+        base_vertex,
+    );
 }
 
 /// Before a draw: with a translated pipeline its ABI root signature and the kept graphics
@@ -1065,6 +1075,7 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         Ok(()) => {
             count(DISPATCHES);
             super::list_x::note_shader_pass(this);
+            super::list_x::note_frame_dispatch(this, x, y, z);
         }
         Err(e) => {
             count(DISPATCHES_SKIPPED);
@@ -1188,7 +1199,10 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     // more groups in X than D3D12 takes: folded (`recomp::IO_GROUP_LIMIT`)
     let (limit, [x, y, z]) = fold(x, y, z);
     bind_abi(this, list, pso, false, limit)?;
-    super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z])
+    let mark = super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [x, y, z]);
+    let r = super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z]);
+    super::culprit::after_dispatch(list, mark);
+    r
 }
 
 /// A dispatch of `x` x `y` x `z` groups as D3D12 takes it: (the count for

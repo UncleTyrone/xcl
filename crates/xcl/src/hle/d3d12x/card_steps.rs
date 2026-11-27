@@ -394,9 +394,29 @@ pub fn log_stats(frames: f64) {
 mod tests {
     use super::*;
 
+    /// Acceptance: stage-2 copies and stage-1 fills both require `XCL_RELAY=2` ([`crate::hle::d3d12x::relay::exact`]).
+    /// Without it, prelude deferrals refuse so title lists keep recording the ops themselves.
+    #[test]
+    fn relay_exact_gates_prelude_deferrals() {
+        // When XCL_RELAY≠2 or CARD_STEPS stage is below the path, deferrals refuse.
+        // (Parent shells may latch XCL_RELAY; only assert the refuse side when gates are off.)
+        if !crate::hle::d3d12x::relay::exact() || stage() < 2 {
+            assert!(!defer_copy_to_prelude(0x1000, 0x2000, 64));
+        }
+        if !crate::hle::d3d12x::relay::exact() || stage() < 1 {
+            assert!(!defer_fill_to_prelude(0x1000, 256, 0));
+        }
+    }
+
+    #[test]
+    fn continues_rejects_overlap_and_gap() {
+        assert!(!continues((0x100, 0x200, 64), (0x120, 0x240, 32)), "dst overlap");
+        assert!(!continues((0x100, 0x200, 64), (0x180, 0x280, 32)), "gap in dst");
+        assert!(!continues((0x100, 0x200, 64), (0x140, 0x300, 32)), "gap in src");
+    }
+
     #[test]
     fn continues_adjacent_non_overlapping() {
-        assert!(continues((0x100, 0x200, 64), (0x140, 0x240, 32)));
-        assert!(!continues((0x100, 0x200, 64), (0x120, 0x220, 32)));
+        assert!(continues((0x100, 0x200, 64), (0x140, 0x240, 32)));        assert!(!continues((0x100, 0x200, 64), (0x120, 0x220, 32)));
     }
 }

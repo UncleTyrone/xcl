@@ -43,6 +43,7 @@ pub(crate) mod read_env;
 pub(crate) mod join;
 pub(crate) mod card_steps;
 pub(crate) mod land;
+pub(crate) mod safecopy;
 pub(crate) mod root_env;
 pub(crate) mod send_env;
 pub(crate) mod texture_env;

@@ -29,21 +29,46 @@ fn must_come_from_title_folder(dll: &str) -> bool {
     }
 }
 
-/// Imported DLL names that must be present beside the executable but are not (each once, case-insensitive).
-pub fn absent_title_dlls(exe: &Path) -> Result<Vec<String>, String> {
-    let data = std::fs::read(exe).map_err(|e| format!("reading {}: {e}", exe.display()))?;
-    let pe = Pe::parse(&data, Layout::File).map_err(|e| format!("{}: {e}", exe.display()))?;
+/// Collect import / delay-import DLL names from a PE image on disk.
+fn pe_import_dlls(path: &Path) -> Result<Vec<String>, String> {
+    let data = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let pe = Pe::parse(&data, Layout::File).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut all = pe.imports().map_err(|e| format!("imports: {e}"))?;
     all.extend(pe.delay_imports().unwrap_or_default());
+    Ok(all.into_iter().map(|d| d.dll).collect())
+}
+
+/// Imported DLL names that must be present beside the executable but are not (each once, case-insensitive).
+///
+/// Also walks one level into each found title DLL so a missing sibling pulled only by
+/// `XboxBvhBuilder.dll` (etc.) still fails before System Init.
+pub fn absent_title_dlls(exe: &Path) -> Result<Vec<String>, String> {
     let mut seen = std::collections::HashSet::new();
     let mut absent = Vec::new();
-    for d in &all {
-        let key = dll_key(&d.dll);
-        if !seen.insert(key) || !must_come_from_title_folder(&d.dll) {
+    let mut queue: Vec<String> = pe_import_dlls(exe)?;
+    let mut second_wave = Vec::new();
+    let mut in_second = false;
+    while let Some(dll) = queue.pop() {
+        let key = dll_key(&dll);
+        if !seen.insert(key) || !must_come_from_title_folder(&dll) {
             continue;
         }
-        if find_game_dll(&d.dll).is_none() && !absent.iter().any(|a: &String| a.eq_ignore_ascii_case(&d.dll)) {
-            absent.push(d.dll.clone());
+        match find_game_dll(&dll) {
+            None => {
+                if !absent.iter().any(|a: &String| a.eq_ignore_ascii_case(&dll)) {
+                    absent.push(dll);
+                }
+            }
+            Some(path) if !in_second => {
+                if let Ok(more) = pe_import_dlls(&path) {
+                    second_wave.extend(more);
+                }
+            }
+            Some(_) => {}
+        }
+        if queue.is_empty() && !in_second {
+            in_second = true;
+            queue.append(&mut second_wave);
         }
     }
     Ok(absent)

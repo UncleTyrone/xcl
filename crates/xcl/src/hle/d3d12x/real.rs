@@ -5955,12 +5955,18 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
             LAST_COMPUTE_TRANSLATED.with(|c| c.set(true));
             LAST_COMPUTE_RS.with(|c| c.set(0));
             note_console_compute(hr, ppv);
+            if hr >= 0 && !ppv.is_null() {
+                super::culprit::note_compute(*ppv as usize, desc);
+            }
             return hr;
         }
         console = translated_compute_pso(this, f, desc, riid, ppv);
     }
     LAST_COMPUTE_TRANSLATED.with(|c| c.set(matches!(console, Some(Ok(hr)) if hr >= 0)));
     if let Some(Ok(hr)) = console {
+        if hr >= 0 && !ppv.is_null() {
+            super::culprit::note_compute(*ppv as usize, desc);
+        }
         return hr;
     }
     // a console shader the recompiler could not take must not reach the driver: AMD's shader
@@ -7789,6 +7795,8 @@ pub fn log_device_removed() {
         return;
     }
     crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
+    super::flight::dump("device removed");
+    super::culprit::on_device_removed();
     unsafe {
         let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData>() else { return };
         if let Ok(pf) = dred.GetPageFaultAllocationOutput() {
