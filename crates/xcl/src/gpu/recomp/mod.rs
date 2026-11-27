@@ -1434,13 +1434,30 @@ fn scalar_constant(d: &Decoded, code: u64) -> Option<u32> {
 }
 
 /// `XCL_STRICT_JOINS` (default **on**): join merge keeps live-arm SGPR constants when a
-/// predecessor is a conditional branch straight to the merge with an empty EXEC/VCC/SCC
-/// guard (transmission / alpha-prefilter). `XCL_STRICT_JOINS=0` uses intersection-only merge.
+/// predecessor is lane-dead at the merge (transmission / alpha-prefilter). Inspired by CGBJ
+/// `LanePhi` / `only_edge` lane-live predecessor handling (study-only; GPL-2 implementation).
+/// `XCL_STRICT_JOINS=0` uses intersection-only merge.
 pub(crate) fn strict_joins() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| !std::env::var("XCL_STRICT_JOINS").is_ok_and(|v| v.trim() == "0"))
 }
 
+/// Whether the block establishes any user SGPR constants tracked by [`constant_samplers`].
+fn block_sets_sgpr_constants(block: &[Decoded]) -> bool {
+    let f = |d: &Decoded, n: &str| rdna2::field_value(d.enc, &d.words, n);
+    block.iter().any(|d| {
+        let sets = match d.inst.name {
+            "S_MOV_B32" | "S_MOVK_I32" | "S_BREV_B32" | "S_BFM_B32" => {
+                f(d, "SDST").is_some_and(|r| r < 106)
+            }
+            "S_MOV_B64" => f(d, "SDST").is_some_and(|r| r < 106),
+            _ => false,
+        };
+        sets
+    })
+}
+
+/// Conditional branch straight to the join from an empty EXEC/VCC/SCC guard (lane-dead edge).
 fn join_skip_pred(from: &[Decoded], join_pc: u64) -> bool {
     if !strict_joins() {
         return false;
@@ -1456,6 +1473,117 @@ fn join_skip_pred(from: &[Decoded], join_pc: u64) -> bool {
     )
 }
 
+/// LanePhi-inspired: is this predecessor edge lane-dead at the join (do not intersect away
+/// constants defined only on live arms)?
+fn join_lane_dead_pred(from: &[Decoded], join_pc: u64, join_idx: usize, preds: &[usize], rpo: &[usize]) -> bool {
+    if !strict_joins() {
+        return false;
+    }
+    if join_skip_pred(from, join_pc) {
+        return true;
+    }
+    // Loop-header joins: LanePhi refuses `only_edge` here; do not treat inert arms as dead.
+    if preds.len() >= 2 && preds.iter().any(|&p| rpo[p] >= rpo[join_idx]) {
+        return false;
+    }
+    if block_sets_sgpr_constants(from) {
+        return false;
+    }
+    from.iter().any(|d| {
+        rdna2::branch_target(d).is_some_and(|t| t == join_pc)
+            && matches!(d.inst.name, "S_BRANCH" | "S_SETPC_B64" | "S_CBRANCH_EXECZ" | "S_CBRANCH_VCCZ" | "S_CBRANCH_VCCNZ" | "S_CBRANCH_SCC0" | "S_CBRANCH_SCC1")
+    })
+}
+
+type SgprKnown = std::collections::HashMap<u64, u32>;
+
+/// Merge incoming SGPR constants at a CFG join (LanePhi-inspired live-arm preservation).
+fn merge_known_at_join(have: &mut SgprKnown, incoming: &SgprKnown, dead_edge: bool) {
+    if !strict_joins() {
+        if have.is_empty() {
+            have.extend(incoming.iter().map(|(&r, &v)| (r, v)));
+        } else {
+            have.retain(|r, v| incoming.get(r) == Some(v));
+        }
+        return;
+    }
+    if dead_edge {
+        for (r, v) in incoming {
+            if have.get(r).is_some_and(|hv| hv != v) {
+                have.remove(r);
+            }
+        }
+        return;
+    }
+    if have.is_empty() {
+        have.extend(incoming.iter().map(|(&r, &v)| (r, v)));
+        return;
+    }
+    for (r, v) in incoming {
+        match have.get(r) {
+            None => {
+                have.insert(*r, *v);
+            }
+            Some(hv) if *hv == *v => {}
+            Some(_) => {
+                have.remove(r);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod join_merge_tests {
+    use super::*;
+
+    #[test]
+    fn lane_phi_merge_keeps_constants_when_predecessor_defines_none() {
+        let mut have: SgprKnown = std::collections::HashMap::from([(8, 0x92u32)]);
+        let incoming: SgprKnown = std::collections::HashMap::new();
+        merge_known_at_join(&mut have, &incoming, false);
+        assert_eq!(have.get(&8), Some(&0x92));
+    }
+
+    #[test]
+    fn lane_phi_merge_clears_on_live_conflict() {
+        let mut have: SgprKnown = std::collections::HashMap::from([(8, 1)]);
+        let incoming: SgprKnown = std::collections::HashMap::from([(8, 2)]);
+        merge_known_at_join(&mut have, &incoming, false);
+        assert!(!have.contains_key(&8));
+    }
+}
+
+fn block_rpo(next: &[Vec<usize>]) -> Vec<usize> {
+    let n = next.len();
+    let mut rpo = vec![usize::MAX; n];
+    let mut time = 0usize;
+    fn visit(next: &[Vec<usize>], rpo: &mut [usize], time: &mut usize, stack: &mut Vec<(usize, bool)>) {
+        while let Some((b, out)) = stack.pop() {
+            if out {
+                *time += 1;
+                rpo[b] = *time;
+            } else if rpo[b] == usize::MAX {
+                rpo[b] = 0;
+                stack.push((b, true));
+                for &s in next[b].iter().rev() {
+                    if rpo[s] == usize::MAX {
+                        stack.push((s, false));
+                    }
+                }
+            }
+        }
+    }
+    if !next.is_empty() {
+        visit(next, &mut rpo, &mut time, &mut vec![(0, false)]);
+    }
+    for b in 1..n {
+        if rpo[b] == usize::MAX {
+            visit(next, &mut rpo, &mut time, &mut vec![(b, false)]);
+        }
+    }
+    rpo
+}
+
 /// S# built from constants in the code – how the console compiler places the static
 /// samplers of a root signature: for each MIMG instruction whose four sampler SGPRs hold
 /// constants set by s_mov / s_movk / s_brev on every path that reaches it, those words.
@@ -1467,11 +1595,11 @@ fn join_skip_pred(from: &[Decoded], join_pc: u64) -> bool {
 /// `follow`: follow constants through branches when recording S# for MIMG (vertex/pixel always;
 /// compute when `follow` is true). At joins, predecessors that `s_cbranch_execz` straight to
 /// the merge are ignored when intersecting SGPR constants so a guarded sample after a live arm
-/// still resolves its immediate S# (transmission prefilter on Wave32). Buffer/UAV descriptor SGPRs
-/// need the fuller structured lane-guard join from CGBJ `resource.rs` (`only_edge` / `live`) for
-/// per-lane phis and nested joins; [`constant_srsrc`] covers the common execz-to-join case.
+/// still resolves its immediate S# (transmission prefilter on Wave32). LanePhi-style join merge
+/// keeps constants from live predecessors when another arm defines none; full per-lane `LanePhi`
+/// tracing in emit remains unported.
 pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, follow: bool) -> BTreeMap<u64, [u32; 4]> {
-    type Known = std::collections::HashMap<u64, u32>;
+    type Known = SgprKnown;
     fn run(block: &[Decoded], known: &mut Known, mut out: Option<&mut BTreeMap<u64, [u32; 4]>>) {
         for d in block {
             let f = |n: &str| rdna2::field_value(d.enc, &d.words, n);
@@ -1537,6 +1665,13 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, foll
         }
         return out;
     };
+    let mut pred: Vec<Vec<usize>> = vec![Vec::new(); blocks.len()];
+    for (k, succs) in next.iter().enumerate() {
+        for &n in succs {
+            pred[n].push(k);
+        }
+    }
+    let rpo = block_rpo(&next);
     let mut start: Vec<Option<Known>> = vec![None; blocks.len()];
     let mut work: Vec<usize> = Vec::new();
     if !blocks.is_empty() {
@@ -1548,7 +1683,7 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, foll
         run(blocks[k], &mut known, None);
         for &n in &next[k] {
             let join_pc = blocks[n].first().map(|d| d.pc).unwrap_or(0);
-            let skip = join_skip_pred(blocks[k], join_pc);
+            let dead = join_lane_dead_pred(blocks[k], join_pc, n, &pred[n], &rpo);
             let changed = match &mut start[n] {
                 slot @ None => {
                     *slot = Some(known.clone());
@@ -1556,17 +1691,7 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, foll
                 }
                 Some(have) => {
                     let before = have.len();
-                    if skip {
-                        for (r, v) in &known {
-                            if have.get(r).is_some_and(|hv| hv != v) {
-                                have.remove(r);
-                            }
-                        }
-                    } else if have.is_empty() {
-                        have.extend(known.iter().map(|(&r, &v)| (r, v)));
-                    } else {
-                        have.retain(|r, v| known.get(r) == Some(v));
-                    }
+                    merge_known_at_join(have, &known, dead);
                     have.len() != before
                 }
             };
@@ -1581,11 +1706,10 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, foll
     out
 }
 
-/// Buffer / flat / UAV SRSRC words built from constants on every path (same join / `execz_skip`
-/// rules as [`constant_samplers`]: dead `s_cbranch_execz` edges at a merge do not clear the live
-/// arm's descriptor – transmission / alpha-prefilter CS patterns).
+/// Buffer / flat / UAV SRSRC words built from constants on every path (same LanePhi-inspired
+/// join rules as [`constant_samplers`]: lane-dead edges at a merge do not clear the live arm).
 pub(crate) fn constant_srsrc(insts: &[Decoded], leaders: &BTreeSet<u64>, follow: bool) -> BTreeMap<u64, [u32; 4]> {
-    type Known = std::collections::HashMap<u64, u32>;
+    type Known = SgprKnown;
     fn run(block: &[Decoded], known: &mut Known, mut out: Option<&mut BTreeMap<u64, [u32; 4]>>) {
         for d in block {
             let f = |n: &str| rdna2::field_value(d.enc, &d.words, n);
@@ -1681,6 +1805,13 @@ pub(crate) fn constant_srsrc(insts: &[Decoded], leaders: &BTreeSet<u64>, follow:
         }
         return out;
     };
+    let mut pred: Vec<Vec<usize>> = vec![Vec::new(); blocks.len()];
+    for (k, succs) in next.iter().enumerate() {
+        for &n in succs {
+            pred[n].push(k);
+        }
+    }
+    let rpo = block_rpo(&next);
     let mut start: Vec<Option<Known>> = vec![None; blocks.len()];
     let mut work: Vec<usize> = Vec::new();
     if !blocks.is_empty() {
@@ -1692,7 +1823,7 @@ pub(crate) fn constant_srsrc(insts: &[Decoded], leaders: &BTreeSet<u64>, follow:
         run(blocks[k], &mut known, None);
         for &n in &next[k] {
             let join_pc = blocks[n].first().map(|d| d.pc).unwrap_or(0);
-            let skip = join_skip_pred(blocks[k], join_pc);
+            let dead = join_lane_dead_pred(blocks[k], join_pc, n, &pred[n], &rpo);
             let changed = match &mut start[n] {
                 slot @ None => {
                     *slot = Some(known.clone());
@@ -1700,17 +1831,7 @@ pub(crate) fn constant_srsrc(insts: &[Decoded], leaders: &BTreeSet<u64>, follow:
                 }
                 Some(have) => {
                     let before = have.len();
-                    if skip {
-                        for (r, v) in &known {
-                            if have.get(r).is_some_and(|hv| hv != v) {
-                                have.remove(r);
-                            }
-                        }
-                    } else if have.is_empty() {
-                        have.extend(known.iter().map(|(&r, &v)| (r, v)));
-                    } else {
-                        have.retain(|r, v| known.get(r) == Some(v));
-                    }
+                    merge_known_at_join(have, &known, dead);
                     have.len() != before
                 }
             };
