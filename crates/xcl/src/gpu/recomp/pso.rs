@@ -1194,7 +1194,8 @@ pub struct TwoPass {
 
 fn finish_two_pass_compiled(cs: Compiled, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
     let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
-    let ms = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
+    let payload = super::mesh_launch::enabled();
+    let ms = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref(), payload), "main", "ms_6_6")?.0;
     let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
     Ok(TwoPass { cs: cs.dxil, ms, record, mesh_groups_per_record, samplers: cs.samplers })
 }
@@ -1349,7 +1350,12 @@ pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: b
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("GS");
                 let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
-                let msb = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
+                let msb = dxc::compile_cached(
+                    &super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref(), super::mesh_launch::enabled()),
+                    "main",
+                    "ms_6_6",
+                )?
+                .0;
                 let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
                 return Ok(TwoPass { cs: k.dxil, ms: msb, record, mesh_groups_per_record, samplers: k.static_samplers });
             }
@@ -1404,7 +1410,13 @@ pub fn static_sampler_desc(k: u32, (w, comparison): &StaticSampler) -> D3D12_STA
 
 /// The ABI root signature with the pipeline's static samplers (registers 0.., space 1).
 pub fn abi_root_signature_with(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler]) -> Result<ID3D12RootSignature, String> {
-    abi_signature(dev, graphics, samplers, false)
+    abi_signature(dev, graphics, samplers, false, false)
+}
+
+/// XCL ABI root signature with mesh-launch amplification bindings after the six UAVs.
+pub fn abi_root_signature_mesh_launch(dev: &ID3D12Device, samplers: &[StaticSampler]) -> Result<(ID3D12RootSignature, [u32; 3]), String> {
+    let rs = abi_signature(dev, true, samplers, false, true)?;
+    Ok((rs, super::mesh_launch::ROOT_INDICES))
 }
 
 /// Record all piece dispatches after the six common root views have been bound.
@@ -1452,10 +1464,43 @@ pub(crate) unsafe fn record_dispatch_chain<'a>(
 }
 
 pub(crate) fn dispatch_chain_root_signature(dev: &ID3D12Device, samplers: &[StaticSampler]) -> Result<ID3D12RootSignature, String> {
-    abi_signature(dev, false, samplers, true)
+    abi_signature(dev, false, samplers, true, false)
 }
 
-fn abi_signature(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler], split: bool) -> Result<ID3D12RootSignature, String> {
+/// Root parameter index for `tb_heap_strides` / `t252, space1` when `XCL_HEAP_STRIDES=1`.
+pub fn abi_heap_strides_root_index(split: bool, mesh_launch: bool) -> Option<u32> {
+    if !crate::hle::d3d12x::heap_strides::on() {
+        return None;
+    }
+    let mut n = 6u32;
+    if split {
+        n += 2;
+    }
+    if mesh_launch {
+        n += 3;
+    }
+    Some(n)
+}
+
+fn push_heap_strides_root(params: &mut Vec<D3D12_ROOT_PARAMETER1>) {
+    if !crate::hle::d3d12x::heap_strides::on() {
+        return;
+    }
+    let slot = crate::hle::d3d12x::heap_strides::SLOT_TABLE_STRIDES as u32;
+    params.push(D3D12_ROOT_PARAMETER1 {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                ShaderRegister: slot,
+                RegisterSpace: 1,
+                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    });
+}
+
+fn abi_signature(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler], split: bool, mesh_launch: bool) -> Result<ID3D12RootSignature, String> {
     let statics: Vec<D3D12_STATIC_SAMPLER_DESC> = samplers.iter().enumerate().map(|(k, s)| static_sampler_desc(k as u32, s)).collect();
     unsafe {
         // u0 io, u1 res, u2..u5 the memory windows (`gpu::uma`; unused ones need no binding)
@@ -1484,6 +1529,10 @@ fn abi_signature(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler],
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        if mesh_launch {
+            params.extend(super::mesh_launch::root_params(params.len() as u32));
+        }
+        push_heap_strides_root(&mut params);
         let mut flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
         if graphics {
             flags |= D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;

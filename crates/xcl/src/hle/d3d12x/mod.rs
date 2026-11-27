@@ -16,7 +16,7 @@ pub mod bind;
 mod bvh_want;
 mod capture;
 pub mod console_heap;
-mod heap_strides;
+pub(crate) mod heap_strides;
 pub mod console_list;
 pub mod clamp;
 pub(crate) mod constants;

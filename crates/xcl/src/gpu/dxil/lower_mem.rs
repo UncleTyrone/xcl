@@ -1104,6 +1104,34 @@ impl Lw {
             v
         }
     }
+    /// UINT/SINT view-kind flags from the root stride table (`t252`, `XCL_HEAP_STRIDES=1`).
+    fn table_view_kind(&mut self, slot: Value) -> Option<(Value, Value)> {
+        let (handle, binding) = {
+            let tb = self.table_strides.as_ref()?;
+            (tb.handle, tb.binding)
+        };
+        use crate::hle::d3d12x::heap_strides::{VIEW_INTEGER, VIEW_SIGNED};
+        let byte_off = self.shlc(slot, 2);
+        let buf = RawUav { handle, binding };
+        let word = self.s.raw_load(buf, byte_off, 1).into_iter().next()?;
+        let wi = self.andc(word, VIEW_INTEGER);
+        let ws = self.andc(word, VIEW_SIGNED);
+        let int = self.cmpc(Pred::Ne, wi, 0);
+        let signed = self.cmpc(Pred::Ne, ws, 0);
+        Some((int, signed))
+    }
+
+    fn table_stride_for_slot(&mut self, slot: Value) -> Option<Value> {
+        let (handle, binding) = {
+            let tb = self.table_strides.as_ref()?;
+            (tb.handle, tb.binding)
+        };
+        let byte_off = self.shlc(slot, 2);
+        let buf = RawUav { handle, binding };
+        let word = self.s.raw_load(buf, byte_off, 1).into_iter().next()?;
+        Some(self.andc(word, 0x3FFF_FFFF))
+    }
+
     fn d16_merge(&mut self, v: Value, raw: Value, n: u32, signed: bool, half: u32) -> Value {
         let bits = 8 * n;
         let val = if signed {
@@ -1254,8 +1282,13 @@ impl Lw {
         let (d0, d1, d2, d3) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2), self.sreg(srsrc + 3));
         let index = if idxen { self.vreg(vaddr) } else { self.c(0) };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { self.c(0) };
-        let stride = self.lshrc(d1, 16);
-        let stride = self.andc(stride, 0x3FFF);
+        let stride_raw = self.lshrc(d1, 16);
+        let mut stride = self.andc(stride_raw, 0x3FFF);
+        if idxen {
+            if let Some(ts) = self.table_stride_for_slot(index) {
+                stride = ts;
+            }
+        }
         let off = self.addc(voff, f("OFFSET") as u32);
         let a = self.add(d0, soff);
         let a = self.add(a, off);
@@ -1392,7 +1425,16 @@ impl Lw {
                         let lo16 = self.andc(s_val, 0xFFFF);
                         let sf = self.f(s_val);
                         let h16 = self.s.f32_to_f16(sf);
-                        let h = self.sel(c1.desc.isint, lo16, h16);
+                        let mut h = self.sel(c1.desc.isint, lo16, h16);
+                        if idxen {
+                            if let Some((int, signed)) = self.table_view_kind(index) {
+                                let n16 = self.andc(s_val, 0xFFFF);
+                                let up = self.shlc(n16, 16);
+                                let se = self.ashrc(up, 16);
+                                let ext = self.sel(signed, se, n16);
+                                h = self.sel(int, ext, h);
+                            }
+                        }
                         if high {
                             let h = self.shlc(h, 16);
                             let h = self.sel(ok, h, z);

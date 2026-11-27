@@ -3483,6 +3483,9 @@ pub(super) unsafe fn rebind(this: *mut c_void, list: &ID3D12GraphicsCommandList,
         // (resolved here, and a compute pipeline has none of the state the hook of a title's call keeps)
         super::list_x::set_compute_pipeline(this, b.pso.as_raw());
     }
+    if let Some(idx) = crate::gpu::recomp::pso::abi_heap_strides_root_index(false, false) {
+        super::heap_strides::bind_root(list, gfx, idx);
+    }
 }
 
 /// XCL's ABI for a translated pipeline: its root signature, the user SGPRs (`io`, the kept

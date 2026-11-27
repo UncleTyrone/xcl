@@ -4898,6 +4898,9 @@ impl Em {
             let ty = if *cmp { "SamplerComparisonState" } else { "SamplerState" };
             let _ = writeln!(h, "{ty} xcl_ss{k} : register(s{k}, space1);");
         }
+        if crate::hle::d3d12x::heap_strides::on() {
+            h.push_str("ByteAddressBuffer tb_heap_strides : register(t252, space1);\n");
+        }
         h.push_str(PRELUDE);
         if body.contains(LOOP_CAP_INIT) {
             h.push_str("// loop passes one entry of a loop may run (`Em::loop_guard`)

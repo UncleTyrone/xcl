@@ -45,6 +45,17 @@ fn init_table(g: &mut Option<Table>) {
     *g = Some(Table { cpu: vec![0u32; words], gpu });
 }
 
+/// Bind the stride table on an open list (`bind_abi` root index from [`crate::gpu::recomp::pso::abi_heap_strides_root_index`]).
+pub unsafe fn bind_root(list: &windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList, gfx: bool, root_index: u32) {
+    if let Some(gpu) = gpu_address() {
+        if gfx {
+            list.SetGraphicsRootShaderResourceView(root_index, gpu);
+        } else {
+            list.SetComputeRootShaderResourceView(root_index, gpu);
+        }
+    }
+}
+
 /// GPU VA of the stride table for root binding; `None` when off or not allocated.
 pub fn gpu_address() -> Option<u64> {
     if !on() {

@@ -14,7 +14,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use super::module::{BinOp, Block, CastOp, Pred, Value};
 use super::ops::{BitCount, Binary, FClass, FUnary, Tertiary};
-use super::shader::{Feature, RawUav, Shader};
+use super::shader::{Feature, RawSrv, RawUav, Shader};
 use super::ssa::Ssa;
 use crate::gpu::rdna2::{self, Decoded, Encoding, Operand, Variant};
 
@@ -199,6 +199,8 @@ pub struct Lw {
     /// the windows come from the descriptor heap (`lower_window`; `mems` only counts them):
     /// Some(globallycoherent)
     pub heap_mem: Option<bool>,
+    /// Root `t252, space1` stride / view-kind table (`XCL_HEAP_STRIDES=1`).
+    pub table_strides: Option<RawSrv>,
     pub res: Option<RawUav>,
     /// the buffer format table (`FMT_INFO`), created on first use
     pub fmt_table: Option<Value>,
