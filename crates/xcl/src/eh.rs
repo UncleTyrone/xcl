@@ -111,6 +111,7 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
             rec.ExceptionCode as u32,
             modules::describe_address(addr)
         );
+        crate::boot_diag::write_crash_snapshots();
         crate::xlog_error!("{msg}");
         // XCL's queues and the last GPU-side events (`d3d12x::flight`): a title that ends itself
         // after its own GPU watchdog fired shows here which queue had stopped
@@ -353,8 +354,14 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
                 unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, old, &mut old) };
             }
         }
-        ConsoleOnly::Monitorx => {}
-        ConsoleOnly::Mwaitx => {
+        ConsoleOnly::Monitorx | ConsoleOnly::Mwaitx => {
+            if len == 3 && crate::loader::console_insn::patches_waits() {
+                if let Some(new) = crate::loader::console_insn::wait_patch(what) {
+                    if unsafe { crate::loader::console_insn::patch(rip, [code[0], code[1], code[2]], new) } {
+                        crate::xlog_info!("console_insn: patched {:?} at {}", what, modules::describe_address(rip));
+                    }
+                }
+            }
             std::hint::spin_loop();
         }
         ConsoleOnly::Clzero => {
@@ -369,6 +376,12 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
             }
         }
         ConsoleOnly::ClzeroLoop { end_reg } => {
+            if len == 12
+                && crate::loader::console_insn::patches_clzero()
+                && unsafe { crate::loader::console_insn::patch_clzero(rip, &code[..12]) }
+            {
+                crate::xlog_info!("console_insn: patched clzero loop at {}", modules::describe_address(rip));
+            }
             let regs: [&u64; 16] = [
                 &ctx.Rax, &ctx.Rcx, &ctx.Rdx, &ctx.Rbx, &ctx.Rsp, &ctx.Rbp, &ctx.Rsi, &ctx.Rdi,
                 &ctx.R8, &ctx.R9, &ctx.R10, &ctx.R11, &ctx.R12, &ctx.R13, &ctx.R14, &ctx.R15,

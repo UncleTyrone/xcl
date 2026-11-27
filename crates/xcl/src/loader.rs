@@ -11,9 +11,11 @@ use windows_sys::Win32::System::Memory::{
     PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
 };
 
+pub mod console_insn;
 pub mod frame_rate;
 pub mod patch_insn;
 pub mod resolution;
+pub mod title_preflight;
 pub mod write_sites;
 
 use crate::modules::{self, MappedModule};
@@ -242,6 +244,13 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         unsafe { write_sites::apply_asked(&name, base, size) };
         unsafe { frame_rate::apply_if_asked(base, size) };
         unsafe { resolution::apply_asked(base, size) };
+        let text: Vec<(u32, u32)> = pe
+            .sections
+            .iter()
+            .filter(|s| s.characteristics & pe::SCN_MEM_EXECUTE != 0)
+            .map(|s| (s.va, s.mapped_size()))
+            .collect();
+        unsafe { console_insn::warm_text(base, size, &text) };
     }
     Ok(module)
 }

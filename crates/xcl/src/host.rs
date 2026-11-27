@@ -198,6 +198,14 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::eh::start_probes();
     HOST_MODE.store(true, Ordering::Release);
 
+    let title_dir = boot.game_root.as_path();
+    if let Err(e) = crate::loader::title_preflight::check_or_bail(&boot.exe_path, title_dir) {
+        crate::xlog_error!("{e}");
+        eprintln!("xcl: {e}");
+        crate::report::write_final(Some(e.clone()));
+        return 0x7C1_0003;
+    }
+
     let main = match crate::loader::load_main(&boot.exe_path) {
         Ok(m) => m,
         Err(e) => {
@@ -208,6 +216,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
         }
     };
     unsafe { crate::hle::kernelx::adopt_title_hooks(&main) };
+    crate::boot_diag::start_after_main(main.base, main.size, &boot.cache_dir());
     crate::report::write_final(None);
     let code = crate::loader::run_main(&main);
     crate::xlog_info!("game entry point returned code {code}");
