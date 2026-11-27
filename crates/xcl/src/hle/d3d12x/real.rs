@@ -454,6 +454,23 @@ pub fn video_memory() -> Option<(u64, u64)> {
     }
 }
 
+/// The process's video memory on the device's adapter against its budget: (local, non-local).
+pub fn video_budget() -> Option<(windows::Win32::Graphics::Dxgi::DXGI_QUERY_VIDEO_MEMORY_INFO, windows::Win32::Graphics::Dxgi::DXGI_QUERY_VIDEO_MEMORY_INFO)> {
+    use windows::Win32::Graphics::Dxgi::*;
+    let raw = device_raw();
+    let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }?;
+    unsafe {
+        let luid = dev.GetAdapterLuid();
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+        let adapter: IDXGIAdapter3 = factory.EnumAdapterByLuid(luid).ok()?;
+        let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        let mut non_local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local).ok()?;
+        adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut non_local).ok()?;
+        Some((local, non_local))
+    }
+}
+
 /// The device runs only 32-lane waves: wave64 compute, mesh and geometry programs need the
 /// split form (`Options::split_wave64`). Unknown device: assume so.
 fn wave32_only(device: *mut c_void) -> bool {
@@ -540,6 +557,7 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
             }
             for (adapter, desc) in list {
                 if let Ok(dev) = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0) {
+                    super::gpu_awake::start(&dev, desc.VendorId);
                     device = Some(dev);
                     name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
                     break;
@@ -1114,6 +1132,7 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
     let hr = dev_create_descriptor_heap(this, pc.as_ptr() as usize, riid, ppv);
     if hr >= 0 {
         let raw = *ppv;
+        super::frame_replay::note_descriptor_heap(raw as usize, d[0], d[1], flags);
         let heap = ID3D12DescriptorHeap::from_raw_borrowed(&raw).unwrap();
         let dev = ID3D12Device::from_raw_borrowed(&this).unwrap();
         let cpu = heap.GetCPUDescriptorHandleForHeapStart().ptr as u64;
@@ -3160,7 +3179,9 @@ unsafe fn adjust_raytracing_options5(feature: i32, data: *mut u8, size: u32) {
     }
     let opts = &mut *(data as *mut D3D12_FEATURE_DATA_D3D12_OPTIONS5);
     let host = opts.RaytracingTier.0;
-    if let Some(tier) = crate::state::config().raytracing_tier_override() {
+    if !super::bvh_env::activate_rays() {
+        opts.RaytracingTier = D3D12_RAYTRACING_TIER(0);
+    } else if let Some(tier) = crate::state::config().raytracing_tier_override() {
         opts.RaytracingTier = D3D12_RAYTRACING_TIER(tier as i32);
     }
     static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -7533,6 +7554,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
 /// Title `ExecuteCommandLists` after refresh / translate join.
 unsafe fn execute_command_lists_body(this: *mut c_void, lists: &[*mut c_void]) {
     super::pcores::pin_current_thread_fast();
+    super::gpu_awake::note_activity();
     let _in_pc = super::pso_async::pc_call();
     if !super::late_wait::relax_relay_wait_before_submit() {
         super::relay::wait_before_submit();
