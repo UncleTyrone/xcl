@@ -7479,6 +7479,7 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
     if hr >= 0 {
         super::fence_x::note_queue_signal(fence as usize, value);
         super::list_x::note_title_queue_signal(this as usize, fence as usize, value);
+        super::frame_replay::on_queue_signal(this, fence, value);
     }
     hr
 }
@@ -7506,11 +7507,11 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
 
 /// Title `ExecuteCommandLists` after refresh / translate join.
 unsafe fn execute_command_lists_body(this: *mut c_void, lists: &[*mut c_void]) {
-    super::frame_replay::on_title_submit(this, lists);
     let _in_pc = super::pso_async::pc_call();
     super::submit::begin_refresh();
     super::title_textures::refresh(this);
     let mapped = super::thin::map_lists(lists);
+    super::frame_replay::on_submit(this, lists, &mapped);
     if super::submit::run_async_mapped(this, mapped.clone()) {
         super::submit::end_refresh();
         super::title_textures::submitted(&mapped);
@@ -7532,16 +7533,34 @@ pub(super) unsafe fn execute_mapped_lists(this: *mut c_void, mapped: &[*mut c_vo
     type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
     super::list_x::note_queue_for_lists(this as usize, mapped);
-    super::list_x::execute_with_waits_on(this, mapped, |chunk| {
-        let _ = super::alloc_pool::note_resubmits(this, chunk);
+    let submit_chunk = |chunk: &[*mut c_void]| {
+        let _fid = super::late_wait::begin_chunk(this as usize, 0);
+        unsafe { super::late_wait::settle_bop_before_submit(this) };
+        if super::alloc_pool::note_resubmits(this, chunk) > 0 {
+            super::submit::pause_refresh(|| super::alloc_pool::wait_for_previous_submits(chunk));
+        }
         super::submit::driver_execute(|| f(this, chunk.len() as u32, chunk.as_ptr()));
         super::list_x::copy_scratch_submitted(this, chunk);
         super::alloc_pool::executed(this, chunk);
+        let w64 = super::list_x::chunk_write64_signals(chunk);
         super::list_x::signal_write64_fences(this, chunk);
         super::list_x::readback_sparse_writes(this, chunk);
         super::list_x::cpu_writes_after(this, chunk);
-        super::late_wait::note_chunk_sent();
-    });
+        super::late_wait::note_chunk_payload(&w64, 0);
+        super::late_wait::end_chunk();
+        if super::port::submit_serial() {
+            unsafe { super::late_wait::serial_wait_after_submit(this) };
+        }
+    };
+    if super::port::submit_serial() {
+        super::list_x::execute_with_waits_on(this, mapped, |chunk| {
+            for &one in chunk {
+                submit_chunk(&[one]);
+            }
+        });
+    } else {
+        super::list_x::execute_with_waits_on(this, mapped, submit_chunk);
+    }
 }
 
 /// Wait (up to 10 s) until the GPU has finished the work submitted to the queues console code

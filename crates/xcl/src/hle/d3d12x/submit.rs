@@ -95,6 +95,42 @@ pub fn driver_execute<R>(f: impl FnOnce() -> R) -> R {
     pause_refresh(f)
 }
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static WOKE: std::sync::Condvar = std::sync::Condvar::new();
+static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+
+pub fn frames_cap() -> u32 {
+    super::port::frames_ahead()
+}
+
+pub fn present_behind() -> u64 {
+    IN_FLIGHT.load(Ordering::Acquire)
+}
+
+pub fn note_present_queued() {
+    IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+}
+
+pub fn note_submit_done() {
+    let before = IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+    let v = before.saturating_sub(1);
+    let cap = frames_cap() as u64;
+    if v < cap {
+        WOKE.notify_all();
+    }
+}
+
 pub fn present_may_queue() -> bool {
     super::late_wait::present_ahead() && super::port::async_submit()
+}
+
+pub fn wait_present_room() {
+    let cap = frames_cap() as u64;
+    if cap <= 1 {
+        return;
+    }
+    while present_behind() >= cap {
+        std::thread::sleep(std::time::Duration::from_micros(500));
+    }
 }

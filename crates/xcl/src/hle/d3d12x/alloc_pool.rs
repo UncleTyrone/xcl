@@ -178,6 +178,65 @@ pub unsafe fn note_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize
     found
 }
 
+/// How long a submit waits for the previous submits of its lists (`XCL_RESUBMIT_WAIT_MS`, 2 000;
+/// 0: not at all). Stage 2 late-wait may shorten this to zero when under the in-flight cap.
+fn resubmit_wait() -> std::time::Duration {
+    if let Some(d) = super::late_wait::resubmit_wait_override() {
+        return d;
+    }
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_millis(
+        *MS.get_or_init(|| {
+            std::env::var("XCL_RESUBMIT_WAIT_MS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(2000)
+        }),
+    )
+}
+
+/// `lists` are about to be submitted: wait (up to [`resubmit_wait`]) for prior GPU work on lists
+/// still in flight (`note_resubmits`). Returns (lists waited for, not done in time).
+pub unsafe fn wait_for_previous_submits(lists: &[*mut c_void]) -> (usize, usize) {
+    let limit = resubmit_wait();
+    if !enabled() || limit.is_zero() {
+        return (0, 0);
+    }
+    let pending: Vec<(ID3D12Fence, u64)> = {
+        let g = STATE.lock().unwrap();
+        let Some(s) = g.as_ref() else {
+            return (0, 0);
+        };
+        lists
+            .iter()
+            .filter_map(|&l| s.last_submit.get(&(l as usize)))
+            .filter(|l| unsafe { l.fence.GetCompletedValue() } < l.value)
+            .map(|l| (l.fence.clone(), l.value))
+            .collect()
+    };
+    if pending.is_empty() {
+        return (0, 0);
+    }
+    let start = std::time::Instant::now();
+    let mut late = 0usize;
+    for (fence, value) in &pending {
+        let mut polls = 0u32;
+        while unsafe { fence.GetCompletedValue() } < *value {
+            if start.elapsed() >= limit {
+                late += 1;
+                break;
+            }
+            if polls < 64 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+            polls += 1;
+        }
+    }
+    (pending.len(), late)
+}
+
 /// Whether the GPU has not finished the last submit of the PC list `list` (#1452: it must not be
 /// submitted again before that; `title_list` records the title's next recording elsewhere).
 pub fn in_flight(list: usize) -> bool {
@@ -209,6 +268,7 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
         *v += 1;
         (f.clone(), *v)
     };
+    super::late_wait::attach_queue_fence(queue, &fence, value);
     for &l in lists {
         if let Some(&b) = s.of_list.get(&(l as usize)) {
             s.backings.entry(b).or_default().marks.insert(key, (fence.clone(), value));

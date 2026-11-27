@@ -34,6 +34,7 @@ struct Job {
     fence: ID3D12Fence,
     value: u64,
     writes: Vec<Write>,
+    flight_id: u64,
 }
 
 // SAFETY: the fence is a free-threaded COM object; the writes are plain data
@@ -79,6 +80,7 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
                         }
                     }
                 }
+                super::late_wait::note_bop_settled(job.flight_id, job.writes.len() as u32);
             }
         });
         if let Err(e) = spawned {
@@ -181,7 +183,9 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
         if q.Signal(&entry.fence, entry.value).is_err() {
             return;
         }
-        Job { fence: entry.fence.clone(), value: entry.value, writes }
+        let flight_id = super::late_wait::current_chunk_id();
+        super::late_wait::note_chunk_payload(&[], writes.len() as u32);
+        Job { fence: entry.fence.clone(), value: entry.value, writes, flight_id }
     };
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| crate::xlog_info!("D3D12.X: bottom-of-pipe writes outside unified memory are done by the CPU after the GPU ({} in the first submission)", job.writes.len()));
