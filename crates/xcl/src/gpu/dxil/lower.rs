@@ -224,6 +224,8 @@ pub struct Lw {
     /// MIMG instructions (pc) whose S# is built from constants in the code: the HLSL
     /// kernel binds those as static samplers
     pub static_samplers: std::collections::BTreeMap<u64, [u32; 4]>,
+    /// MUBUF/FLAT sites whose SRSRC is constant on every path ([`recomp::constant_srsrc`], LanePhi-inspired joins).
+    pub static_srsrc: std::collections::BTreeMap<u64, [u32; 4]>,
     /// the program writes a non-default MODE[3:2] and has f16 rounding ops (no f64 ones):
     /// f16 results round in software under `VAR_FP16_RM` (the recompiler's `dynamic_f16_rm`)
     pub dyn_rm: bool,
@@ -696,6 +698,19 @@ impl Lw {
             0..=124 | 126 | 127 => self.rd(code as u32),
             _ => self.c(0),
         }
+    }
+
+    /// SRSRC dwords for a memory instruction: immediates when [`Self::static_srsrc`] has `pc`.
+    pub fn buffer_srsrc_words(&mut self, pc: u64, base: u64) -> [Value; 4] {
+        if let Some(w) = self.static_srsrc.get(&pc).copied() {
+            return [self.c(w[0]), self.c(w[1]), self.c(w[2]), self.c(w[3])];
+        }
+        [
+            self.sreg(base),
+            self.sreg(base + 1),
+            self.sreg(base + 2),
+            self.sreg(base + 3),
+        ]
     }
     pub fn vreg(&mut self, n: u64) -> Value {
         self.rd(VAR_VGPR + n as u32)

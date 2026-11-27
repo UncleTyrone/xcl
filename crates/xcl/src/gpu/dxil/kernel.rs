@@ -645,6 +645,7 @@ impl Lw {
             ntmp: 0,
             scratch: None,
             static_samplers: Default::default(),
+            static_srsrc: Default::default(),
             static_used: Vec::new(),
             sampler_base: o.sampler_base,
             dyn_rm: false,
@@ -717,11 +718,9 @@ impl Lw {
             }
         }
         // Join guard merge for static S#/SRSRC uses [`recomp::strict_joins`] (`XCL_STRICT_JOINS`, default on).
-        lw.static_samplers = crate::gpu::recomp::constant_samplers(
-            insts,
-            leaders,
-            matches!(entry, Entry::Vertex(_) | Entry::Pixel(_) | Entry::Compute(_) | Entry::Kernel | Entry::Mesh(_)),
-        );
+        let follow_sgpr = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_) | Entry::Compute(_) | Entry::Kernel | Entry::Mesh(_));
+        lw.static_samplers = crate::gpu::recomp::constant_samplers(insts, leaders, follow_sgpr);
+        lw.static_srsrc = crate::gpu::recomp::constant_srsrc(insts, leaders, follow_sgpr);
         let group_threads: Option<u32> = match entry {
             Entry::Vertex(_) | Entry::Pixel(_) => None,
             Entry::Kernel => None,

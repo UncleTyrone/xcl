@@ -1301,7 +1301,7 @@ impl Lw {
         let (vdata, vaddr, srsrc) = (f("VDATA"), f("VADDR"), Self::field(d, "SRSRC"));
         let soff = self.code32(f("SOFFSET"), None, false).ok_or_else(|| format!("{}: op", rdna2::format(d)))?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
-        let (d0, d1, d2, d3) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2), self.sreg(srsrc + 3));
+        let [d0, d1, d2, d3] = self.buffer_srsrc_words(d.pc, srsrc);
         let index = if idxen { self.vreg(vaddr) } else { self.c(0) };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { self.c(0) };
         let stride_raw = self.lshrc(d1, 16);
@@ -1973,7 +1973,7 @@ impl Lw {
         let (vdata, vaddr, srsrc) = (f("VDATA"), f("VADDR"), Self::field(d, "SRSRC"));
         let soff = self.code32(f("SOFFSET"), None, false).ok_or_else(|| format!("{}: op", rdna2::format(d)))?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
-        let (d0, d1, d2) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2));
+        let [d0, d1, d2, _] = self.buffer_srsrc_words(d.pc, srsrc);
         let index = if idxen { self.vreg(vaddr) } else { self.c(0) };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { self.c(0) };
         let x2 = op.ends_with("_x2");
