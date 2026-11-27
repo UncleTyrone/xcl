@@ -210,6 +210,9 @@ pub unsafe fn note_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize
 /// How long a submit waits for the previous submits of its lists (`XCL_RESUBMIT_WAIT_MS`, 2 000;
 /// 0: not at all, as before).
 fn resubmit_wait() -> std::time::Duration {
+    if let Some(d) = super::late_wait::resubmit_wait_override() {
+        return d;
+    }
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     std::time::Duration::from_millis(*MS.get_or_init(|| std::env::var("XCL_RESUBMIT_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2000)))
 }

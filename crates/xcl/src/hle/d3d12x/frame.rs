@@ -457,6 +457,8 @@ pub fn mark_flipped(token: u64) {
     if token == 0 {
         return;
     }
+    super::late_wait::note_present_boundary();
+    super::frame_replay::on_present(token);
     // the frame's own origin (a token XCL did not issue: the latest origin)
     let origin = ISSUED.lock().unwrap().iter().rev().find(|e| e.0 == token).map(|e| e.1).unwrap_or_else(|| LAST_ORIGIN.load(Ordering::Relaxed));
     let mut f = FLIPPED.lock().unwrap();

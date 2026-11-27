@@ -1849,6 +1849,15 @@ pub(super) unsafe fn place_at_title_address(this: *mut c_void, va: usize, desc: 
     if bytes == 0 {
         return None;
     }
+    if super::port_constants::on() && (va as u64) < (1u64 << 32) {
+        d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+        d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        d.Alignment = 0;
+        if let Some(hr) = super::port_constants::place_console_buffer(va, bytes, riid, ppv) {
+            UMA_BUFFERS.write().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (va, bytes, false));
+            return Some(hr);
+        }
+    }
     let (va, outside_base) = match u.window_of(va) {
         Some(_) => (va, None),
         None => {
@@ -2204,11 +2213,6 @@ pub fn pso_shaders(pso: usize) -> Option<(u64, u64)> {
     PSO_SHADERS.read().unwrap().as_ref()?.get(&pso).copied()
 }
 
-/// The console shaders of pipeline `pso` ((CS, 0) or (VS, PS)), for `XCL_GPU_PROFILE`.
-pub(super) fn note_pso_shaders(pso: usize, shaders: (u64, u64)) {
-    PSO_SHADERS.write().unwrap().get_or_insert_with(HashMap::new).insert(pso, shaders);
-}
-
 pub fn is_translated_graphics(pso: usize) -> bool {
     pso != 0 && TRANSLATED_GRAPHICS.read().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
 }
@@ -2552,15 +2556,38 @@ fn note_buffer_view() {
     }
 }
 
+/// D3D12 rejects a constant view larger than 64 KiB; a larger SizeInBytes has removed the
+/// device on NVIDIA. Cap before writing the V# / forwarding to the PC.
+const CBV_SIZE_CAP: u32 = 64 * 1024;
+
+fn cap_cbv_size(size: u32) -> u32 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if size <= CBV_SIZE_CAP {
+        return size;
+    }
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        crate::xlog_warn!("D3D12.X: CreateConstantBufferView SizeInBytes capped at 64 KiB (was {size})");
+    }
+    CBV_SIZE_CAP
+}
+
 /// #17 CreateConstantBufferView: a V# of float4 rows at the buffer's console address
 /// (`desc::cbv_words`; unified memory, anything else gets an empty V#). No PC CBV: translated
 /// shaders read buffers through `mem`.
 unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12_CONSTANT_BUFFER_VIEW_DESC, cpu: u64) {
     let Some(slot) = super::console_heap::slot(cpu).filter(|s| !s.sampler) else {
         let f: unsafe extern "system" fn(*mut c_void, *const D3D12_CONSTANT_BUFFER_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 17));
+        if let Some(d) = desc.as_ref() {
+            if d.SizeInBytes > CBV_SIZE_CAP {
+                let mut capped = *d;
+                capped.SizeInBytes = cap_cbv_size(d.SizeInBytes);
+                return f(this, &capped, cpu);
+            }
+        }
         return f(this, desc, cpu);
     };
     let (va, size) = desc.as_ref().map_or((0, 0), |d| (d.BufferLocation, d.SizeInBytes));
+    let size = cap_cbv_size(size);
     let resolved = resolve_uma_va(va, size as usize)
         .or_else(|| super::sparse::gpu_view::base_for(va as usize, size as usize).map(|b| b as u64));
     let (va, size) = match resolved {
@@ -2571,6 +2598,25 @@ unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12
         }
     };
     super::console_heap::write(&slot, &crate::gpu::desc::cbv_words(va, size));
+    if super::port_cbv::constants_raw() {
+        let in_place = super::port_constants::on() && super::port_constants::touches_range(va as usize, size as usize);
+        if in_place && super::port_cbv::in_place_on() && super::port_cbv::raw_ok(va) {
+            super::port_cbv::in_place(size);
+        } else if in_place {
+            super::port_cbv::copied(super::port_cbv::raw_ok(va));
+        } else {
+            super::port_cbv::copied(false);
+        }
+        if super::port_cbv::raw_ok(va) {
+            if let (Some(raw), Some(twin)) = (
+                super::port_cbv::raw_words(va, size),
+                super::console_heap::slot(cpu + u64::from(super::console_heap::SLOT)),
+            ) {
+                super::console_heap::write(&twin, &raw);
+                super::port_cbv::twinned();
+            }
+        }
+    }
 }
 
 /// #22 CreateSampler: the PC sampler at the slot's index, the S# in XCL ABI form (word 3
@@ -3864,6 +3910,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("OMSetRenderTargets", cl_om_set_render_targets as usize),
             ("ClearRenderTargetView", cl_clear_rtv as usize),
             ("ExecuteIndirect", cl_execute_indirect as usize),
+            ("BuildRaytracingAccelerationStructure", super::dxr_build::cl_build_raytracing_acceleration_structure as usize),
         ]),
         Kind::DmaList => v.extend_from_slice(&[
             ("Release", cl_release as usize),
@@ -4007,9 +4054,11 @@ unsafe fn adjust_raytracing_options5(feature: i32, data: *mut u8, size: u32) {
     }
     let opts = &mut *(data as *mut D3D12_FEATURE_DATA_D3D12_OPTIONS5);
     let host = opts.RaytracingTier.0;
+    super::dxr_build::note_host_raytracing_tier(host);
     if let Some(tier) = crate::state::config().raytracing_tier_override() {
         opts.RaytracingTier = D3D12_RAYTRACING_TIER(tier as i32);
     }
+    super::dxr_build::note_effective_raytracing_tier(opts.RaytracingTier.0);
     static LOGGED: AtomicU64 = AtomicU64::new(0);
     if LOGGED.fetch_add(1, Ordering::Relaxed) == 0 {
         crate::xlog_info!("D3D12.X: CheckFeatureSupport(D3D12_OPTIONS5) → RaytracingTier {} (host {})", opts.RaytracingTier.0, host);
@@ -6851,7 +6900,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
             super::ambient::note_graphics_pso(*ppv as usize, shader_bytes(&d.PS));
             TRANSLATED_GRAPHICS.write().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
             note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
-            if super::present::trace_frame() || super::gpu_profile::on() {
+            if super::present::trace_frame() {
                 PSO_SHADERS.write().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps_hash));
             }
             if n < 5 || n % 1000 == 0 {
@@ -6953,9 +7002,6 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     super::ambient::note_graphics_pso(*ppv as usize, shader_bytes(&d.PS));
     TRANSLATED_GRAPHICS.write().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
-    if super::gpu_profile::on() && !super::present::trace_frame() {
-        note_pso_shaders(*ppv as usize, (crate::gpu::shader::fnv64(vs), shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64)));
-    }
     if super::present::trace_frame() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
         PSO_SHADERS.write().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));
@@ -7031,47 +7077,39 @@ enum OwnedDesc {
 
 /// A pipeline's copy of one of its console shaders, shared with every pipeline that copied the
 /// same bytes (`intern_blob`).
-struct Blob {
-    bytes: std::sync::Arc<[u8]>,
-    hash: u64,
-}
+type Blob = std::sync::Arc<[u8]>;
 
-/// The copies kept by hash and length while a pipeline holds them. Collisions share a bucket.
-type BlobBuckets = HashMap<(u64, usize), Vec<std::sync::Weak<[u8]>>>;
-static BLOBS: Mutex<Option<(BlobBuckets, usize)>> = Mutex::new(None);
+/// The copies kept: (title address, length) → the copy, while a pipeline holds it.
+static BLOBS: Mutex<Option<(HashMap<(usize, usize), std::sync::Weak<[u8]>>, usize)>> = Mutex::new(None);
 
-/// Share each distinct shader across pipeline descriptors, even when the title copied it to
-/// multiple addresses. Keep the hash for the pipeline's shader keys.
+/// The copy of the shader `bytes` a pipeline keeps until it is built: the one an earlier
+/// pipeline made of the same bytes at the same address, or a new one. A retail title makes
+/// ~80 000 pipelines in its first minute from a few thousand shaders, and every one waiting to
+/// be built (`pso_async::lazy`) held copies of its own. (Equal bytes are checked: an address
+/// the title used again for another shader gets a copy of its own.)
 fn intern_blob(bytes: &[u8]) -> Blob {
-    intern_hashed_blob(bytes, crate::gpu::shader::fnv64(bytes))
-}
-
-fn intern_hashed_blob(bytes: &[u8], hash: u64) -> Blob {
-    let key = (hash, bytes.len());
+    let key = (bytes.as_ptr() as usize, bytes.len());
     let mut g = BLOBS.lock().unwrap();
     let (m, since_prune) = g.get_or_insert_with(|| (HashMap::new(), 0));
-    let bucket = m.entry(key).or_default();
-    if let Some(bytes) = bucket.iter().filter_map(std::sync::Weak::upgrade).find(|b| b.as_ref() == bytes) {
-        return Blob { bytes, hash };
+    if let Some(b) = m.get(&key).and_then(std::sync::Weak::upgrade) {
+        if *b == *bytes {
+            return b;
+        }
     }
-    let bytes: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes);
-    bucket.retain(|w| w.strong_count() > 0);
-    bucket.push(std::sync::Arc::downgrade(&bytes));
+    let b: Blob = std::sync::Arc::from(bytes);
+    m.insert(key, std::sync::Arc::downgrade(&b));
     *since_prune += 1;
     if *since_prune >= 4096 {
         *since_prune = 0;
-        m.retain(|_, bucket| {
-            bucket.retain(|w| w.strong_count() > 0);
-            !bucket.is_empty()
-        });
+        m.retain(|_, w| w.strong_count() > 0);
     }
-    Blob { bytes, hash }
+    b
 }
 
 /// The shader copies pipelines hold (`intern_blob`): how many and their bytes.
 pub fn pipeline_blob_bytes() -> (usize, usize) {
     BLOBS.lock().unwrap().as_ref().map_or((0, 0), |(m, _)| {
-        m.values().flatten().filter_map(std::sync::Weak::upgrade).fold((0, 0), |(n, b), x| (n + 1, b + x.len()))
+        m.values().filter_map(std::sync::Weak::upgrade).fold((0, 0), |(n, b), x| (n + 1, b + x.len()))
     })
 }
 
@@ -7081,49 +7119,19 @@ unsafe impl Send for OwnedDesc {}
 /// pipeline by in the next run.
 /// `shaders_key` of the one shader `blob`.
 pub(crate) fn shader_key(blob: &[u8]) -> u64 {
-    shader_set_key([crate::gpu::shader::fnv64(blob)])
+    ((0xcbf2_9ce4_8422_2325u64 ^ crate::gpu::shader::fnv64(blob)).wrapping_mul(0x0000_0100_0000_01b3)) | 1
 }
 
 pub(crate) fn shaders_key<B: AsRef<[u8]>>(blobs: &[B]) -> u64 {
-    shader_set_key(blobs.iter().map(|b| crate::gpu::shader::fnv64(b.as_ref())))
-}
-
-fn shader_set_key(hashes: impl IntoIterator<Item = u64>) -> u64 {
-    hashes.into_iter().fold(0xcbf2_9ce4_8422_2325u64, |key, hash| (key ^ hash).wrapping_mul(0x0000_0100_0000_01b3)) | 1
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in blobs {
+        h = (h ^ crate::gpu::shader::fnv64(b.as_ref())).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h | 1
 }
 
 #[cfg(test)]
 mod shaders_key_tests {
-    #[test]
-    fn lazy_pipelines_share_identical_shader_bytes_at_distinct_addresses() {
-        let a = vec![1, 2, 3, 4];
-        let mut b = a.clone();
-        assert_ne!(a.as_ptr(), b.as_ptr());
-
-        let first = super::intern_blob(&a);
-        let second = super::intern_blob(&b);
-        assert!(std::sync::Arc::ptr_eq(&first.bytes, &second.bytes));
-
-        b[0] = 5;
-        let changed = super::intern_blob(&b);
-        assert!(!std::sync::Arc::ptr_eq(&first.bytes, &changed.bytes));
-        assert_eq!(&*first.bytes, &a);
-        assert_eq!(&*changed.bytes, &b);
-        assert_eq!(super::shader_set_key([first.hash, changed.hash]), super::shaders_key(&[a, b.clone()]));
-        b[0] = 1;
-        assert!(std::sync::Arc::ptr_eq(&first.bytes, &super::intern_blob(&b).bytes));
-    }
-
-    #[test]
-    fn same_length_shader_hash_collisions_keep_distinct_bytes() {
-        let first = super::intern_hashed_blob(b"abc", u64::MAX);
-        let second = super::intern_hashed_blob(b"def", u64::MAX);
-        assert_eq!(&*first.bytes, b"abc");
-        assert_eq!(&*second.bytes, b"def");
-        assert!(std::sync::Arc::ptr_eq(&first.bytes, &super::intern_hashed_blob(b"abc", u64::MAX).bytes));
-        assert!(std::sync::Arc::ptr_eq(&second.bytes, &super::intern_hashed_blob(b"def", u64::MAX).bytes));
-    }
-
     #[test]
     fn the_key_of_one_shader_is_the_key_of_a_set_of_it() {
         let a = vec![1u8, 2, 3];
@@ -7151,10 +7159,10 @@ impl OwnedDesc {
             OwnedDesc::Graphics(_, b, ..) => b,
             OwnedDesc::Stream(_, _, b) => b,
         };
-        let key = shader_set_key(blobs.iter().map(|b| b.hash));
+        let key = shaders_key(blobs);
         // each shader by itself too: what a title's shader preparation translates before the
         // next run (`pso_async::earlier_used_shaders`)
-        let parts: Vec<u64> = blobs.iter().map(|b| shader_set_key([b.hash])).collect();
+        let parts: Vec<u64> = blobs.iter().map(|b| shader_key(b)).collect();
         super::pso_async::shaders_of(key, parts.clone());
         (key, parts)
     }
@@ -7188,7 +7196,7 @@ unsafe fn own_shader(b: &mut D3D12_SHADER_BYTECODE, blobs: &mut Vec<Blob>) {
     if let Some(bytes) = shader_bytes(b) {
         blobs.push(intern_blob(bytes));
         let v = blobs.last().unwrap();
-        *b = bytecode(&v.bytes);
+        *b = bytecode(v);
     } else {
         *b = D3D12_SHADER_BYTECODE::default();
     }
@@ -7257,7 +7265,7 @@ unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
                     buf[at..at + 16].fill(0);
                 } else if crate::gpu::shader::readable(p, n) {
                     blobs.push(intern_blob(std::slice::from_raw_parts(p as *const u8, n)));
-                    buf[at..at + 8].copy_from_slice(&(blobs.last().unwrap().bytes.as_ptr() as u64).to_le_bytes());
+                    buf[at..at + 8].copy_from_slice(&(blobs.last().unwrap().as_ptr() as u64).to_le_bytes());
                 } else {
                     return None;
                 }
@@ -7400,17 +7408,17 @@ unsafe fn go_background(
     // (a graphics pipeline used in this run is built before the next starts: `gfx_records`)
     let described = if super::pso_async::lazy() { owned.record(key, &parts) } else { None };
     // a big compute program that writes nothing but images: binds can go on without it
-    let big_image_only = compute && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::big_and_image_only(&b.bytes)));
+    let big_image_only = compute && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::big_and_image_only(b)));
     let image_only = big_image_only && super::pso_async::image_skip();
-    let bvh_trav = compute && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| is_rt_gated_cs(&b.bytes)));
+    let bvh_trav = compute && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| is_rt_gated_cs(b)));
     let heavy_compute = compute
         && super::pso_async::async_heavy_compute()
-        && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::compute_code_len(&b.bytes).is_some_and(|n| n >= crate::gpu::effects::HEAVY_CODE)));
-    let ambient_cs = compute && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| super::ambient::is_ambient_compute(&b.bytes)));
+        && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::compute_code_len(b).is_some_and(|n| n >= crate::gpu::effects::HEAVY_CODE)));
+    let ambient_cs = compute && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| super::ambient::is_ambient_compute(b)));
     if compute {
         if let OwnedDesc::Compute(_, b) = &owned {
             if let Some(cs) = b.first() {
-                note_compute_threads(*ppv as usize, &cs.bytes);
+                note_compute_threads(*ppv as usize, cs);
             }
         }
         if bvh_trav {
@@ -7543,7 +7551,6 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
     let hr = create_compute_pso(this, desc, riid, ppv);
     if hr >= 0 && !ppv.is_null() {
         super::culprit::note_compute(*ppv as usize, desc);
-        super::gpu_profile::note_title_compute(*ppv as usize, desc, wave32_only(this));
     }
     hr
 }
@@ -9236,6 +9243,7 @@ unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
 }
 
 unsafe extern "system" fn cl_draw_instanced(this: *mut c_void, vcount: u32, icount: u32, sv: u32, si: u32) {
+    super::list_x::note_shader_pass(this);
     super::list_x::prepare_draw(this);
     type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "DrawInstanced")));
@@ -9243,6 +9251,7 @@ unsafe extern "system" fn cl_draw_instanced(this: *mut c_void, vcount: u32, icou
 }
 
 unsafe extern "system" fn cl_draw_indexed_instanced(this: *mut c_void, icount: u32, inst: u32, si: u32, bv: i32, sinst: u32) {
+    super::list_x::note_shader_pass(this);
     super::list_x::prepare_draw(this);
     type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "DrawIndexedInstanced")));
@@ -9259,6 +9268,7 @@ unsafe extern "system" fn cl_execute_indirect(
     cnt_buf: *mut c_void,
     cnt_off: u64,
 ) {
+    super::list_x::note_shader_pass(this);
     super::list_x::prepare_draw(this);
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, u64, *mut c_void, u64);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteIndirect")));
@@ -9298,14 +9308,7 @@ unsafe fn release_taking_first<T>(this: *mut c_void, take: impl FnOnce() -> T, a
 }
 
 unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
-    release_taking_first(
-        this,
-        || {
-            super::list_x::on_queue_release(this as usize);
-            super::title_textures::on_queue_release(this as usize);
-        },
-        drop,
-    )
+    release_taking_first(this, || super::list_x::on_queue_release(this as usize), drop)
 }
 
 unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
@@ -9649,48 +9652,57 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         stop_if_device_removed();
         return;
     }
+    let slice = std::slice::from_raw_parts(lists, n as usize);
+  execute_command_lists_body(this, slice);
+}
+
+/// Title `ExecuteCommandLists` after journal / refresh / translate join.
+unsafe fn execute_command_lists_body(this: *mut c_void, lists: &[*mut c_void]) {
     super::pcores::pin_current_thread_fast();
     super::gpu_awake::note_activity();
-    // from here to the end: XCL's uploads and tile mappings before the lists, then the driver's
-    // own work in the submission. Where that takes long, it is not the title's time
-    // (`pso_async::title_held`)
-    let _in_pc = super::pso_async::pc_call();
+  let _in_pc = super::pso_async::pc_call();
     let _prof = super::prof::span(super::prof::Kind::Submit);
-    // whether these lists need a write-watch look of their own (`title_textures::decide_look`)
-    super::title_textures::decide_look(std::slice::from_raw_parts(lists, n as usize));
-    // textures in title memory the CPU wrote since: uploaded again first
-    super::title_textures::refresh(this);
-    // console-shaped lists run as the PC lists they were translated into (split title lists expand
-    // into all of their recorded PC segments in exact chronological order)
-    let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
+    if !super::late_wait::relax_relay_wait_before_submit() {
+        super::relay::wait_before_submit();
+    }
+    super::frame_replay::on_title_submit(this, lists);
+    super::submit::begin_refresh();
+    {
+        let _heaps = super::port_journal::begin_at_submit();
+        super::title_textures::decide_look(lists);
+        super::title_textures::refresh(this);
+    }
     let record_prof = super::prof::span(super::prof::Kind::SubmitRecord);
-    for &l in std::slice::from_raw_parts(lists, n as usize) {
-        if let Some(pc) = super::console_list::pc_list(l) {
-            mapped.push(pc);
-        } else {
-            super::list_x::record_deferred(l);
-            if !super::title_list::push_segments(l, &mut mapped) {
-                mapped.push(l);
-            }
-        }
-    }
+    let mapped = super::thin::map_lists(lists);
     drop(record_prof);
-    // Flush and wait for any tile mappings / recycled-tile zero-fills queued concurrently while
-    // `record_deferred` built/waited on PSOs so the title's submit never races `UpdateTileMappings`.
-    if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&this) {
-        super::sparse::wait_pending_mappings(q);
-        super::vram::wait_pending_mappings(q);
+    if super::submit::run_async_mapped(this, mapped.clone()) {
+        super::submit::end_refresh();
+        super::title_textures::submitted(&mapped);
+        super::title_textures::after_execute(this, &mapped);
+        super::present::note_execute(this, &mapped);
+        stop_if_device_removed();
+        return;
     }
-    super::list_x::note_queue_for_lists(this as usize, &mapped);
-    super::gpu_profile::note_queue(this);
-    super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
-        // a list still on the GPU from its previous submit: that one first (the PC does not take
-        // a list again before then)
+    execute_mapped_lists(this, &mapped);
+    super::submit::end_refresh();
+    super::title_textures::submitted(&mapped);
+    super::title_textures::after_execute(this, &mapped);
+    super::present::note_execute(this, &mapped);
+    stop_if_device_removed();
+}
+
+/// Run already-translated PC command lists (join complete; safe for async worker).
+pub(super) unsafe fn execute_mapped_lists(this: *mut c_void, mapped: &[*mut c_void]) {
+    type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
+    super::list_x::note_queue_for_lists(this as usize, mapped);
+    let _card = super::card_steps::try_prep_before_lists(this, mapped);
+    super::list_x::execute_with_waits_on(this, mapped, |chunk| {
         if super::alloc_pool::note_resubmits(this, chunk) > 0 {
-            super::alloc_pool::wait_for_previous_submits(chunk);
+            super::submit::pause_refresh(|| super::alloc_pool::wait_for_previous_submits(chunk));
         }
         let driver_prof = super::prof::span(super::prof::Kind::SubmitDriver);
-        f(this, chunk.len() as u32, chunk.as_ptr());
+        super::submit::driver_execute(|| f(this, chunk.len() as u32, chunk.as_ptr()));
         drop(driver_prof);
         let _after = super::prof::span(super::prof::Kind::SubmitAfter);
         super::list_x::copy_scratch_submitted(this, chunk);
@@ -9698,11 +9710,8 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         super::list_x::signal_write64_fences(this, chunk);
         super::list_x::readback_sparse_writes(this, chunk);
         super::list_x::cpu_writes_after(this, chunk);
+        super::late_wait::note_chunk_sent();
     });
-    // the next uploads into textures kept in step start from the states these lists leave
-    super::title_textures::submitted(&mapped);
-    super::present::note_execute(this, &mapped);
-    stop_if_device_removed();
 }
 
 /// Wait (up to 10 s) until the GPU has finished the work submitted to the queues console code
@@ -10921,9 +10930,9 @@ mod mesh_stream_tests {
             let owned = own_stream(d_valid.as_ptr() as *const c_void).expect("valid stream");
             let OwnedDesc::Stream(_, buf, blobs) = owned else { panic!("expected Stream") };
             assert_eq!(blobs.len(), 1);
-            assert_eq!(&*blobs[0].bytes, &shader[..]);
+            assert_eq!(&*blobs[0], &shader[..]);
             let rebased = u64::from_le_bytes(buf[8..16].try_into().unwrap()) as usize;
-            assert_eq!(rebased, blobs[0].bytes.as_ptr() as usize);
+            assert_eq!(rebased, blobs[0].as_ptr() as usize);
             assert_ne!(rebased, shader.as_ptr() as usize);
             assert_eq!(&buf[32..48], &[0u8; 16], "zero-len shader entry cleared");
             assert_eq!(&buf[56..72], &[0u8; 16], "cached PSO cleared");

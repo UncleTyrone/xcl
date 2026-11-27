@@ -127,20 +127,16 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         let now = std::time::Instant::now();
         if let Some(t) = LAST.lock().unwrap().replace(now) {
             crate::xlog_info!("D3D12.X: {frames} frames presented, {:.1} fps over the last 300", 300.0 / (now - t).as_secs_f64());
+            super::late_wait::log_frame_stats(300.0);
+            super::relay::note_frame(300.0);
         }
     }
     super::real::stop_if_device_removed();
+    super::port_constants::tick_log();
+    super::port_cbv::tick_log();
+    super::dxr_build::tick_log();
     super::alloc_pool::release_finished();
-    let low_commit = super::vram::commit_low();
-    crate::gpu::texture::trim_idle_staging(frames, low_commit);
-    if let Some(queue) = ID3D12CommandQueue::from_raw_borrowed(&queue).filter(|_| low_commit) {
-        let mut dev: Option<ID3D12Device> = None;
-        if queue.GetDevice(&mut dev).is_ok() {
-            if let Some(dev) = dev {
-                super::bind::trim_free_scratch(dev.as_raw() as usize);
-            }
-        }
-    }
+    crate::gpu::texture::trim_idle_staging(frames, super::vram::commit_low());
     if !PRESENTX.swap(true, Ordering::Relaxed) {
         crate::xlog_info!("D3D12.X: PresentX – the title presents its own frames ({plane_count} plane(s))");
     }
@@ -339,6 +335,7 @@ pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
             q.push(queue as usize);
         }
     }
+    super::console_heap::recycle_after_submit();
     super::late_release::drain_known(false);
     if !enabled() || IN_PRESENT.with(|c| c.get()) || PRESENTX.load(Ordering::Relaxed) {
         return;
