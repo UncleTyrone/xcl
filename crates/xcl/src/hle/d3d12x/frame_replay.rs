@@ -9,7 +9,8 @@
 //!
 //! **Gaps vs CGBJ `victory-gpu/replay/*`:** no full heap/PSO/resource snap, no cross-process
 //! list rehydration, no `PresentX` re-issue (token logged only), no CLI player. Binary
-//! `XCLFRAME` blobs (`XCL_RECORD_WIRE=1`) cover submit/signal/present (VICFRAME role, not layout).
+//! `XCLFRAME` v2 blobs (`XCL_RECORD_WIRE=1`) add heap metadata, bind ids, and title GPU VAs
+//! (VICFRAME role, not layout).
 //!
 //! ### Environment (default off)
 //!
@@ -20,8 +21,9 @@
 //! | `XCL_RECORD_FRAMES` | Stop after N frames (unless `ALWAYS`) | `1` frame |
 //! | `XCL_RECORD_ALWAYS` | Keep recording every frame | off |
 //! | `XCL_RECORD_REFS` | Sidecar `refs/submit_*.ref.json` (pointer sets) | off |
-//! | `XCL_RECORD_WIRE` | Also write `frames/frame_NNNN.bin` (`XCLFRAME`) | off |
+//! | `XCL_RECORD_WIRE` | Also write `frames/frame_NNNN.bin` (`XCLFRAME` v2) | off |
 //! | `XCL_REPLAY` | Load `index.jsonl` from directory; hook presents | unset = off |
+//! | `XCL_REPLAY_WIRE` | Prefer `frames/frame_NNNN.bin` over per-frame JSONL | off |
 //! | `XCL_REPLAY_AT` | Skip first N presents before replay | `0` |
 //! | `XCL_REPLAY_EXECUTE` | Re-issue `ExecuteCommandLists` on live queue | on when `XCL_REPLAY` set |
 //! | `XCL_REPLAY_EXECUTE=0` | Log-only replay | — |
@@ -36,7 +38,7 @@ use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use windows::core::Interface;
-use windows::Win32::Graphics::Direct3D12::{ID3D12CommandQueue, ID3D12Fence};
+use windows::Win32::Graphics::Direct3D12::{ID3D12CommandQueue, ID3D12DescriptorHeap, ID3D12Fence};
 
 #[derive(Clone)]
 struct Settings {
@@ -49,6 +51,8 @@ struct Settings {
     write_refs: bool,
     /// Binary `XCLFRAME` beside JSONL (`XCL_RECORD_WIRE=1`).
     write_wire: bool,
+    /// Load per-frame `XCLFRAME` blobs when replaying (`XCL_REPLAY_WIRE=1`).
+    replay_wire: bool,
     replay_execute: bool,
     replay_fences: bool,
     replay_skip_presents: u64,
@@ -92,6 +96,7 @@ fn settings() -> &'static Settings {
             always,
             write_refs: env_on("XCL_RECORD_REFS"),
             write_wire: env_on("XCL_RECORD_WIRE"),
+            replay_wire: env_on("XCL_REPLAY_WIRE"),
             replay_execute,
             replay_fences: env_on("XCL_REPLAY_FENCES"),
             replay_skip_presents: parse_u64("XCL_REPLAY_AT").unwrap_or(0),
@@ -107,10 +112,114 @@ static FRAMES_RECORDED: AtomicU64 = AtomicU64::new(0);
 static WRITER: Mutex<Option<std::fs::File>> = Mutex::new(None);
 
 static FRAME_BUF: Mutex<Vec<RecordedEvent>> = Mutex::new(Vec::new());
+static FRAME_BOUND_HEAP_PTRS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static KNOWN_HEAPS: Mutex<Vec<HeapEntry>> = Mutex::new(Vec::new());
 static REPLAY_FRAMES: OnceLock<Mutex<ReplayCatalog>> = OnceLock::new();
 static REPLAY_CURSOR: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct HeapEntry {
+    ptr: usize,
+    ty: u32,
+    count: u32,
+    flags: u32,
+}
+
+impl HeapEntry {
+    fn from_wire(h: &super::frame_wire::HeapEntry) -> Self {
+        Self {
+            ptr: h.ptr,
+            ty: h.ty,
+            count: h.count,
+            flags: h.flags,
+        }
+    }
+
+    fn to_wire(&self) -> super::frame_wire::HeapEntry {
+        super::frame_wire::HeapEntry {
+            ptr: self.ptr,
+            ty: self.ty,
+            count: self.count,
+            flags: self.flags,
+        }
+    }
+}
+
+fn merge_heap_ptr(dst: &mut Vec<usize>, xs: &[usize]) {
+    for &p in xs {
+        if p != 0 && !dst.contains(&p) {
+            dst.push(p);
+        }
+    }
+}
+
+/// Called from `CreateDescriptorHeap` while `XCL_RECORD` is active.
+pub fn note_descriptor_heap(ptr: usize, ty: u32, count: u32, flags: u32) {
+    if settings().record_dir.is_none() || ptr == 0 {
+        return;
+    }
+    let mut g = KNOWN_HEAPS.lock().unwrap();
+    if let Some(e) = g.iter_mut().find(|e| e.ptr == ptr) {
+        e.ty = ty;
+        e.count = count;
+        e.flags = flags;
+    } else {
+        g.push(HeapEntry { ptr, ty, count, flags });
+    }
+}
+
+fn heap_meta_from_ptr(ptr: usize) -> Option<HeapEntry> {
+    if ptr == 0 {
+        return None;
+    }
+    let raw = ptr as *mut std::ffi::c_void;
+    unsafe {
+        let h = ID3D12DescriptorHeap::from_raw_borrowed(&raw)?;
+        let d = h.GetDesc();
+        Some(HeapEntry {
+            ptr,
+            ty: d.Type.0 as u32,
+            count: d.NumDescriptors,
+            flags: d.Flags.0 as u32,
+        })
+    }
+}
+
+fn heap_snapshot_for_frame(frame_bound: &[usize]) -> Vec<HeapEntry> {
+    let mut out = KNOWN_HEAPS.lock().unwrap().clone();
+    for &p in frame_bound {
+        if out.iter().any(|e| e.ptr == p) {
+            continue;
+        }
+        if let Some(m) = heap_meta_from_ptr(p) {
+            out.push(m);
+        }
+    }
+    out.sort_by_key(|e| e.ptr);
+    out
+}
+
+fn submit_bind_meta(mapped: &[*mut std::ffi::c_void]) -> (Vec<usize>, Vec<usize>, Vec<u64>, Vec<usize>) {
+    let mut psos = Vec::with_capacity(mapped.len());
+    let mut rs_gfx = Vec::with_capacity(mapped.len());
+    let mut gpu_vas = Vec::new();
+    let mut bound_heaps = Vec::new();
+    for &pc in mapped {
+        let list = pc;
+        let (pso, rs) = super::bind::frame_bind_ids(list);
+        psos.push(pso);
+        rs_gfx.push(rs);
+        gpu_vas.extend(super::list_x::frame_touch_vas(list));
+        bound_heaps.extend(super::list_x::frame_bound_heaps(list));
+    }
+    gpu_vas.sort_unstable();
+    gpu_vas.dedup();
+    bound_heaps.sort_unstable();
+    bound_heaps.dedup();
+    (psos, rs_gfx, gpu_vas, bound_heaps)
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 enum RecordedEvent {
     #[serde(rename = "session")]
@@ -124,7 +233,17 @@ enum RecordedEvent {
         backing: Vec<usize>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         blob_refs: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        psos: Vec<usize>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rs_gfx: Vec<usize>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        gpu_vas: Vec<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        bound_heaps: Vec<usize>,
     },
+    #[serde(rename = "heapsnap")]
+    HeapSnap { heaps: Vec<HeapEntry> },
     Signal {
         queue: usize,
         fence: usize,
@@ -146,13 +265,14 @@ fn write_session_meta(dir: &Path) {
         return;
     }
     let body = serde_json::json!({
-        "format": 1,
+        "format": 2,
         "kind": "xcl_frame_replay",
         "distinct_from": "XCL_CAPTURE_FRAME",
-        "events": ["submit", "signal", "present"],
+        "events": ["submit", "heapsnap", "signal", "present"],
+        "wire": super::frame_wire::VERSION,
     });
     let _ = std::fs::write(dir.join("session.json"), body.to_string());
-    append_line(&serde_json::json!({"kind":"session","format":1}).to_string());
+    append_line(&serde_json::json!({"kind":"session","format":2}).to_string());
 }
 
 fn ensure_log() {
@@ -180,11 +300,12 @@ fn ensure_log() {
                     let n = cat.frames.len();
                     let _ = REPLAY_FRAMES.get_or_init(|| Mutex::new(cat));
                     crate::xlog_info!(
-                        "D3D12.X: XCL_REPLAY={} ({} frame(s), execute={}, fences={})",
+                        "D3D12.X: XCL_REPLAY={} ({} frame(s), execute={}, fences={}, wire={})",
                         dir.display(),
                         n,
                         settings().replay_execute,
-                        settings().replay_fences
+                        settings().replay_fences,
+                        settings().replay_wire
                     );
                 }
                 Err(e) => {
@@ -243,6 +364,10 @@ fn events_to_wire(events: &[RecordedEvent]) -> Vec<super::frame_wire::WireEvent>
                 addrs,
                 pc_addrs,
                 backing,
+                psos,
+                rs_gfx,
+                gpu_vas,
+                bound_heaps,
                 ..
             } => Some(WireEvent::Submit {
                 n: *n,
@@ -251,6 +376,13 @@ fn events_to_wire(events: &[RecordedEvent]) -> Vec<super::frame_wire::WireEvent>
                 addrs: addrs.clone(),
                 pc_addrs: pc_addrs.clone(),
                 backing: backing.clone(),
+                psos: psos.clone(),
+                rs_gfx: rs_gfx.clone(),
+                gpu_vas: gpu_vas.clone(),
+                bound_heaps: bound_heaps.clone(),
+            }),
+            RecordedEvent::HeapSnap { heaps } => Some(WireEvent::HeapSnap {
+                heaps: heaps.iter().map(HeapEntry::to_wire).collect(),
             }),
             RecordedEvent::Signal { queue, fence, value } => Some(WireEvent::Signal {
                 queue: *queue,
@@ -258,6 +390,54 @@ fn events_to_wire(events: &[RecordedEvent]) -> Vec<super::frame_wire::WireEvent>
                 value: *value,
             }),
             RecordedEvent::Present { frame, token, submits } => Some(WireEvent::Present {
+                frame: *frame,
+                token: *token,
+                submits: *submits,
+            }),
+        })
+        .collect()
+}
+
+fn recorded_from_wire(events: &[super::frame_wire::WireEvent]) -> Vec<RecordedEvent> {
+    events
+        .iter()
+        .filter_map(|ev| match ev {
+            super::frame_wire::WireEvent::Session { format } => {
+                Some(RecordedEvent::Session { format: *format })
+            }
+            super::frame_wire::WireEvent::Submit {
+                n,
+                queue,
+                lists,
+                addrs,
+                pc_addrs,
+                backing,
+                psos,
+                rs_gfx,
+                gpu_vas,
+                bound_heaps,
+            } => Some(RecordedEvent::Submit {
+                n: *n,
+                queue: *queue,
+                lists: *lists,
+                addrs: addrs.clone(),
+                pc_addrs: pc_addrs.clone(),
+                backing: backing.clone(),
+                blob_refs: vec![],
+                psos: psos.clone(),
+                rs_gfx: rs_gfx.clone(),
+                gpu_vas: gpu_vas.clone(),
+                bound_heaps: bound_heaps.clone(),
+            }),
+            super::frame_wire::WireEvent::HeapSnap { heaps } => Some(RecordedEvent::HeapSnap {
+                heaps: heaps.iter().map(HeapEntry::from_wire).collect(),
+            }),
+            super::frame_wire::WireEvent::Signal { queue, fence, value } => Some(RecordedEvent::Signal {
+                queue: *queue,
+                fence: *fence,
+                value: *value,
+            }),
+            super::frame_wire::WireEvent::Present { frame, token, submits } => Some(RecordedEvent::Present {
                 frame: *frame,
                 token: *token,
                 submits: *submits,
@@ -290,12 +470,37 @@ fn flush_frame_file(frame: u64) {
     }
 }
 
+fn load_wire_frame(dir: &Path, frame: u64) -> Option<Vec<RecordedEvent>> {
+    let path = dir.join("frames").join(format!("frame_{frame:04}.bin"));
+    super::frame_wire::read_frame(&path)
+        .ok()
+        .map(|wire| recorded_from_wire(&wire))
+}
+
+fn load_jsonl_frame(dir: &Path, frame: u64) -> Option<Vec<RecordedEvent>> {
+    let path = dir.join("frames").join(format!("frame_{frame:04}.jsonl"));
+    let file = std::fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    let mut out = Vec::new();
+    for line in reader.lines() {
+        let line = line.ok()?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        out.push(serde_json::from_str(line).ok()?);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 fn load_replay_catalog(dir: &Path) -> Result<ReplayCatalog, String> {
     let index = dir.join("index.jsonl");
     let file = std::fs::File::open(&index).map_err(|e| format!("open {}: {e}", index.display()))?;
     let reader = BufReader::new(file);
     let mut frames: Vec<Vec<RecordedEvent>> = Vec::new();
     let mut current = Vec::new();
+    let use_wire = settings().replay_wire;
+    let mut frame_no = 0u64;
     for line in reader.lines() {
         let line = line.map_err(|e| e.to_string())?;
         let line = line.trim();
@@ -305,19 +510,41 @@ fn load_replay_catalog(dir: &Path) -> Result<ReplayCatalog, String> {
         let ev: RecordedEvent = serde_json::from_str(line).map_err(|e| format!("json: {e}"))?;
         match &ev {
             RecordedEvent::Session { .. } => {}
-            RecordedEvent::Present { .. } => {
-                current.push(ev);
-                frames.push(std::mem::take(&mut current));
+            RecordedEvent::Present { frame, .. } => {
+                frame_no += 1;
+                if use_wire {
+                    if let Some(events) = load_wire_frame(dir, *frame).filter(|e| !e.is_empty()) {
+                        frames.push(events);
+                    } else if let Some(events) = load_jsonl_frame(dir, *frame).filter(|e| !e.is_empty()) {
+                        frames.push(events);
+                    } else {
+                        current.push(ev);
+                        frames.push(std::mem::take(&mut current));
+                    }
+                } else {
+                    current.push(ev);
+                    frames.push(std::mem::take(&mut current));
+                }
+                current.clear();
             }
-            _ => current.push(ev),
+            _ => {
+                if !use_wire {
+                    current.push(ev);
+                }
+            }
         }
     }
-    if !current.is_empty() {
+    if !use_wire && !current.is_empty() {
         frames.push(current);
     }
     if frames.is_empty() {
-        return Err("index.jsonl has no present boundaries".into());
+        return Err(if use_wire {
+            "no replay frames (index.jsonl presents and no frames/frame_*.bin)".into()
+        } else {
+            "index.jsonl has no present boundaries".into()
+        });
     }
+    let _ = frame_no;
     Ok(ReplayCatalog { frames })
 }
 
@@ -387,6 +614,8 @@ pub fn on_submit(queue: *mut c_void, title_lists: &[*mut c_void], mapped: &[*mut
             .iter()
             .map(|&l| super::title_list::backing(l).map(|b| b as usize).unwrap_or(0))
             .collect();
+        let (psos, rs_gfx, gpu_vas, bound_heaps) = submit_bind_meta(mapped);
+        merge_heap_ptr(&mut FRAME_BOUND_HEAP_PTRS.lock().unwrap(), &bound_heaps);
         let mut blob_refs = Vec::new();
         if settings().write_refs {
             if let Some(dir) = &settings().record_dir {
@@ -404,6 +633,10 @@ pub fn on_submit(queue: *mut c_void, title_lists: &[*mut c_void], mapped: &[*mut
             pc_addrs,
             backing,
             blob_refs,
+            psos,
+            rs_gfx,
+            gpu_vas,
+            bound_heaps,
         };
         append_event(&ev);
     }
@@ -422,6 +655,13 @@ pub fn on_present(token: u64) {
     if record && p > settings().skip_presents && recording_active() {
         {
             let frame = FRAMES_RECORDED.fetch_add(1, Ordering::Relaxed) + 1;
+            {
+                let bound = std::mem::take(&mut *FRAME_BOUND_HEAP_PTRS.lock().unwrap());
+                let heaps = heap_snapshot_for_frame(&bound);
+                if !heaps.is_empty() {
+                    append_event(&RecordedEvent::HeapSnap { heaps });
+                }
+            }
             let ev = RecordedEvent::Present {
                 frame,
                 token,
@@ -533,6 +773,12 @@ fn try_replay_frame(frame_idx: usize, token: u64) {
                     "D3D12.X: XCL_REPLAY: replayed frame idx {frame_idx} (recorded frame {frame}, token {t}); PresentX not re-issued"
                 );
             }
+            RecordedEvent::HeapSnap { heaps } => {
+                crate::xlog_info!(
+                    "D3D12.X: XCL_REPLAY: frame {frame_idx}: heap snap {} heap(s) (metadata only)",
+                    heaps.len()
+                );
+            }
             RecordedEvent::Session { .. } => {}
         }
     }
@@ -565,9 +811,43 @@ mod tests {
             pc_addrs: vec![3, 4, 5],
             backing: vec![6, 0],
             blob_refs: vec![],
+            psos: vec![0xA],
+            rs_gfx: vec![0xB],
+            gpu_vas: vec![0x1000],
+            bound_heaps: vec![0xC],
         };
         let s = serde_json::to_string(&ev).unwrap();
         let back: RecordedEvent = serde_json::from_str(&s).unwrap();
         assert!(matches!(back, RecordedEvent::Submit { n: 1, .. }));
+    }
+
+    #[test]
+    fn wire_recorded_roundtrip_v2_fields() {
+        let recorded = vec![
+            RecordedEvent::Submit {
+                n: 2,
+                queue: 0x40,
+                lists: 1,
+                addrs: vec![1],
+                pc_addrs: vec![2],
+                backing: vec![2],
+                blob_refs: vec![],
+                psos: vec![3],
+                rs_gfx: vec![4],
+                gpu_vas: vec![0x5000],
+                bound_heaps: vec![0x80],
+            },
+            RecordedEvent::HeapSnap {
+                heaps: vec![HeapEntry {
+                    ptr: 0x80,
+                    ty: 0,
+                    count: 16,
+                    flags: 1,
+                }],
+            },
+        ];
+        let wire = events_to_wire(&recorded);
+        let back = recorded_from_wire(&wire);
+        assert_eq!(back, recorded);
     }
 }
