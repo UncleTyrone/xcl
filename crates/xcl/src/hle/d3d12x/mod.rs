@@ -57,6 +57,7 @@ pub mod sparse;
 mod standin;
 pub(crate) mod thin;
 mod texture_policy;
+mod texture_upload_ahead;
 pub mod title_list;
 pub(crate) mod port_journal;
 pub mod title_textures;

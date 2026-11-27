@@ -632,6 +632,9 @@ pub(super) unsafe fn register(
         super::vram::unmap_superseded(r);
     }
     TEXTURES_GEN.fetch_add(1, Ordering::Release);
+    if super::texture_upload_ahead::on() {
+        super::texture_upload_ahead::offer(res as usize);
+    }
     Ok(())
 }
 
@@ -1016,6 +1019,7 @@ unsafe fn wait_queue_uploads(queue: &ID3D12CommandQueue) {
 unsafe fn refresh_once(queue: *mut c_void) {
     reclaim_completed_on_queue(queue as usize);
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
+        super::texture_upload_ahead::wait_for(q);
         if super::texture_policy::show_after() {
             wait_queue_uploads(q);
         }
@@ -1712,6 +1716,76 @@ unsafe fn submit_on_title_queue(dev: &ID3D12Device, queue: &ID3D12CommandQueue, 
     q.in_flight.push_back((v, f));
     reclaim(dev, q, in_flight_cap_bytes(super::vram::commit_low()), 10_000);
     Ok(failed)
+}
+
+unsafe fn ahead_sent(_dev: &ID3D12Device, queue: &ID3D12CommandQueue) -> Option<super::texture_upload_ahead::Sent> {
+    let key = queue.as_raw() as usize;
+    let g = ON_QUEUE.lock().unwrap();
+    let q = g.get(&key)?;
+    Some(super::texture_upload_ahead::Sent {
+        fence: q.fence.clone(),
+        value: q.value,
+    })
+}
+
+/// Upload one still-pending texture on XCL's upload queue (`XCL_UPLOAD_AHEAD`).
+pub(super) unsafe fn upload_if_pending(res: usize) -> Result<Option<super::texture_upload_ahead::Sent>, String> {
+    let (r, upload, device) = {
+        let t = TEXTURES.lock().unwrap();
+        let Some(e) = t.by_res.get(&res) else {
+            return Ok(None);
+        };
+        if !e.pending || e.gpu_written {
+            return Ok(None);
+        }
+        let p = res as *mut c_void;
+        let r = ID3D12Resource::from_raw_borrowed(&p).ok_or_else(|| "no resource".to_string())?;
+        (
+            r.clone(),
+            Upload {
+                device: e.device,
+                src: e.src,
+                tex: Arc::clone(&e.tex),
+                states: e.states.clone(),
+                dirty_pages: None,
+                page_size: 0x1000,
+            },
+            e.device,
+        )
+    };
+    let size = upload.tex.size() as usize;
+    let picked = [(
+        r.clone(),
+        upload.src,
+        upload.tex,
+        upload.states,
+        upload.page_size,
+        false,
+    )];
+    let prepared = hash_and_detile_all(&picked, size, false);
+    let Some(subs) = prepared.into_iter().next().flatten() else {
+        return Ok(None);
+    };
+    if super::vram::level_pages() && !map_levels_with_texels(&r, &subs) {
+        return Ok(None);
+    }
+    let d = device as *mut c_void;
+    let dev = ID3D12Device::from_raw_borrowed(&d).ok_or_else(|| "no device".to_string())?;
+    let queue = upload_queue(dev, device)?;
+    let states = picked[0].3.clone();
+    let batch = [(r, subs, states)];
+    let failed = submit_on_title_queue(dev, &queue, &batch)?;
+    if let Some((_, e)) = failed.into_iter().next() {
+        return Err(e);
+    }
+    let mut t = TEXTURES.lock().unwrap();
+    if let Some(e) = t.by_res.get_mut(&res).filter(|e| e.pending) {
+        e.pending = false;
+        adjust_pending(-1);
+    }
+    drop(t);
+    UPLOADS.fetch_add(1, Ordering::Relaxed);
+    Ok(ahead_sent(dev, &queue))
 }
 
 /// The uploads `todo`, in batches of up to `BATCH_BYTES` (or `BATCH_BYTES_LOW_COMMIT` when Windows
