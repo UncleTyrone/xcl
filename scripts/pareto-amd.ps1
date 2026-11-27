@@ -1,4 +1,5 @@
-﻿# amd-dev pareto bundle (maps CGBJ Play-VIctory.cmd / scripts/play.ps1 to XCL_*).
+﻿# amd-dev pareto bundle (maps CGBJ scripts/play.ps1 + extended ports; NOT Play-VIctory.cmd NVIDIA defaults).
+# Build from: src/amd-dev  (cargo build --release -p xcl)
 # Usage:
 #   . .\scripts\pareto-amd.ps1
 #   # then launch your title with xcl.dll injected / xcl run ...
