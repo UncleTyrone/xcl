@@ -5,12 +5,14 @@
 //! are current; a turn-robin sweep compares held bytes to title for diagnostics.
 //!
 //! GPL-2 reimplementation from understanding of CGBJ `victory-gpu` shadow @ `80e8619`
-//! (study only — not a paste). Full card/D3D12/relay/window surface remains Wave C.
+//! (study only — not a paste). Card staging metadata, `copy_back` / `merge_under_writes`, and
+//! loose / by-address copies extend the core held/copied journal (full D3D12 card twins optional).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
+use super::card_shadow;
 use super::land;
 
 /// 4 KiB kernel page (copied-generation grain).
@@ -43,6 +45,8 @@ pub(crate) struct Shadow {
     pub(crate) id: u64,
     /// Bytes shaders / land last knew on the card side (same length as `len`).
     held: Mutex<Vec<u8>>,
+    /// Snapshot at last `declare_gpu_writes` for `copy_back` / relay merge.
+    before: Mutex<Option<Vec<u8>>>,
     /// Per 4 KiB page from `start`: asking generation when last taken whole (0 = never).
     copied: Mutex<Vec<u64>>,
     /// Ranges shaders may still be writing: `(title_addr, end)`.
@@ -50,7 +54,14 @@ pub(crate) struct Shadow {
     /// Bitset of 4 KiB pages landed since last refresh look.
     landings: Mutex<Vec<u64>>,
     landing: AtomicBool,
+  /// Host card-side dirty journal for large buffers (see `card_shadow`).
+    card: Option<card_shadow::CardSide>,
+    window: bool,
+    by_address: bool,
 }
+
+static LOOSE: RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = RwLock::new(BTreeMap::new());
+static SNAPS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
 
 struct Entry {
     end: u64,
@@ -187,15 +198,23 @@ impl Shadow {
     fn new(start: u64, len: u64) -> Arc<Self> {
         let pages = pages_for(start, len);
         LIVE.fetch_add(1, Ordering::Relaxed);
+        let card = super::session::card_buffers_room(len).then(|| {
+            super::session::note_card_bytes(len);
+            card_shadow::CardSide::new(len)
+        });
         Arc::new(Self {
             start,
             len,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             held: Mutex::new(vec![0u8; len as usize]),
+            before: Mutex::new(None),
             copied: Mutex::new(vec![0u64; pages]),
             pending: Mutex::default(),
             landings: Mutex::default(),
             landing: AtomicBool::new(false),
+            card,
+            window: false,
+            by_address: false,
         })
     }
 
@@ -334,6 +353,128 @@ impl Shadow {
         }
         let n = src.len().min(held.len() - off);
         held[off..off + n].copy_from_slice(&src[..n]);
+        if let Some(card) = &self.card {
+            card.note_dirty(off, n);
+        }
+    }
+
+    fn snapshot_before(&self) {
+        let held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        *self.before.lock().unwrap_or_else(|e| e.into_inner()) = Some(held.clone());
+        if super::wide_back::enabled() {
+            let (off0, off1) = (0usize, held.len());
+            if off1 > off0 {
+                let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
+                snaps.push((self.start as usize + off0, off0, off1 - off0));
+            }
+        }
+    }
+
+    /// After shaders ran: merge card-held bytes that changed since the snapshot into title memory.
+    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+        let before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(ref snap) = *before else {
+            return 0;
+        };
+        let (off0, off1) = self.inside(address, len);
+        if off0 >= off1 || snap.len() < off1 {
+            return 0;
+        }
+        let held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let pieces = differing_pieces(self.start as usize, off0, off1, &held[off0..off1], &snap[off0..off1]);
+        let mut written = 0usize;
+        for (at, n) in pieces {
+            let title_va = self.start as usize + at;
+            let card = &held[at..at + n];
+            if unsafe { merge_if_covered(title_va, card, n) }.is_some() {
+                written += n;
+                continue;
+            }
+            if let Some((base, off)) = super::real::uma_window_buffer(title_va, n) {
+                let mut h = card.to_vec();
+                let (nb, _) = unsafe { land::merge_range(base + off as usize, card, &mut h, n) };
+                written += nb.max(n);
+            }
+        }
+        written
+    }
+
+    /// Title memory under declared shader writes: pull title bytes into `held` where the title moved.
+    pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+        let start = self.start as usize;
+        let (from, to) = (address.max(start), (address + len).min(start + self.len as usize));
+        if from >= to {
+            return false;
+        }
+        let busy: Vec<(usize, usize)> = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&&(a, e)| a < to && e > from)
+            .map(|&(a, e)| (a.max(from), e.min(to)))
+            .collect();
+        if busy.is_empty() {
+            return false;
+        }
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let mut wait = false;
+        for &(a, e) in &busy {
+            let mut page = a / PAGE;
+            while page * PAGE < e {
+                let lo = (page * PAGE).max(a);
+                let hi = ((page + 1) * PAGE).min(e);
+                let off = lo - start;
+                let n = hi - lo;
+                if *runs_left == 0 {
+                    wait = true;
+                    break;
+                }
+                *runs_left -= 1;
+                if let Some((base, boff)) = super::real::uma_window_buffer(lo, n) {
+                    let src = unsafe { std::slice::from_raw_parts((base + boff as usize) as *const u8, n) };
+                    let runs = card_shadow::merge_piece_runs(start, off, n, &mut held[off..off + n], src);
+                    if let Some(card) = &self.card {
+                        for (r, m) in runs {
+                            card.note_dirty(off + r, m);
+                        }
+                    }
+                }
+                page += 1;
+            }
+        }
+        wait
+    }
+
+    /// Relay flight: one piece that changed on the card since the snapshot.
+    pub(crate) fn relay_merge(&self, at: usize, n: usize) -> usize {
+        if n == 0 || at + n > self.len as usize {
+            return 0;
+        }
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(ref mut snap) = *before else {
+            return 0;
+        };
+        let held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let now = &held[at..at + n];
+        let Some(old) = snap.get(at..at + n) else {
+            return 0;
+        };
+        let Some(first) = first_difference(now, old) else {
+            return 0;
+        };
+        let last = last_difference(now, old).unwrap_or(first);
+        let piece = last + 1 - first;
+        let title_va = self.start as usize + at + first;
+        let Some((base, boff)) = super::real::uma_window_buffer(title_va, piece) else {
+            return 0;
+        };
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut((base + boff as usize) as *mut u8, piece)
+        };
+        dst.copy_from_slice(&now[first..first + piece]);
+        snap[at + first..at + first + piece].copy_from_slice(&now[first..first + piece]);
+        piece
     }
 
     /// Copy title bytes into held for whole pages marked stale vs `now` / `written`.
@@ -473,9 +614,10 @@ pub(crate) fn declare_gpu_writes(ranges: &[(usize, usize)]) {
         if n == 0 {
             continue;
         }
-        let Some(s) = peek(va as u64, n as u64).or_else(|| find(va as u64, n as u64)) else {
+        let Some(s) = find_for_read(va as u64, n as u64, super::relay::exact()) else {
             continue;
         };
+        s.snapshot_before();
         let end = va.saturating_add(n);
         let lo = va.max(s.start as usize);
         let hi = end.min((s.start + s.len) as usize);
@@ -485,12 +627,30 @@ pub(crate) fn declare_gpu_writes(ranges: &[(usize, usize)]) {
     }
 }
 
-/// After land-back: clear declared write spans that were copied back.
+/// After land-back: copy card deltas back and clear declared write spans.
 pub(crate) fn finish_gpu_writes(ranges: &[(usize, usize)]) {
     if !enabled() {
         return;
     }
+    let mut runs_left = usize::MAX;
     let map = BUFFERS.read().unwrap_or_else(|e| e.into_inner());
+    for &(va, n) in ranges {
+        if n == 0 {
+            continue;
+        }
+        let end = va.saturating_add(n);
+        for (_, entry) in map.iter() {
+            let Some(shadow) = entry.shadow.as_ref() else { continue };
+            let s0 = shadow.start as usize;
+            let s1 = (shadow.start + shadow.len) as usize;
+            let lo = va.max(s0);
+            let hi = end.min(s1);
+            if lo < hi {
+                let _ = shadow.copy_back(lo, hi - lo);
+                let _ = shadow.merge_under_writes(lo, hi - lo, &mut runs_left);
+            }
+        }
+    }
     for &(va, n) in ranges {
         if n == 0 {
             continue;
@@ -506,7 +666,90 @@ pub(crate) fn finish_gpu_writes(ranges: &[(usize, usize)]) {
                 shadow.writes_done(&[(lo, hi)]);
             }
         }
+        if let Some(s) = LOOSE.read().unwrap_or_else(|e| e.into_inner()).values().find(|s| {
+            let s0 = s.start as usize;
+            va < s0 + s.len as usize && end > s0
+        }) {
+            let lo = va.max(s.start as usize);
+            let hi = end.min((s.start + s.len) as usize);
+            if lo < hi {
+                s.writes_done(&[(lo, hi)]);
+            }
+        }
     }
+    SNAPS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// Exact relay: land deferred flights through shadow merge / copy-back.
+pub(crate) fn relay_finish_ranges(ranges: &[(usize, usize)], order: u64) {
+    if !enabled() || !super::relay::exact() {
+        return;
+    }
+    let _ = order;
+    for &(va, n) in ranges {
+        if n == 0 {
+            continue;
+        }
+        let Some(s) = find_for_read(va as u64, n as u64, true) else { continue };
+        let end = va + n;
+        let start = s.start as usize;
+        let mut at = va.max(start);
+        while at < end.min(start + s.len as usize) {
+            let n = (PIECE - at % PIECE).min(end - at);
+            let _ = s.relay_merge(at - start, n);
+            at += n;
+        }
+        if let Some(card) = &s.card {
+            card.clear_sent_through(order);
+        }
+    }
+}
+
+/// Window / arena copy keyed by exact `(start, len)` (not a registered buffer).
+pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
+    if !enabled() || len == 0 || !super::session::card_buffers_enabled() {
+        return None;
+    }
+    let key = (start, len);
+    if let Some(s) = LOOSE.read().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return Some(s.clone());
+    }
+    let shadow = find(start, 1)?;
+    if shadow.len < len {
+        return None;
+    }
+    let mut m = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = m.get(&key) {
+        return Some(s.clone());
+    }
+    let arc = shadow.clone();
+    m.insert(key, arc.clone());
+    Some(arc)
+}
+
+/// Loose title memory outside buffers (`exact` = registered buffer only).
+pub(crate) fn find_for_read(address: u64, len: u64, loose: bool) -> Option<Arc<Shadow>> {
+    if !enabled() {
+        return None;
+    }
+    let end = address.saturating_add(len.max(1));
+    if loose {
+        let cell = address & !(PIECE as u64 - 1);
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        for ((s, l), shadow) in map.range((cell, 0)..=(address, u64::MAX)) {
+            if *s + *l >= end {
+                return Some(shadow.clone());
+            }
+        }
+        if let Some(s) = by_address(address, end - address) {
+            return Some(s);
+        }
+    }
+    peek(address, len).or_else(|| find(address, len))
+}
+
+pub(crate) fn take_wide_snapshots() -> Vec<(usize, usize, usize)> {
+    std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// Note landed ranges onto covering shadows (sparse beside path).

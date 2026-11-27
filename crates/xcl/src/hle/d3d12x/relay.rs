@@ -62,6 +62,9 @@ fn ensure_worker() {
                 unsafe {
                     if let Some(queue) = ID3D12CommandQueue::from_raw_borrowed(&qptr) {
                         super::sparse::readback_after_execute_sync(queue, &job.ranges);
+                        if exact() {
+                            super::shadow::relay_finish_ranges(&job.ranges, job.order);
+                        }
                     }
                 }
                 LANDED_ORDER.store(job.order, Ordering::Release);
@@ -70,11 +73,12 @@ fn ensure_worker() {
             }
         });
         let st = stage();
+        let fetch = super::diag_env::fetch_check();
         crate::xlog_info!(
             "D3D12.X: relay worker (XCL_RELAY={st}{}{}{})",
             if exact() { ", exact" } else { "" },
             if relay_copy() { ", copy queue fetch" } else { "" },
-            if super::diag_env::fetch_check() { ", XCL_FETCH_CHECK" } else { "" },
+            if fetch { ", XCL_FETCH_CHECK" } else { "" },
         );
     });
 }

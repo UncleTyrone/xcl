@@ -10,6 +10,7 @@
 //! Benjamin Larsson, Ulion, Sascha Sommer, Reimar Döffinger, Lynne), adapted to safe Rust for
 //! XCL on 2026-11-21.
 
+pub mod frames;
 pub mod tables;
 
 use std::collections::VecDeque;
@@ -1907,6 +1908,31 @@ impl Decoder {
             pcm.push(scaled);
         }
         Ok(pcm)
+    }
+
+    /// Decode one XMA frame bit blob (`frame` from [`frames::read_frame`]) without resetting overlap.
+    pub fn decode_frame_blob(&mut self, frame: &frames::Frame) -> Result<Vec<i16>, String> {
+        let mut pkt = [0u8; PACKET_SIZE];
+        pkt[0..4].copy_from_slice(&(1u32 << 26).to_be_bytes());
+        let n = frame.data.len().min(PACKET_SIZE - 4);
+        pkt[4..4 + n].copy_from_slice(&frame.data[..n]);
+        self.current_stream = 0;
+        let floats = self.decode_packets_f32(&pkt, false)?;
+        let mut pcm = Vec::with_capacity(floats.len());
+        for s in floats {
+            let scaled = (s * 32768.0_f32).round().clamp(-32768.0, 32767.0) as i16;
+            pcm.push(scaled);
+        }
+        Ok(pcm)
+    }
+
+    /// Append overlap tail after input ends (half frame per channel).
+    pub fn flush_tail_i16(&mut self) -> Vec<i16> {
+        let floats = self.decode_packets_f32(&[], true).unwrap_or_default();
+        floats
+            .into_iter()
+            .map(|s| (s * 32768.0_f32).round().clamp(-32768.0, 32767.0) as i16)
+            .collect()
     }
 }
 

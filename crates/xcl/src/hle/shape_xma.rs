@@ -7,8 +7,8 @@
 //! each enabled context's 256-byte PCM output ring from its input packets via
 //! [`crate::hle::xma2::Decoder`].
 //!
-//! Still thinner than CGBJ: bit-accurate mid-packet frame seek (`read_frame` /
-//! overlap-buffer handoff). Loop boundaries reset the bit cursor from context word 3.
+//! Frame-at-a-time decode via [`crate::hle::xma2::frames::read_frame`]; loop boundaries reset
+//! the bit cursor from context word 3; overlap is carried across frames on each voice decoder.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -209,7 +209,7 @@ fn pump_one(context: Context, voice: &mut Voice) {
     }
 }
 
-/// Decode more input into `voice`; false when nothing further is ready.
+/// Decode one XMA frame into `voice.pcm`; false when nothing further is ready.
 fn decode_packets(context: Context, voice: &mut Voice) -> bool {
     let valid = context.field(0, 20, 2);
     if voice.ended {
@@ -221,14 +221,12 @@ fn decode_packets(context: Context, voice: &mut Voice) -> bool {
             context.set_field(2, 26, 6, 0);
         }
     }
+    let channels = context.channels();
     let mut current = context.field(4, 31, 1);
     if valid & (1 << current) == 0 {
         if valid & (1 << (1 - current)) == 0 {
             if let Some(decoder) = &mut voice.decoder {
-                decoder.flush();
-                if let Ok(tail) = decoder.decode_buffer_i16(&[], true) {
-                    voice.pcm.extend(tail);
-                }
+                voice.pcm.extend(decoder.flush_tail_i16());
             }
             voice.ended = true;
             context.set_field(2, 26, 5, INPUT_INVALID);
@@ -238,6 +236,9 @@ fn decode_packets(context: Context, voice: &mut Voice) -> bool {
         current = 1 - current;
         context.set_field(4, 31, 1, current);
         context.set_field(2, 0, 26, 0);
+        if let Some(decoder) = &mut voice.decoder {
+            decoder.flush();
+        }
     }
     let (address, packets) = match current {
         0 => (context.get(5), context.field(0, 0, 12)),
@@ -251,16 +252,16 @@ fn decode_packets(context: Context, voice: &mut Voice) -> bool {
         context.set_field(0, 20 + current, 1, 0);
         return true;
     };
-    let channels = context.channels() as u16;
+    let rate_idx = context.field(1, 27, 2) as usize;
     const RATES: [u32; 4] = [24_000, 32_000, 44_100, 48_000];
-    let rate = RATES[context.field(1, 27, 2) as usize];
+    let rate = RATES[rate_idx.min(3)];
     let decoder = match voice.decoder.as_mut() {
         Some(d) => d,
         None => {
             let cfg = StreamConfig {
                 version: xma2::Version::Xma2,
                 sample_rate: rate,
-                channels,
+                channels: channels as u16,
                 stream_channels: vec![channels.min(2) as u8],
             };
             match Decoder::new(cfg) {
@@ -277,43 +278,41 @@ fn decode_packets(context: Context, voice: &mut Voice) -> bool {
         }
     };
     let mut at_bits = context.field(2, 0, 26) as usize;
-    let data = if at_bits >= 32 {
-        &data[at_bits / 8..]
-    } else {
-        data
-    };
-    let loops = context.field(0, 12, 8);
-    let loop_end = context.field(4, 0, 26);
-    match decoder.decode_buffer_i16(data, false) {
-        Ok(mut pcm) => {
-            let channels = context.channels().max(1);
-            let skip = (voice.skip * channels).min(pcm.len());
-            voice.skip -= skip / channels;
-            pcm = pcm.split_off(skip);
-            let looping = loops > 0 && loop_end != 0;
-            if looping {
-                let keep = (context.field(1, 12, 2) as usize + 1) * SUBFRAME_SAMPLES * channels;
-                if pcm.len() > keep {
-                    pcm.truncate(keep);
-                }
-                voice.skip = context.field(1, 17, 3) as usize * SUBFRAME_SAMPLES;
-                if loops != 255 {
-                    context.set_field(0, 12, 8, loops - 1);
-                }
-                context.set_field(2, 0, 26, context.field(3, 0, 26));
-            } else if data.is_empty() {
-                context.set_field(0, 20 + current, 1, 0);
-            } else {
-                let next = at_bits.saturating_add(data.len() * 8).min(1 << 26);
-                context.set_field(2, 0, 26, next as u32);
-                if next >= packets as usize * xma2::PACKET_SIZE * 8 {
-                    context.set_field(0, 20 + current, 1, 0);
-                }
-            }
-            voice.pcm.extend(pcm);
-        }
-        Err(e) => crate::xlog_warn!("SHAPE XMA: decode failed: {e}"),
+    if at_bits < 32 {
+        at_bits = xma2::frames::default_frame_start(data);
     }
+    let Some(frame) = xma2::frames::read_frame(data, at_bits) else {
+        context.set_field(0, 20 + current, 1, 0);
+        return true;
+    };
+    let mut pcm = decoder.decode_frame_blob(&frame).unwrap_or_default();
+    let mut next = frame.next.unwrap_or(0);
+    let loops = context.field(0, 12, 8);
+    let loop_end = context.field(4, 0, 26) as usize;
+    let ends_loop = loop_end != 0
+        && (frame.start == loop_end
+            || (frame.start < loop_end && frame.next.is_none_or(|n| loop_end < n)));
+    let looping = loops > 0 && ends_loop;
+    if looping {
+        let keep = (context.field(1, 12, 2) as usize + 1) * SUBFRAME_SAMPLES * channels;
+        if pcm.len() > keep {
+            pcm.truncate(keep);
+        }
+        next = context.field(3, 0, 26) as usize;
+        if loops != 255 {
+            context.set_field(0, 12, 8, loops - 1);
+        }
+    }
+    let skip = (voice.skip * channels).min(pcm.len());
+    voice.skip -= skip / channels;
+    voice.pcm.extend(&pcm[skip..]);
+    if looping {
+        voice.skip = context.field(1, 17, 3) as usize * SUBFRAME_SAMPLES;
+    }
+    if next == 0 {
+        context.set_field(0, 20 + current, 1, 0);
+    }
+    context.set_field(2, 0, 26, next as u32);
     true
 }
 
