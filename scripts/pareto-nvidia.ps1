@@ -31,6 +31,10 @@ $pareto = @{
     XCL_LEVELS_ON_DEMAND        = '1'
     XCL_CARD_BUFFERS_MIN_KB     = '64'
     XCL_D3D12_DRED              = 'light'
+    XCL_HEAP_STRIDES            = '1'
+    XCL_RESIDENCY               = '1'
+    XCL_FRAME_INTERVAL_MS       = '16'
+    XCL_GPU_AWAKE               = '1'
 }
 
 # Opt-in land spine (Play-VIctory.cmd does not set LAND; pareto-amd does):
