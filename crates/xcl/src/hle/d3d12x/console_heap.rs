@@ -401,6 +401,24 @@ pub fn recycle_after_submit(queue: usize) {
     }
 }
 
+fn pending_dynamic_len() -> usize {
+    PENDING_DYNAMIC.lock().unwrap().len()
+}
+
+/// Retry fence-driven release of deferred dynamic descriptor ranges (CGBJ `settle_for_fence`).
+pub unsafe fn settle_for_fence() {
+    if !super::residency::defer_dynamic_slots() {
+        return;
+    }
+    for _ in 0..4 {
+        let before = pending_dynamic_len();
+        drain_completed_dynamic_slots();
+        if pending_dynamic_len() == before {
+            break;
+        }
+    }
+}
+
 /// Ranges held until the submit fence that recorded them has completed.
 pub unsafe fn drain_completed_dynamic_slots() {
     if !super::residency::defer_dynamic_slots() {
@@ -601,6 +619,11 @@ pub fn release_global(first: u32, count: u32) {
         if let Some(n) = NAMES.get() {
             n.clear(first, first + count);
         }
+        if super::heap_strides::on() {
+            for i in first..first.saturating_add(count) {
+                super::heap_strides::write(i, 0);
+            }
+        }
     }
     if let Some(s) = GLOBAL.lock().unwrap().as_mut() {
         merge_release(&mut s.free, first, count);
@@ -738,7 +761,13 @@ pub fn unregister(obj: usize) {
             if h.sampler {
                 release_global_sampler(f, sampler_page_descriptors(h.n, p as u32));
             } else {
-                release_global(f, page_descriptors(h.n, p as u32));
+                let first = f;
+                let count = page_descriptors(h.n, p as u32);
+                if super::residency::defer_dynamic_slots() && first >= MIN_DYNAMIC {
+                    hold_for_submit(first, count);
+                } else {
+                    release_global(first, count);
+                }
                 PAGES_PLACED.fetch_sub(1, Relaxed);
             }
         }
@@ -841,6 +870,7 @@ pub unsafe fn publish(s: &Slot, uav: bool, res: usize) {
     let _w = SLOT_WRITES.lock().unwrap();
     copy_views(&dev, 1, dst, src);
     names().note(s.index + uav as u32, res);
+    super::heap_strides::note_view(s.index, res);
 }
 
 /// The PC resources the SRV and the UAV of view slot `s` name in the shared heap (0: not known,
@@ -898,6 +928,9 @@ pub unsafe fn publish_range(first: &Slot, n: u32, names: &[(usize, usize)]) {
                             fill_nulls(ndev, *cpu, *inc, i, i + 1, *at);
                         }
                         m.note(i, res);
+                        if !s.sampler {
+                            super::heap_strides::note_view(i, res);
+                        }
                     }
                 }
             }

@@ -9184,6 +9184,7 @@ unsafe extern "system" fn fence_get_completed_value(this: *mut c_void) -> u64 {
     let f: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12Fence", "GetCompletedValue")));
     let v = f(this);
     super::sparse::settle_readbacks_try();
+    unsafe { super::console_heap::settle_for_fence() };
     v
 }
 

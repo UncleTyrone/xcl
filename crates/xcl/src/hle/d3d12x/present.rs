@@ -335,6 +335,19 @@ pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
             q.push(queue as usize);
         }
     }
+    static LAST_MAINT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = super::residency::coarse_ms();
+    if now.saturating_sub(LAST_MAINT_MS.load(Ordering::Relaxed)) >= 1000 {
+        LAST_MAINT_MS.store(now, Ordering::Relaxed);
+        super::residency::refresh();
+        let vram = super::session::texture_budget_bytes();
+        let (used, _) = super::vram::page_bytes();
+        super::texture_pool::tick(Some((vram, used as u64)));
+    }
+    super::console_heap::settle_for_fence();
+    super::console_heap::recycle_after_submit(queue as usize);
+    let (draws_skipped, _) = super::bind::skipped_counts();
+    super::console_heap::maybe_log_shared_heap(draws_skipped);
     super::late_release::drain_known(false);
     if !enabled() || IN_PRESENT.with(|c| c.get()) || PRESENTX.load(Ordering::Relaxed) {
         return;

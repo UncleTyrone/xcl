@@ -70,7 +70,7 @@ fn refresh() {
     for (c, v) in values {
         c.0.store(v, Ordering::Release);
     }
-    unsafe { super::console_heap::drain_completed_dynamic_slots() };
+    unsafe { super::console_heap::settle_for_fence() };
 }
 
 unsafe fn arm(fence: usize, value: u64) {
