@@ -41,6 +41,7 @@ pub(crate) mod relay;
 pub(crate) mod wide_back;
 pub(crate) mod join;
 mod frame_replay;
+mod frame_wire;
 mod late_release;
 mod late_wait;
 pub mod layout;
