@@ -513,7 +513,8 @@ fn window_thread() {
         RegisterClassW(&wc);
         let cfg = crate::state::config();
         let title = window_name();
-        let mut rc = RECT { left: 0, top: 0, right: cfg.window_width as i32, bottom: cfg.window_height as i32 };
+        let (cw, ch) = super::window_env::clamp_window_size(cfg.window_width, cfg.window_height);
+        let mut rc = RECT { left: 0, top: 0, right: cw as i32, bottom: ch as i32 };
         let _ = AdjustWindowRect(&mut rc, WS_OVERLAPPEDWINDOW, false);
         let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
         let (x, y) = window_position(&cfg.window_pos, w, h);
@@ -535,7 +536,7 @@ fn window_thread() {
             crate::xlog_error!("could not create the XCL window");
             return;
         };
-        crate::xlog_info!("XCL window created ({}x{})", cfg.window_width, cfg.window_height);
+        crate::xlog_info!("XCL window created ({cw}x{ch})");
         if !preparation::active() { crate::hle::kbm::attach(hwnd.0); }
         SetTimer(Some(hwnd), COMPILE_TIMER, 500, None);
         HWND_RAW.store(hwnd.0 as isize, Ordering::Release);

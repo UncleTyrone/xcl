@@ -76,6 +76,12 @@ pub fn threads() -> usize {
         std::env::var("XCL_LAND_THREADS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
+            .or_else(|| {
+                let n = super::render_env::under_threads();
+                (std::env::var_os("XCL_UNDER_THREADS").is_some()
+                    || std::env::var_os("VICTORY_UNDER_THREADS").is_some())
+                .then_some(n)
+            })
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get() / 4).clamp(1, 4))
             .clamp(1, 16)
     })

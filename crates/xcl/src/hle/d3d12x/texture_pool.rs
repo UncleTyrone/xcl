@@ -9,6 +9,7 @@ const STAGING_KEPT: usize = 8;
 pub fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
+        let _ = super::render_env::wait_resident();
         match std::env::var("XCL_TEXTURE_POOL") {
             Ok(v) if v.trim() == "0" => false,
             Ok(v) if !v.trim().is_empty() && v.trim() != "0" => true,
@@ -44,9 +45,13 @@ pub fn tick(memory: Option<(u64, u64)>) {
     if !on() {
         return;
     }
+    if !super::texture_env::texture_sweep_on() && !super::render_env::sweep() {
+        return;
+    }
     let pressure = super::residency::pressured();
+    let room = super::texture_env::texture_room_percent();
     let _keep_spare = memory
-        .filter(|(budget, used)| *budget > 0 && u128::from(*used) * 100 < u128::from(*budget) * 85)
+        .filter(|(budget, used)| *budget > 0 && u128::from(*used) * 100 < u128::from(*budget) * room as u128)
         .is_some();
     let (p, b) = super::present::counters();
     let frames = p.max(b);
@@ -57,6 +62,9 @@ pub fn tick(memory: Option<(u64, u64)>) {
 
 /// Cap in bytes for retained in-flight upload staging (`title_textures::in_flight_cap_bytes`).
 pub fn free_cap_bytes() -> u64 {
+    let _ = super::texture_env::texture_room_percent();
+    let _ = super::texture_env::texture_sweep();
+    let _ = super::texture_env::texture_keep();
     if !on() {
         return 512 << 20;
     }

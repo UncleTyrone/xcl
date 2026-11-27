@@ -88,5 +88,14 @@ pub fn send_spare_bytes() -> u64 {
 
 /// Touch latches when card-buffer / send path is entered.
 pub fn on_send_path() {
-    let _ = (send_own(), send_bar(), send_changed(), send_spare_bytes());
+    let _ = (
+        send_own(),
+        send_bar(),
+        send_changed(),
+        send_spare_bytes(),
+        super::render_env::under_words(),
+        super::render_env::upload_low(),
+        super::render_env::wait_resident(),
+        super::render_env::split_waits(),
+    );
 }
