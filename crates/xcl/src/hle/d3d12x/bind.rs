@@ -498,6 +498,15 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
             list.SetGraphicsRootSignature(r);
         }
+        super::list_x::note_frame_indirect(
+            this,
+            sig as u64,
+            max,
+            args as u64,
+            args_off,
+            count_buf as u64,
+            count_off,
+        );
         return indirect_execute_after_order(this, constants_ordered, || pc(this, sig, max, args, args_off, count_buf, count_off));
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
@@ -522,6 +531,15 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 }
             }
             count(if gfx { DRAWS } else { DISPATCHES });
+            super::list_x::note_frame_indirect(
+                this,
+                sig as u64,
+                max,
+                args as u64,
+                args_off,
+                count_buf as u64,
+                count_off,
+            );
             indirect_execute_after_order(this, constants_ordered, || pc(this, sig, max, args, args_off, count_buf, count_off))
         }
         Err(e) => {
@@ -667,12 +685,28 @@ pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices:
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
     if let Some(list) = graphics_bound(this) {
         if draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
-            super::list_x::note_frame_draw(this, false, vertices, instances, first_vertex, 0);
+            super::list_x::note_frame_draw(
+                this,
+                false,
+                vertices,
+                instances,
+                first_vertex,
+                0,
+                first_instance,
+            );
             return;
         }
         super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
         list.DrawInstanced(vertices, instances, first_vertex, first_instance);
-        super::list_x::note_frame_draw(this, false, vertices, instances, first_vertex, 0);
+        super::list_x::note_frame_draw(
+            this,
+            false,
+            vertices,
+            instances,
+            first_vertex,
+            0,
+            first_instance,
+        );
     }
 }
 
@@ -718,6 +752,7 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
         instances,
         first_index,
         base_vertex,
+        first_instance,
     );
 }
 

@@ -1,9 +1,9 @@
 //! Offline XCLFRAME tooling: list-op edit, content/plane pixel compare, diverge reports.
 //!
 //! GPL-2 stand-ins for CGBJ `victory replay --pixel` / `--diverge` / edit experiments. These
-//! operate on recorded `XCLFRAME` / JSONL captures without a GPU device. Live texel probes and
-//! multi-run GPU diverge (CGBJ `play::pixel` / `play::diverge`) need a full offline command
-//! rebuild, which XCL does not support across processes — see module docs on [`super::frame_replay`].
+//! operate on recorded `XCLFRAME` / JSONL captures without a GPU device. Live same-process content
+//! diverge is `XCL_REPLAY_DIVERGE` in [`super::frame_replay`]. Multi-run GPU picture diverge
+//! (CGBJ `play::diverge_picture`) needs offline command rebuild — **impossible** across processes.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -790,7 +790,12 @@ pub fn cli_pixel(
                 compare["byte_diffs"].as_array().map(|a| a.len()).unwrap_or(0)
             ));
         }
-        out.push_str("note: offline plane/content compare only (no live GPU texel probe)\n");
+        let present = dir.join("present.bin");
+        if present.is_file() {
+            let n = std::fs::metadata(&present).map(|m| m.len()).unwrap_or(0);
+            out.push_str(&format!("present.bin: {n} B (session sidecar)\n"));
+        }
+        out.push_str("note: offline plane/content/present.bin compare; live GPU texel probe same-process only\n");
         Ok(out)
     }
 }
@@ -953,7 +958,10 @@ pub fn cli_diverge(
             "against": against.map(|p| p.display().to_string()),
             "findings": findings,
             "first_content_split": first_content_split,
-            "gpu_multi_run_diverge": "unsupported",
+            "gpu_multi_run_diverge": "impossible",
+            "present_bin": dir.join("present.bin").is_file()
+                || dir.join("frames").join("frame_0001.present.bin").is_file(),
+            "contents_bin": dir.join("contents.bin").is_file(),
         })
         .to_string())
     } else {
@@ -971,7 +979,15 @@ pub fn cli_diverge(
         if write_report {
             out.push_str(&format!("wrote {}\\diverge\\report.json\n", dir.display()));
         }
-        out.push_str("note: offline content/list diverge only (no GPU multi-run trials)\n");
+        if dir.join("present.bin").is_file() {
+            out.push_str("present.bin: present (session sidecar)\n");
+        }
+        if dir.join("contents.bin").is_file() {
+            out.push_str("contents.bin: present (session sidecar)\n");
+        }
+        out.push_str(
+            "note: offline content/list diverge; GPU multi-run picture diverge IMPOSSIBLE cross-process\n",
+        );
         Ok(out)
     }
 }

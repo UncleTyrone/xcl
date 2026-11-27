@@ -22,7 +22,8 @@
 //! - **`HeapSnap` / `HeapEntry`** — optional GPU/CPU descriptor-heap start handles
 //!   (VICFRAME `DescriptorHeap` id/kind/count role without full slot-run codecs).
 //! - **`Present` plane tail** — per-plane `width` / `height` / `format` from `GetDesc` when known
-//!   (VICFRAME `Present` picture meta toward `present.bin`; pixel dump remains same-process only).
+//!   (VICFRAME `Present` picture meta). Texel bytes live in sidecar `frames/frame_NNNN.present.bin`
+//!   (JSONL carries `pitch` / `file_off` / `hash`; wire v5 layout unchanged).
 //!
 //! ## `XCLFRAME` version 4
 //!
@@ -249,7 +250,7 @@ impl HeapEntry {
 /// One PresentX plane resource (+ optional source rect) for v4+ present tails.
 ///
 /// v5 adds resource `GetDesc` width/height/format (0 when unknown) toward VICFRAME `Present`
-/// picture metadata; full `present.bin` texel dump is still same-process / offline-absent.
+/// picture metadata. Texel dump is a sidecar (`present.bin`), not part of the v5 plane tail.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PresentPlane {
     pub resource: usize,
