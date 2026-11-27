@@ -751,6 +751,12 @@ impl Lw {
                 let c = self.lane_heap_index(clear);
                 self.sel(cond, s, c)
             }
+            E::Select { set, clear } => {
+                let cond = self.scc_bit();
+                let s = self.lane_heap_index(set);
+                let c = self.lane_heap_index(clear);
+                self.sel(cond, s, c)
+            }
             E::LanePhi { arms } => {
                 let live: Vec<_> = arms.iter().flatten().collect();
                 match live.len() {
