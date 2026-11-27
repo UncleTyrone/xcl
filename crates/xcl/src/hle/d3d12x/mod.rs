@@ -17,6 +17,7 @@ pub mod bind;
 pub(crate) mod clamp;
 mod culprit;
 pub mod console_heap;
+mod desc_recycle;
 pub(crate) mod heap_strides;
 pub mod console_list;
 mod depth_uav;
