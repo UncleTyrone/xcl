@@ -1554,20 +1554,22 @@ mod join_merge_tests {
     }
 }
 
+/// Reverse-postorder ranks (earlier in RPO = smaller). Used by LanePhi `only_edge` to refuse
+/// loop-header joins (`pred` rank ≥ join rank ⇒ back edge), matching CGBJ's `rpo` sense.
 pub(crate) fn block_rpo(next: &[Vec<usize>]) -> Vec<usize> {
     let n = next.len();
-    let mut rpo = vec![usize::MAX; n];
+    let mut finish = vec![usize::MAX; n];
     let mut time = 0usize;
-    fn visit(next: &[Vec<usize>], rpo: &mut [usize], time: &mut usize, stack: &mut Vec<(usize, bool)>) {
+    fn visit(next: &[Vec<usize>], finish: &mut [usize], time: &mut usize, stack: &mut Vec<(usize, bool)>) {
         while let Some((b, out)) = stack.pop() {
             if out {
                 *time += 1;
-                rpo[b] = *time;
-            } else if rpo[b] == usize::MAX {
-                rpo[b] = 0;
+                finish[b] = *time;
+            } else if finish[b] == usize::MAX {
+                finish[b] = 0;
                 stack.push((b, true));
                 for &s in next[b].iter().rev() {
-                    if rpo[s] == usize::MAX {
+                    if finish[s] == usize::MAX {
                         stack.push((s, false));
                     }
                 }
@@ -1575,12 +1577,19 @@ pub(crate) fn block_rpo(next: &[Vec<usize>]) -> Vec<usize> {
         }
     }
     if !next.is_empty() {
-        visit(next, &mut rpo, &mut time, &mut vec![(0, false)]);
+        visit(next, &mut finish, &mut time, &mut vec![(0, false)]);
     }
     for b in 1..n {
-        if rpo[b] == usize::MAX {
-            visit(next, &mut rpo, &mut time, &mut vec![(b, false)]);
+        if finish[b] == usize::MAX {
+            visit(next, &mut finish, &mut time, &mut vec![(b, false)]);
         }
+    }
+    // High finish time ⇒ early RPO. Unreachable blocks keep `usize::MAX`.
+    let mut order: Vec<usize> = (0..n).filter(|&b| finish[b] != usize::MAX).collect();
+    order.sort_by_key(|&b| std::cmp::Reverse(finish[b]));
+    let mut rpo = vec![usize::MAX; n];
+    for (i, &b) in order.iter().enumerate() {
+        rpo[b] = i;
     }
     rpo
 }
@@ -1597,8 +1606,9 @@ pub(crate) fn block_rpo(next: &[Vec<usize>]) -> Vec<usize> {
 /// compute when `follow` is true). At joins, predecessors that `s_cbranch_execz` straight to
 /// the merge are ignored when intersecting SGPR constants so a guarded sample after a live arm
 /// still resolves its immediate S# (transmission prefilter on Wave32). LanePhi-style join merge
-/// keeps constants from live predecessors when another arm defines none. Per-lane heap `LanePhi`
-/// in DXIL emit remains unported; see [`join_lane_phi`].
+/// keeps constants from live predecessors when another arm defines none. Nested `only_edge`
+/// peel and SGPR copy/`s_cselect` same-arm folds live in [`join_lane_phi`]. Per-lane heap
+/// `LanePhi` phis in DXIL emit remain unported.
 pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, follow: bool) -> BTreeMap<u64, [u32; 4]> {
     propagate_sgpr_descriptors(
         insts,
@@ -1629,8 +1639,9 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, foll
     )
 }
 
-/// Buffer / flat / UAV SRSRC words built from constants on every path (same LanePhi-inspired
-/// join rules as [`constant_samplers`]: lane-dead edges at a merge do not clear the live arm).
+/// Buffer / flat / UAV / MIMG T# SRSRC words built from constants on every path (same
+/// LanePhi-inspired join rules as [`constant_samplers`]: lane-dead edges at a merge do not
+/// clear the live arm). MIMG records the first four T# dwords (`tw0..tw3`) for DXIL/HLSL emit.
 pub(crate) fn constant_srsrc(insts: &[Decoded], leaders: &BTreeSet<u64>, follow: bool) -> BTreeMap<u64, [u32; 4]> {
     propagate_sgpr_descriptors(
         insts,
@@ -1642,7 +1653,10 @@ pub(crate) fn constant_srsrc(insts: &[Decoded], leaders: &BTreeSet<u64>, follow:
             }
         },
         |d, known, out| {
-            if !matches!(&*d.enc.name, "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL") {
+            if !matches!(
+                &*d.enc.name,
+                "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_MIMG"
+            ) {
                 return;
             }
             let f = |n: &str| rdna2::field_value(d.enc, &d.words, n);

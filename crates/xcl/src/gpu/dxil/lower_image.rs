@@ -1041,9 +1041,9 @@ impl Lw {
                 }
             }
         };
-        let tw0 = self.sreg(srsrc);
-        let tw1 = self.sreg(srsrc + 1);
-        let tw3 = self.sreg(srsrc + 3);
+        // Constant T# words when LanePhi-inspired joins prove SRSRC on every live path
+        // ([`recomp::constant_srsrc`] / `static_srsrc`); else the live SGPRs.
+        let [tw0, tw1, _, tw3] = self.buffer_srsrc_words(d.pc, srsrc);
         let act = self.act();
         let valid = self.valid_tsharp(tw0, tw1, tw3);
         let run = self.land(act, valid);
