@@ -953,9 +953,9 @@ pub(super) fn two_pass_defer() -> bool {
 /// `XCL_TWO_PASS_BATCH`: 0 (unset or anything else), 1 or 2 (read once).
 fn two_pass_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("XCL_TWO_PASS_BATCH").as_deref().map(str::trim) {
-        Ok("1") => 1,
-        Ok("2") => 2,
+    *MODE.get_or_init(|| match std::env::var("XCL_TWO_PASS_BATCH").ok().as_deref().map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
         _ => 0,
     })
 }
@@ -3563,6 +3563,15 @@ pub(super) fn last_draw_args() -> (bool, u32, u32, u32, i32) {
 #[cfg(test)]
 pub(super) fn counts_snapshot() -> [u64; 5] {
     std::array::from_fn(|k| COUNTS[k].load(Ordering::Relaxed))
+}
+
+/// Bound pipeline and graphics root signature on a PC command list (for frame record metadata).
+pub(super) fn frame_bind_ids(list: *mut c_void) -> (usize, usize) {
+    if STATES.contains(list as usize) {
+        with(list, |s| (s.pso, s.rs_gfx))
+    } else {
+        (0, 0)
+    }
 }
 
 #[cfg(test)]

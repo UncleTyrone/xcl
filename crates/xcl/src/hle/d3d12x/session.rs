@@ -87,10 +87,43 @@ pub fn forget_card_bytes(bytes: u64) {
 }
 
 pub fn card_buffers_room(bytes: u64) -> bool {
+    if !card_buffers_enabled() {
+        return false;
+    }
     let budget = card_buffers_budget_bytes();
     let tenth = budget / 10;
     let cap = budget.saturating_sub(tenth);
     card_bytes_charged().saturating_add(bytes) <= cap
+}
+
+/// Card buffer copies enabled (`XCL_CARD_BUFFERS`, default on; `=0` off).
+pub fn card_buffers_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_CARD_BUFFERS").is_none_or(|v| v != "0"))
+}
+
+/// `XCL_CARD_BUFFERS_MIN_MB` minimum card-copy buffer size.
+pub fn card_buffers_min_mb() -> u64 {
+    static MB: OnceLock<u64> = OnceLock::new();
+    *MB.get_or_init(|| env_mb(&["XCL_CARD_BUFFERS_MIN_MB", "VICTORY_CARD_BUFFERS_MIN_MB"], 0))
+}
+
+/// `XCL_CARD_WINDOWS_MB` extra UMA windows (default 0).
+pub fn card_windows_bytes() -> u64 {
+    static B: OnceLock<u64> = OnceLock::new();
+    *B.get_or_init(|| env_mb(&["XCL_CARD_WINDOWS_MB", "VICTORY_CARD_WINDOWS_MB"], 0) << 20)
+}
+
+/// `XCL_CARD_ROOM_FOR_BUFFERS` (default on unless `=0`).
+pub fn card_room_for_buffers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_CARD_ROOM_FOR_BUFFERS").is_none_or(|v| v != "0"))
+}
+
+/// `XCL_CARD_ROOM_FOR_TARGETS_MB` headroom for render targets.
+pub fn card_room_for_targets_mb() -> u64 {
+    static MB: OnceLock<u64> = OnceLock::new();
+    *MB.get_or_init(|| env_mb(&["XCL_CARD_ROOM_FOR_TARGETS_MB", "VICTORY_CARD_ROOM_FOR_TARGETS_MB"], 3072))
 }
 
 // ---------------------------------------------------------------------------------------

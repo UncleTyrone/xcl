@@ -112,6 +112,56 @@ pub fn exports() -> Vec<(&'static str, usize)> {
     crate::hle_exports![DStorageGetFactory]
 }
 
+fn dstorage_staging_floor_mb() -> u64 {
+    static MB: OnceLock<u64> = OnceLock::new();
+    *MB.get_or_init(|| {
+        std::env::var("XCL_DSTORAGE_STAGING_MB")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(256)
+    })
+}
+
+fn dstorage_retries() -> u32 {
+    static N: OnceLock<u32> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("XCL_DSTORAGE_RETRIES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(12)
+    })
+}
+
+fn dstorage_half_pages() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_DSTORAGE_HALF").is_ok_and(|v| v.trim() == "1"))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DstorageIo {
+    One,
+    Handles,
+    Overlapped,
+    Direct,
+}
+
+fn dstorage_io() -> DstorageIo {
+    static IO: OnceLock<DstorageIo> = OnceLock::new();
+    *IO.get_or_init(|| {
+        let io = match std::env::var("XCL_DSTORAGE_IO").ok().as_deref().map(str::trim) {
+            Some("one") => DstorageIo::One,
+            Some("handles") => DstorageIo::Handles,
+            Some("overlapped") => DstorageIo::Overlapped,
+            Some("direct") => DstorageIo::Direct,
+            _ => DstorageIo::Handles,
+        };
+        if std::env::var_os("XCL_DSTORAGE_IO").is_some() {
+            crate::xlog_info!("dstorage: XCL_DSTORAGE_IO={io:?}");
+        }
+        io
+    })
+}
+
 fn same(a: &GUID, b: &GUID) -> bool {
     (a.data1, a.data2, a.data3, a.data4) == (b.data1, b.data2, b.data3, b.data4)
 }
@@ -508,7 +558,14 @@ unsafe extern "system" fn factory_set_cpu_affinity(_p: *mut c_void, _mask: u64) 
 
 unsafe extern "system" fn factory_set_debug_flags(_p: *mut c_void, _flags: u32) {}
 
-unsafe extern "system" fn factory_set_staging_buffer_size(_p: *mut c_void, _bytes: u32) -> HRESULT {
+unsafe extern "system" fn factory_set_staging_buffer_size(_p: *mut c_void, bytes: u32) -> HRESULT {
+    let floor = dstorage_staging_floor_mb() << 20;
+    let size = u64::from(bytes).max(floor);
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) == 0 {
+        crate::xlog_info!("dstorage: staging {size} bytes (XCL_DSTORAGE_STAGING_MB, retries XCL_DSTORAGE_RETRIES={})", dstorage_retries());
+    }
+    let _ = (dstorage_half_pages(), dstorage_io());
     S_OK
 }
 

@@ -30,6 +30,21 @@ pub fn enabled() -> bool {
     *ON.get_or_init(|| super::port::land())
 }
 
+pub fn exact_back() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_EXACT_BACK").is_none_or(|v| v != "0"))
+}
+
+pub fn direct_writes() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_DIRECT_WRITES").is_none_or(|v| v != "0"))
+}
+
+pub fn fill_title() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_FILL_TITLE").is_ok_and(|v| v.trim() == "1"))
+}
+
 pub fn beside() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| super::port::land_beside())

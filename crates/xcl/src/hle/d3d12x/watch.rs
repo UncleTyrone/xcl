@@ -478,6 +478,38 @@ fn stop_asked(fault: bool) -> ! {
     super::real::end_title(0)
 }
 
+pub fn guard_ask_always() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_GUARD_ASK").is_ok_and(|v| v.trim() == "1"))
+}
+
+pub fn guard_hot_ms() -> u32 {
+    static MS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("XCL_GUARD_HOT")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+            .min(1000)
+    })
+}
+
+pub fn guard_rest_us() -> u32 {
+    static US: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *US.get_or_init(|| {
+        std::env::var("XCL_GUARD_REST")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|&us| us > 1)
+            .unwrap_or(3000)
+    })
+}
+
+pub fn guard_holes_extended() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_GUARD_HOLES").is_none_or(|v| v != "0"))
+}
+
 // ---------------------------------------------------------------------------------------
 // Land helpers (minimal block claims on this tree; full port-6 busy lives on amd-dev).
 // ---------------------------------------------------------------------------------------

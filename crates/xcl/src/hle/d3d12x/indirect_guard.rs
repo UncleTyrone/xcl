@@ -67,9 +67,9 @@ pub(super) enum Counts {
 }
 
 fn on(kind: Counts) -> bool {
-    static MODE: LazyLock<u32> = LazyLock::new(|| match std::env::var("XCL_INDIRECT_GUARD").as_deref().map(str::trim) {
-        Ok("0") => 0,
-        Ok("dispatch") => 1,
+    static MODE: LazyLock<u32> = LazyLock::new(|| match std::env::var("XCL_INDIRECT_GUARD").ok().as_deref().map(str::trim) {
+        Some("0") => 0,
+        Some("dispatch") => 1,
         _ => 2,
     });
     *MODE == 2 || (*MODE == 1 && kind == Counts::Dispatch)

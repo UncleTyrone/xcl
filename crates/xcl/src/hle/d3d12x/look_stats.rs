@@ -15,9 +15,9 @@ use std::time::Duration;
 /// `XCL_LOOK_STATS`: 1 the lines of the looks, 2 those and the splits; 0 when unset
 fn level() -> u8 {
     static LEVEL: OnceLock<u8> = OnceLock::new();
-    *LEVEL.get_or_init(|| match std::env::var("XCL_LOOK_STATS").as_deref().map(str::trim) {
-        Ok("1") => 1,
-        Ok("2") => 2,
+    *LEVEL.get_or_init(|| match std::env::var("XCL_LOOK_STATS").ok().as_deref().map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
         _ => 0,
     })
 }
