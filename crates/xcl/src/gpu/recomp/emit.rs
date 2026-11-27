@@ -56,6 +56,8 @@ pub(super) struct Em {
     cur_pc: u64,
     /// MIMG instruction address → its sampler's S# when the code builds it from constants
     pub static_ss: BTreeMap<u64, [u32; 4]>,
+    /// Memory instruction address → SRSRC words when built from constants ([`constant_srsrc`])
+    pub static_sr: BTreeMap<u64, [u32; 4]>,
     /// the static samplers sampled with: (S#, comparison), in register order
     pub static_used: Vec<([u32; 4], bool)>,
     /// highest VGPR the program references (v_movrel* ranges)
@@ -636,6 +638,7 @@ impl Em {
             upper: None,
             cur_pc: 0,
             static_ss: BTreeMap::new(),
+            static_sr: BTreeMap::new(),
             static_used: Vec::new(),
             max_vgpr: 0,
             has_f16_round_op: false,
@@ -797,6 +800,23 @@ impl Em {
             }
             None => "0u".into(),
         }
+    }
+
+    fn buffer_sr(&mut self, pc: u64, srsrc: u64) -> (String, String, String, String) {
+        if let Some(w) = self.static_sr.get(&pc) {
+            return (
+                format!("{}u", w[0]),
+                format!("{}u", w[1]),
+                format!("{}u", w[2]),
+                format!("{}u", w[3]),
+            );
+        }
+        (
+            self.sreg(srsrc),
+            self.sreg(srsrc + 1),
+            self.sreg(srsrc + 2),
+            self.sreg(srsrc + 3),
+        )
     }
 
     fn vreg(&mut self, n: u64) -> String {
@@ -2164,7 +2184,7 @@ impl Em {
         let (vdata, vaddr, srsrc) = (f("VDATA"), f("VADDR"), Self::field(d, "SRSRC"));
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
-        let (d0, d1, d2, d3) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2), self.sreg(srsrc + 3));
+        let (d0, d1, d2, d3) = self.buffer_sr(d.pc, srsrc);
         let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
@@ -4338,7 +4358,7 @@ impl Em {
         let (vdata, vaddr, srsrc) = (f("VDATA"), f("VADDR"), Self::field(d, "SRSRC"));
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
-        let (d0, d1, d2) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2));
+        let (d0, d1, d2, _) = self.buffer_sr(d.pc, srsrc);
         let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
@@ -4396,7 +4416,7 @@ impl Em {
         let (vdata, vaddr, srsrc) = (f("VDATA"), f("VADDR"), Self::field(d, "SRSRC"));
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
-        let (d0, d1, d2) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2));
+        let (d0, d1, d2, _) = self.buffer_sr(d.pc, srsrc);
         let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
