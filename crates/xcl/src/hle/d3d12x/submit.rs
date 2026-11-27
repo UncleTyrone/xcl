@@ -94,3 +94,7 @@ pub unsafe fn run_async_mapped(queue: *mut c_void, mapped: Vec<*mut c_void>) -> 
 pub fn driver_execute<R>(f: impl FnOnce() -> R) -> R {
     pause_refresh(f)
 }
+
+pub fn present_may_queue() -> bool {
+    super::late_wait::present_ahead() && super::port::async_submit()
+}
