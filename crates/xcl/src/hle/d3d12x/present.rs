@@ -1215,6 +1215,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
             }
             p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
             if comp.record(&p.dev, &p.list, &bb, w, h, fmt, &resolved, p.ring.cur) {
+                super::panel_gpu::draw(&p.dev, &p.list, &bb, fmt, w, h, D3D12_RESOURCE_STATE_RENDER_TARGET);
                 if due {
                     p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
                     let bb_desc = bb.GetDesc();
@@ -1227,6 +1228,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
                 }
                 composited = true;
             } else {
+                super::panel_gpu::draw(&p.dev, &p.list, &bb, fmt, w, h, D3D12_RESOURCE_STATE_RENDER_TARGET);
                 p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
             }
         } else {
@@ -1265,6 +1267,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
                 dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
             }
         }
+        super::panel_gpu::draw(&p.dev, &p.list, &bb, fmt, w, h, D3D12_RESOURCE_STATE_COPY_DEST);
         let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
         p.list.ResourceBarrier(&b2);
     }

@@ -54,9 +54,10 @@ Usage:
                [--warm <hashes.txt|all>]
       Offline translator pass (forwards to `shaders --recomp`; --validate → --direct --validate).
       --warm hashes.txt|all: DXIL-cache-only warm (CGBJ translate --warm; XCL_WARM_SECONDS caps time).
-  xcl warm <file | folder | package.rpf> [--jobs N] [--used-only] [--limit N] [--again]
+  xcl warm <file | folder | package.rpf> [--jobs N] [--used-only] [--limit N] [--again] [--no-book]
       Precompile + build pipelines into DXIL / driver / .plib caches (`shaders --precompile --pipelines`).
       --limit caps how many; --again rebuilds even when warm-done.txt already lists them.
+      Enables XCL_PIPELINE_BOOK for pipeline-library warm unless --no-book.
   xcl replay <capture-dir> [--json] [--frame N] [--listing] [--wire] [--fences] [--present]
            [--no-execute] [--at N] [--run <game>] [-- args]
            [--edit] [--skip-draws] [--skip-dispatches] [--meta-only] [--lists A..B] [--out DIR]
@@ -218,9 +219,11 @@ fn translate_cmd(path: &std::path::Path, args: &[String]) -> i32 {
 /// `xcl warm`: precompile shaders and host pipelines into caches (.pso + .plib).
 fn warm_cmd(path: &std::path::Path, args: &[String]) -> i32 {
     let mut fwd = vec!["--precompile".to_string(), "--pipelines".to_string()];
+    let mut book = true;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--no-book" => book = false,
             "--used-only" | "--used" => fwd.push("--used-only".into()),
             "--again" => fwd.push("--again".into()),
             "--limit" => {
@@ -256,6 +259,9 @@ fn warm_cmd(path: &std::path::Path, args: &[String]) -> i32 {
             }
         }
         i += 1;
+    }
+    if book {
+        std::env::set_var("XCL_PIPELINE_BOOK", "1");
     }
     xcl::shaders::run(path, &fwd)
 }
