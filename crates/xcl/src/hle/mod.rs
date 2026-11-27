@@ -12,6 +12,7 @@ use crate::util::glob_match;
 
 pub mod api_cost;
 pub mod acphal;
+pub mod audio_capture;
 pub mod bcpack;
 pub mod bink;
 pub mod d3d12_layout;
@@ -25,6 +26,7 @@ pub mod mfplat;
 pub mod netoff;
 pub mod opus;
 pub mod playstation;
+pub mod shape_xma;
 pub mod user;
 pub mod xaudio2;
 pub mod xma2;

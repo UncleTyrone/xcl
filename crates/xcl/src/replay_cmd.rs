@@ -1,12 +1,18 @@
-//! `xcl replay` – inspect an `XCL_RECORD` capture and optionally run a title with `XCL_REPLAY`.
+//! `xcl replay` – inspect / edit / compare an `XCL_RECORD` capture and optionally run a title.
 //!
 //! Same-process list re-issue only: the capture must be replayed while the title is live with
-//! still-valid GPU pointers. This is the CLI entry for the existing `frame_replay` path, not a
-//! full offline VICFRAME player (COM command-list handles cannot be rebuilt cross-process).
+//! still-valid GPU pointers. Offline `--listing` / `--edit` / `--pixel` / `--diverge` operate on
+//! `XCLFRAME` wire blobs without a GPU. This is not a full cross-process VICFRAME player (COM
+//! command-list handles cannot be rebuilt from payload bytes alone).
 
 use std::path::{Path, PathBuf};
 
-/// Summarise a capture folder, apply replay env knobs, and optionally `xcl run` a title.
+use crate::hle::d3d12x::{
+    cli_diverge, cli_edit, cli_listing, cli_pixel, frame_replay_inspect, parse_point, parse_range,
+    parse_wh, EditOpts,
+};
+
+/// Summarise a capture folder, run offline tools, apply replay env knobs, and optionally `xcl run`.
 pub fn run(folder: &Path, args: &[String]) -> i32 {
     let mut loops_hint = 1u32;
     let mut wire = false;
@@ -15,10 +21,20 @@ pub fn run(folder: &Path, args: &[String]) -> i32 {
     let mut present = false;
     let mut contents = true;
     let mut json = false;
+    let mut listing = false;
+    let mut edit = false;
+    let mut diverge = false;
+    let mut write_diverge_report = true;
     let mut at = 0u64;
     let mut frame_filter: Option<u64> = None;
     let mut run_target: Option<PathBuf> = None;
     let mut title_args: Vec<String> = Vec::new();
+    let mut edit_opts = EditOpts::default();
+    let mut out_dir: Option<PathBuf> = None;
+    let mut points: Vec<(u32, u32)> = Vec::new();
+    let mut picture: Option<(u32, u32)> = None;
+    let mut compare_dir: Option<PathBuf> = None;
+    let mut against_dir: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -28,6 +44,22 @@ pub fn run(folder: &Path, args: &[String]) -> i32 {
             "--present" => present = true,
             "--no-contents" => contents = false,
             "--json" => json = true,
+            "--listing" | "--list-ops" => listing = true,
+            "--edit" => edit = true,
+            "--skip-draws" => {
+                edit = true;
+                edit_opts.skip_draws = true;
+            }
+            "--skip-dispatches" => {
+                edit = true;
+                edit_opts.skip_dispatches = true;
+            }
+            "--meta-only" | "--barriers-only" => {
+                edit = true;
+                edit_opts.meta_only = true;
+            }
+            "--diverge" => diverge = true,
+            "--no-diverge-report" => write_diverge_report = false,
             "--at" => {
                 i += 1;
                 let Some(v) = args.get(i) else {
@@ -70,6 +102,77 @@ pub fn run(folder: &Path, args: &[String]) -> i32 {
                     }
                 };
             }
+            "--lists" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("xcl replay: --lists needs A..B");
+                    return 2;
+                };
+                match parse_range(v) {
+                    Ok(r) => {
+                        edit = true;
+                        edit_opts.only_lists = Some(r);
+                    }
+                    Err(e) => {
+                        eprintln!("xcl replay: {e}");
+                        return 2;
+                    }
+                }
+            }
+            "--out" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("xcl replay: --out needs a directory");
+                    return 2;
+                };
+                edit = true;
+                out_dir = Some(PathBuf::from(v));
+            }
+            "--pixel" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("xcl replay: --pixel needs x,y");
+                    return 2;
+                };
+                match parse_point(v) {
+                    Ok(p) => points.push(p),
+                    Err(e) => {
+                        eprintln!("xcl replay: {e}");
+                        return 2;
+                    }
+                }
+            }
+            "--of" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("xcl replay: --of needs WxH");
+                    return 2;
+                };
+                match parse_wh(v) {
+                    Ok(wh) => picture = Some(wh),
+                    Err(e) => {
+                        eprintln!("xcl replay: {e}");
+                        return 2;
+                    }
+                }
+            }
+            "--compare" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("xcl replay: --compare needs a capture directory");
+                    return 2;
+                };
+                compare_dir = Some(PathBuf::from(v));
+            }
+            "--against" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("xcl replay: --against needs a capture directory");
+                    return 2;
+                };
+                against_dir = Some(PathBuf::from(v));
+                diverge = true;
+            }
             "--run" => {
                 i += 1;
                 let Some(v) = args.get(i) else {
@@ -99,18 +202,83 @@ pub fn run(folder: &Path, args: &[String]) -> i32 {
         return 2;
     }
 
-    match crate::hle::d3d12x::frame_replay_inspect(folder, json, frame_filter) {
-        Ok(s) => println!("{s}"),
-        Err(e) => {
-            eprintln!("xcl replay: {e}");
-            return 3;
+    let offline_only = listing || edit || diverge || !points.is_empty() || compare_dir.is_some();
+
+    if !offline_only || run_target.is_some() {
+        match frame_replay_inspect(folder, json && !offline_only, frame_filter) {
+            Ok(s) => {
+                if !offline_only || run_target.is_some() {
+                    println!("{s}");
+                }
+            }
+            Err(e) => {
+                // Allow tooling on wire-only folders that lack index.jsonl when not --run.
+                if run_target.is_some() || !offline_only {
+                    eprintln!("xcl replay: {e}");
+                    return 3;
+                }
+            }
+        }
+    }
+
+    if listing {
+        match cli_listing(folder, frame_filter, json) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("xcl replay listing: {e}");
+                return 3;
+            }
+        }
+    }
+
+    if edit {
+        let out = out_dir.as_deref();
+        match cli_edit(folder, &edit_opts, out, frame_filter, json) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("xcl replay edit: {e}");
+                return 3;
+            }
+        }
+    }
+
+    if !points.is_empty() || compare_dir.is_some() {
+        match cli_pixel(
+            folder,
+            &points,
+            picture,
+            compare_dir.as_deref(),
+            frame_filter,
+            json,
+        ) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("xcl replay pixel: {e}");
+                return 3;
+            }
+        }
+    }
+
+    if diverge {
+        match cli_diverge(
+            folder,
+            against_dir.as_deref().or(compare_dir.as_deref()),
+            frame_filter,
+            write_diverge_report,
+            json,
+        ) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("xcl replay diverge: {e}");
+                return 3;
+            }
         }
     }
 
     if run_target.is_none() {
-        if !json {
+        if !json && !offline_only {
             println!(
-                "\nInspect only. To replay in-process during a title run:\n  xcl replay \"{dir}\" --run <game> [--wire] [--fences] [--present] [--at N]",
+                "\nInspect only. Offline tools:\n  xcl replay \"{dir}\" --listing\n  xcl replay \"{dir}\" --edit --skip-draws [--out edited]\n  xcl replay \"{dir}\" --pixel 100,200 --of 1280x720\n  xcl replay \"{dir}\" --diverge --against <other-capture>\nIn-process replay:\n  xcl replay \"{dir}\" --run <game> [--wire] [--fences] [--present] [--at N]",
                 dir = folder.display()
             );
             println!("  (sets XCL_REPLAY; same-process GPU pointers required — not a cross-process player)");

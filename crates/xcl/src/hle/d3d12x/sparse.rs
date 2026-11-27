@@ -727,14 +727,13 @@ const VS_NOW: usize = 11;
 const MIRROR_ASKS_MAX: usize = 4096;
 
 /// Committed pages of the CPU views filled into tiles given video memory at a submit at most
-/// (`XCL_MIRROR_FILL_MB`, 256 MB by default; at least a page; with 16 MB a close-up's mesh
-/// data was asked for at a submit and drawn with part of it still unfilled, as shards and
-/// slabs on the heads of a title's characters): the fills are hashed and go
+/// (`XCL_MIRROR_FILL_MB`, 1024 MB by default; at least a page; it was 16 MB: a mesh whose
+/// data was asked for at a submit then drew with part of it still unfilled, as shards): the fills are hashed and go
 /// through the staging ring on the title's submitting thread, with the state's lock held.
 fn fill_pages() -> usize {
     static PAGES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *PAGES.get_or_init(|| {
-        let mb = std::env::var("XCL_MIRROR_FILL_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(256);
+        let mb = std::env::var("XCL_MIRROR_FILL_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1024);
         (mb.saturating_mul(1 << 20) / PAGE).max(1)
     })
 }
@@ -852,6 +851,7 @@ pub(super) fn note_look() {
 /// is still all zeros).
 #[inline]
 fn scan_page(page: &[u8], pg: usize, slot: &mut Option<Box<[u64; CHUNKS]>>, out: &mut Vec<(usize, usize)>) {
+    super::constants::fill_before_read(pg, PAGE);
     if let Some(sent) = slot.as_deref_mut() {
         for (k, c) in page.chunks_exact(CHUNK).enumerate() {
             let h = chunk_hash(c);
@@ -1913,6 +1913,10 @@ impl State {
         if clean {
             self.sync_sent_range(va, (bytes & 0x7f) as usize);
         }
+        let n = (bytes & 0x7f) as usize;
+        let mut wrote = [0u8; 8];
+        wrote[..n.min(8)].copy_from_slice(&value.to_le_bytes()[..n.min(8)]);
+        super::constants::shader_wrote(va, &wrote[..n]);
     }
 
     /// A copy back's list and a readback buffer of at least `need` bytes (reused when one fits)
@@ -4637,6 +4641,22 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
         *s.pinned.entry(tile).or_default() += 1;
     }
     s.buffers.insert(raw as usize, tiles);
+    // Host shadow directory: title buffer at the window-aligned start (shaders reach by VA).
+    super::shadow::register(raw as usize, start as u64, (delta + bytes) as u64);
+    if super::constants::wants_card_copy(d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS), bytes as u64) {
+        if super::session::card_buffers_room(bytes as u64) {
+            super::constants::card_register(raw as usize, va, bytes as u64);
+            super::session::note_card_bytes(bytes as u64);
+        } else {
+            static CARD_FULL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if CARD_FULL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+                crate::xlog_warn!(
+                    "D3D12.X: card buffer copy refused — past XCL_CARD_BUFFERS_MB ({} MiB budget)",
+                    super::session::card_buffers_budget_mb(),
+                );
+            }
+        }
+    }
     s.signal();
     Some((hr, delta))
 }
