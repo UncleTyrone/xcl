@@ -2326,6 +2326,9 @@ unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12
     });
     super::view_want::want(super::view_want::Path::Cbv, va, size as u64);
     super::console_heap::write(&slot, &words);
+    if va != 0 {
+        let _ = super::card_steps::defer_fill_to_prelude(va as usize, size as usize, cpu);
+    }
 }
 
 /// The V# of a constant buffer view of `size` bytes at `va`, when shaders reach it there: the
@@ -9284,6 +9287,9 @@ unsafe fn execute_command_lists_body(this: *mut c_void, lists: &[*mut c_void]) {
     super::capture::submit(this, lists);
     let _in_pc = super::pso_async::pc_call();
     super::watch::wait_while_held();
+    if !super::late_wait::relax_relay_wait_before_submit() {
+        super::relay::wait_before_submit();
+    }
     let submit_t0 = std::time::Instant::now();
     super::submit::begin_refresh();
     super::title_textures::refresh_for(this, lists);
@@ -9322,8 +9328,10 @@ pub(super) unsafe fn execute_mapped_lists(this: *mut c_void, mapped: &[*mut c_vo
     type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12CommandQueue", "ExecuteCommandLists")));
     super::list_x::note_queue_for_lists(this as usize, mapped);
+    let _card = super::card_steps::try_prep_before_lists(this, mapped);
+    let relay_through = super::relay::submit_order();
     let submit_chunk = |chunk: &[*mut c_void]| {
-        let _fid = super::late_wait::begin_chunk(this as usize, 0);
+        let _fid = super::late_wait::begin_chunk(this as usize, relay_through);
         unsafe { super::late_wait::settle_bop_before_submit(this) };
         let t = std::time::Instant::now();
         if super::alloc_pool::note_resubmits(this, chunk) > 0 {

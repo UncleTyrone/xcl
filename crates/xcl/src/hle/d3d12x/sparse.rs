@@ -2461,7 +2461,52 @@ pub fn queue() -> Option<ID3D12CommandQueue> {
     QUEUE.lock().unwrap().clone()
 }
 
+fn merge_submit_ranges(s: &State, ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && s.window_index(a).is_some()).collect();
+    filtered.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(filtered.len());
+    for (a, n) in filtered {
+        match merged.last_mut() {
+            Some(last) if a <= last.0.saturating_add(last.1) => {
+                let end = (last.0 + last.1).max(a + n);
+                last.1 = end - last.0;
+            }
+            _ => merged.push((a, n)),
+        }
+    }
+    merged
+}
+
+/// Synchronous sparse GPU→CPU readback (submit thread or relay worker).
+pub(super) unsafe fn readback_after_execute_sync(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
+    if ranges.is_empty() {
+        return;
+    }
+    let mut g = lock_for_submit();
+    let _held = holding(Holder::After);
+    let Some(s) = g.as_mut() else { return };
+    s.note_queue(queue);
+    let merged = merge_submit_ranges(s, ranges);
+    if merged.is_empty() {
+        return;
+    }
+    s.rb_value += 1;
+    let v = s.rb_value;
+    if queue.Signal(&s.rb_fence, v).is_ok() {
+        let _ = s.queue.Wait(&s.rb_fence, v);
+        super::list_x::note_internal_wait(s.queue.as_raw() as usize, "sparse readback behind a title queue (relay)", &s.rb_fence, v);
+    }
+    s.readback_ranges(&merged);
+    super::land::note_sparse_landed(&merged);
+}
+
 pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)], imms: &[(usize, u64, u8)]) {
+    if ranges.is_empty() && imms.is_empty() {
+        return;
+    }
+    let deferred = !ranges.is_empty()
+        && super::relay::defer_sparse_readback(queue.as_raw() as *mut std::ffi::c_void, ranges);
+    let ranges = if deferred { &[][..] } else { ranges };
     if ranges.is_empty() && imms.is_empty() {
         return;
     }
@@ -2620,6 +2665,7 @@ impl State {
             super::list_x::note_internal_wait(s.queue.as_raw() as usize, "sparse readback behind a title queue", &s.rb_fence, v);
         }
         s.readback_ranges(&merged);
+        super::land::note_sparse_landed(&merged);
     }
 }
 
@@ -2665,7 +2711,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
         }
         pg = tile_end;
     }
-    dirty_runs = super::card_rehash::join_runs(dirty_runs);
+    dirty_runs = super::card_steps::join_compare_runs(dirty_runs);
     if !dirty_runs.is_empty() {
         s.upload_dirty(&dirty_runs);
     }
@@ -4476,7 +4522,7 @@ impl State {
             let (scanned, unchanged) = own_scanned(&found, &pages, &dirty_runs);
             super::look_stats::own_writes(written, found.len(), scanned, unchanged);
         }
-        dirty_runs = super::card_rehash::join_runs(dirty_runs);
+        dirty_runs = super::card_steps::join_compare_runs(dirty_runs);
         PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Ordering::Relaxed);
         PHASES[3].fetch_add((zero_runs.len() + dirty_runs.len()) as u64, Ordering::Relaxed);
         // Submit tile clears before CPU writes so overlapping CopyBufferRegion destinations have no WAW hazard.

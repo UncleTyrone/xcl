@@ -478,6 +478,27 @@ fn stop_asked(fault: bool) -> ! {
     super::real::end_title(0)
 }
 
+// ---------------------------------------------------------------------------------------
+// Land helpers (minimal block claims on this tree; full port-6 busy lives on amd-dev).
+// ---------------------------------------------------------------------------------------
+
+pub(crate) struct BlockClaims {
+    _blocks: Vec<usize>,
+}
+
+pub(crate) fn claim_blocks(blocks: &[usize]) -> BlockClaims {
+    BlockClaims {
+        _blocks: blocks.to_vec(),
+    }
+}
+
+static LANDED_BLOCKS: AtomicU64 = AtomicU64::new(0);
+
+/// Landing wrote title bytes in block `block` (`XCL_LAND_BESIDE` path).
+pub(crate) fn note_landed_block(_block: usize) {
+    LANDED_BLOCKS.fetch_add(1, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
