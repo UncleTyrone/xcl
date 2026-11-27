@@ -15,8 +15,8 @@
 //! - Differing-arm SCC `Select` lives in [`super::desc_trace`] (emit `select(scc,…)`)
 //! - Waterfall selected/remaining/retry structural meet + per-lane T# dwords 0..3 in desc_trace
 //!
-//! **Still out of scope vs full CGBJ:** nested multi-block waterfall BDD `meet` and full
-//! IR-level phi reconstruction (XCL uses decoded RDNA2 + structural waterfall proof instead).
+//! **Still out of scope vs full CGBJ:** per-compare Structured BDD `meet` in waterfalls and full
+//! IR-level phi reconstruction (XCL: `desc_trace::scan_waterfall_loops` + SPLIT refusal + lane_masks).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
