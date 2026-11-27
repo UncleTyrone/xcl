@@ -2024,6 +2024,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     em.static_sr = constant_srsrc(&insts, &leaders, follow_sgpr);
     let desc = desc_trace::trace(&insts);
     em.lane_heap = desc.lane_heap;
+    em.lane_tsharp = desc.lane_tsharp;
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
     // continues from the ES into the GS through s_setpc: left as it is); pixel shaders: they
     // skip the quad reads that give the helper lanes' bits
