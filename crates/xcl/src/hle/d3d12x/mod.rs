@@ -11,6 +11,7 @@
 
 mod alloc_pool;
 mod ambient;
+mod bake_upload;
 pub mod bind;
 pub(crate) mod clamp;
 pub mod console_heap;
@@ -46,7 +47,9 @@ pub mod list_x;
 pub mod memory_report;
 pub mod null;
 pub(crate) mod pcores;
+mod bvh_env;
 mod place_times;
+mod session;
 pub mod port;
 pub(crate) mod port_constants;
 pub(crate) mod port_cbv;
@@ -63,6 +66,7 @@ pub mod sparse;
 mod standin;
 pub(crate) mod thin;
 mod texture_policy;
+mod texture_pool;
 mod texture_upload_ahead;
 pub mod title_list;
 pub(crate) mod port_journal;

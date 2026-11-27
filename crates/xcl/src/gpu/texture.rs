@@ -283,6 +283,10 @@ impl<T> StagingPool<T> {
         }
     }
 
+    fn live_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
     fn acquire(&mut self, bytes: u64) -> Option<(u64, T)> {
         let bucket = staging_pool_bucket(bytes)?;
         let list = self.buckets.get_mut(&bucket)?;
@@ -410,6 +414,11 @@ impl Uploader {
             }
         }
         let cap = staging_capacity(bytes).ok_or("texture upload buffer size overflow")?;
+        let bake = crate::host_bake_upload::active();
+        if !crate::host_residency::allow_staging_growth(bake) {
+            crate::host_residency::note_staging_deferred();
+            return Err("texture upload: staging growth deferred (commit headroom)".into());
+        }
         // A cached uploader has passed its last copy fence. Return its old `<= 8 MiB` buffer to
         // the shared power-of-2 pool (or drop an oversized one) before acquiring the replacement
         // so the growth path does not keep two oversized buffers alive simultaneously.
@@ -434,12 +443,36 @@ impl Uploader {
                 return Ok((b, p));
             }
         }
-        let b = buffer(dev, cap)?;
+        let b = match buffer(dev, cap) {
+            Ok(b) => b,
+            Err(e) => {
+                crate::host_residency::note_staging_growth_failed();
+                return Err(e);
+            }
+        };
         let mut p = std::ptr::null_mut();
         b.Map(0, None, Some(&mut p)).map_err(err)?;
         self.staging = Some((b.clone(), p as *mut u8, cap));
         Ok((b, p as *mut u8))
     }
+}
+
+/// Bytes held in shared staging pools and per-queue upload buffers (for `XCL_RESIDENCY` telemetry).
+pub fn staging_live_bytes() -> u64 {
+    let mut bytes = 0u64;
+    if let Some(map) = STAGING_POOLS.lock().unwrap().as_ref() {
+        for pool in map.values() {
+            bytes = bytes.saturating_add(pool.live_bytes());
+        }
+    }
+    if let Some(map) = UPLOADERS.lock().unwrap().as_ref() {
+        for up in map.values() {
+            if let Some((_, _, cap)) = up.staging {
+                bytes = bytes.saturating_add(cap);
+            }
+        }
+    }
+    bytes
 }
 
 /// Reclaim idle upload staging buffers (unused for `>= 2 s` and `>= 30` frames, or immediately
@@ -772,9 +805,23 @@ unsafe fn buffer(dev: &ID3D12Device, size: u64) -> Result<ID3D12Resource, String
         ..Default::default()
     };
     let mut r: Option<ID3D12Resource> = None;
-    dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut r)
-        .map_err(|x| format!("texture upload buffer: {x}"))?;
-    r.ok_or_else(|| "texture upload buffer".into())
+    match dev.CreateCommittedResource(
+        &D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_UPLOAD,
+            ..Default::default()
+        },
+        D3D12_HEAP_FLAG_NONE,
+        &rd,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        None,
+        &mut r,
+    ) {
+        Ok(()) => r.ok_or_else(|| "texture upload buffer".into()),
+        Err(x) => {
+            crate::host_residency::allocation_error_hresult(x.code().0);
+            Err(format!("texture upload buffer: {x}"))
+        }
+    }
 }
 
 fn transition(r: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {

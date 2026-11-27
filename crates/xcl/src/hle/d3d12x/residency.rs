@@ -1,16 +1,11 @@
-//! Dynamic descriptor recycle and host-memory policy (CGBJ Phase 12 subset).
+//! Host-memory admission for texture prefetch and reusable upload storage (CGBJ Phase 12).
 //!
-//! `XCL_RESIDENCY=1` enables deferring dynamic descriptor ranges until the submit fence completes.
+//! Implemented in [`crate::host_residency`] so `gpu::texture` can gate staging growth without a
+//! `gpu` ↔ `hle` module cycle.
 
-use std::sync::OnceLock;
-
-/// `XCL_RESIDENCY=1` enables fence-deferred dynamic descriptor recycle (off by default).
-pub fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XCL_RESIDENCY").is_ok_and(|v| !(v.trim().is_empty() || v.trim() == "0")))
-}
-
-/// Hold `MIN_DYNAMIC..` ranges until the queue submit fence passes (`XCL_RESIDENCY=1`).
-pub fn defer_dynamic_slots() -> bool {
-    on()
-}
+pub use crate::host_residency::{coarse_ms, defer_dynamic_slots, on, refresh};
+pub(crate) use crate::host_residency::{
+    admit_texture_pass, allocation_error_hresult, allow_staging_growth, critical_commit, headroom,
+    limited_host_ram, live_staging_bytes, note_staging_deferred, note_staging_growth_failed, prefetch_limit,
+    pressured, set_live_staging_bytes, take_staging_deferred, upload_refused,
+};
