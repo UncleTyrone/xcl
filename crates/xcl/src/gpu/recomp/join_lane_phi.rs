@@ -7,16 +7,16 @@
 //! lane_heap_index HLSL/DXIL expressions).
 //!
 //! Depth:
-//! - [`only_edge`]-style sole-live predecessor (loop headers refused)
+//! - [`only_edge`]-style sole-live predecessor (loop headers refused; BDD polarity optional)
 //! - Dead edges do **not** seed join state (CGBJ `None` on unused edges)
-//! - [`live_peel_known`]: nested sole-live peel at record time (Tracer `live` analogue)
+//! - [`live_peel_known`]: nested sole-live peel at record time (Tracer `live` / `MAX_JOINS`)
 //! - SGPR copies / same-arm `s_cselect` / const SALU followed through blocks
 //! - Exec/lane polarity + [`lane_masks`] BDD join-edge liveness + Structured `guarded` PCs
-//! - Differing-arm SCC `Select` lives in [`super::desc_trace`] (emit `select(scc,…)`)
-//! - Waterfall selected/remaining/retry structural meet + per-lane T# dwords 0..3 in desc_trace
+//! - Differing-arm SCC `Select` / Fetched / Lanes / LanePhi live in [`super::desc_trace`]
+//! - Waterfall selected/remaining/retry structural meet + VCC/saveexec wiring + per-lane T#
 //!
-//! **Still out of scope vs full CGBJ:** per-compare Structured BDD `meet` in waterfalls and full
-//! IR-level phi reconstruction (XCL: `desc_trace::scan_waterfall_loops` + SPLIT refusal + lane_masks).
+//! **Still out of scope vs full CGBJ:** full Structured BDD `Bools::meet` on waterfall
+//! selected/remaining/retry atoms; IR-level SSA phi reconstruction.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 

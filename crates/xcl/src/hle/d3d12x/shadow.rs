@@ -5,16 +5,19 @@
 //! are current; a turn-robin sweep compares held bytes to title for diagnostics.
 //!
 //! GPL-2 reimplementation from understanding of CGBJ `victory-gpu` shadow @ `80e8619`
-//! (study only — not a paste). Card staging metadata, `copy_back` / `merge_under_writes`,
-//! `card_merge` / relay skip, wide snapshot pool, and idle let-go of loose windows deepen the
-//! core held/copied journal (full D3D12 card twins optional).
+//! (study only — not a paste). Card staging metadata + D3D12 UPLOAD/DEFAULT twins,
+//! `copy_back` / `merge_under_writes`, `card_merge` / relay skip, wide snapshot pool,
+//! inplace place, and idle let-go of loose windows deepen the core held/copied journal.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
+use windows::Win32::Graphics::Direct3D12::{ID3D12Heap, ID3D12Resource};
+
 use super::card_shadow;
+use super::inplace;
 use super::land;
 
 /// 4 KiB kernel page (copied-generation grain).
@@ -56,8 +59,10 @@ pub(crate) struct Shadow {
     /// Bitset of 4 KiB pages landed since last refresh look.
     landings: Mutex<Vec<u64>>,
     landing: AtomicBool,
-  /// Host card-side dirty journal for large buffers (see `card_shadow`).
+  /// Host card-side dirty journal + optional D3D12 staging/before twins (see `card_shadow`).
     card: Option<card_shadow::CardSide>,
+    /// In-place placed buffer over title memory (`XCL_INPLACE`); no host copy either way.
+    place: Option<(ID3D12Heap, ID3D12Resource, u64)>,
     window: bool,
     by_address: bool,
     /// Last touch for loose-window idle reclaim (`let_go_idle`).
@@ -194,7 +199,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
-        entry.shadow = Some(Shadow::new(key.0, len));
+        entry.shadow = Some(Shadow::make(key.0, len, false));
     }
     entry.shadow.clone()
 }
@@ -219,6 +224,52 @@ pub(crate) fn ensure(resource: usize, start: u64, len: u64) -> Option<Arc<Shadow
 }
 
 impl Shadow {
+    /// Prefer port-constants / inplace place for small buffers; else host copy (+ card twins).
+    fn make(start: u64, len: u64, window: bool) -> Arc<Self> {
+        // CGBJ: big card-sided buffers skip inplace (too hot on the PC bus).
+        let big = super::session::card_buffers_enabled()
+            && (super::session::card_all() || len >= super::session::card_buffers_min_bytes());
+        if let Some(p) = super::port_constants::place_for(start, len) {
+            inplace::counted(window, len);
+            return Self::placed(p.heap, p.buffer, p.bias, start, len, window);
+        }
+        if !big {
+            if let Some(p) = inplace::place_for(start, len, window) {
+                return Self::placed(p.heap, p.buffer, p.bias, start, len, window);
+            }
+        }
+        Self::new(start, len)
+    }
+
+    fn placed(
+        heap: ID3D12Heap,
+        buffer: ID3D12Resource,
+        bias: u64,
+        start: u64,
+        len: u64,
+        window: bool,
+    ) -> Arc<Self> {
+        let pages = pages_for(start, len);
+        LIVE.fetch_add(1, Ordering::Relaxed);
+        Arc::new(Self {
+            start,
+            len,
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            // No host mirror: shaders read/write title memory through the placed buffer.
+            held: Mutex::new(Vec::new()),
+            before: Mutex::new(None),
+            copied: Mutex::new(vec![0u64; pages]),
+            pending: Mutex::default(),
+            landings: Mutex::default(),
+            landing: AtomicBool::new(false),
+            card: None,
+            place: Some((heap, buffer, bias)),
+            window,
+            by_address: false,
+            used: Mutex::new(Some(Instant::now())),
+        })
+    }
+
     fn new(start: u64, len: u64) -> Arc<Self> {
         let pages = pages_for(start, len);
         LIVE.fetch_add(1, Ordering::Relaxed);
@@ -237,10 +288,25 @@ impl Shadow {
             landings: Mutex::default(),
             landing: AtomicBool::new(false),
             card,
+            place: None,
             window: false,
             by_address: false,
             used: Mutex::new(Some(Instant::now())),
         })
+    }
+
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
+    /// CPU staging + before twin handles when carded with D3D12 twins.
+    pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
+        self.card.as_ref()?.card_sides()
+    }
+
+    /// Make the DEFAULT "before" twin if missing (declared shader writes).
+    pub(crate) fn card_make_before(&self) -> bool {
+        self.card.as_ref().is_some_and(|c| c.ensure_before())
     }
 
     fn touch(&self) {
@@ -397,6 +463,9 @@ impl Shadow {
     }
 
     fn snapshot_before(&self) {
+        if self.in_place() {
+            return;
+        }
         let held = self.held.lock().unwrap_or_else(|e| e.into_inner());
         let n = held.len();
         if super::wide_back::enabled() && n > 0 {
@@ -418,6 +487,9 @@ impl Shadow {
     /// After shaders ran: merge card-held bytes that changed since the snapshot into title memory.
     /// Differing 64 KiB pieces are trimmed to first/last change; title gets dword-level `put_changed`.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+        if self.in_place() {
+            return 0;
+        }
         let before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let Some(ref snap) = *before else {
             return 0;
@@ -806,6 +878,10 @@ pub(crate) fn declare_gpu_writes(ranges: &[(usize, usize)]) {
         let Some(s) = find_for_read(va as u64, n as u64, super::relay::exact()) else {
             continue;
         };
+        if s.in_place() {
+            continue;
+        }
+        let _ = s.card_make_before();
         s.snapshot_before();
         let end = va.saturating_add(n);
         let lo = va.max(s.start as usize);
@@ -941,6 +1017,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         landings: Mutex::default(),
         landing: AtomicBool::new(false),
         card: None,
+        place: None,
         window: true,
         by_address: true,
         used: Mutex::new(Some(Instant::now())),
@@ -1053,6 +1130,38 @@ pub(crate) fn apply_wide_snapshots() {
 /// Drain deferred snapshot notes (tests / diagnostics).
 pub(crate) fn take_wide_snapshots() -> Vec<(u64, usize, usize)> {
     std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Drop in-place shadows whose title span overlaps `[at, at+len)` (memory remapped / freed).
+pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    let end = at.saturating_add(len);
+    let mut gone = 0u64;
+    {
+        let mut map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
+        for entry in map.values_mut() {
+            let Some(s) = entry.shadow.as_ref() else { continue };
+            if !s.in_place() {
+                continue;
+            }
+            let s0 = s.start;
+            let s1 = s.start.saturating_add(s.len);
+            if s0 < end && at < s1 {
+                if let Some((_, _, _)) = s.place.as_ref() {
+                    inplace::gone(s.window, s.len);
+                }
+                entry.shadow = None;
+                LIVE.fetch_sub(1, Ordering::Relaxed);
+                gone += 1;
+            }
+        }
+    }
+    if gone > 0 {
+        inplace::note_let_go(gone);
+    }
+    gone
 }
 
 /// Drop loose window copies held only by the directory and idle past the window policy.

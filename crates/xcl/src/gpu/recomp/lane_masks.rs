@@ -965,6 +965,20 @@ pub fn join_polarity(insts: &[Decoded], wave64: bool) -> R<BTreeMap<u64, Vec<(u6
     Ok(analyze(insts, wave64)?.join_edge_live)
 }
 
+/// Sole-live predecessor map from BDD join polarity (CGBJ Tracer `only_edge` subset).
+/// Join PC → sole live pred block-start PC when exactly one incoming edge is live.
+pub fn only_edges(insts: &[Decoded], wave64: bool) -> R<BTreeMap<u64, u64>> {
+    let pol = join_polarity(insts, wave64)?;
+    let mut out = BTreeMap::new();
+    for (join_pc, edges) in pol {
+        let live: Vec<u64> = edges.into_iter().filter(|(_, l)| *l).map(|(p, _)| p).collect();
+        if let [pred] = live[..] {
+            out.insert(join_pc, pred);
+        }
+    }
+    Ok(out)
+}
+
 /// Analyses a decoded program (far jumps resolved) that starts with every lane in EXEC.
 pub fn analyze(insts: &[Decoded], wave64: bool) -> R<Summary> {
     analyze_launch(insts, wave64, LaunchExec::All)

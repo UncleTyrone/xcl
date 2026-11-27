@@ -15,9 +15,9 @@
 //! | `List.commands` | `ListPayload` ops blob (`XLST` + draw/dispatch/indirect/mesh notes) |
 //! | `contents.bin` / `Content` | `ContentChunk` + `frames/frame_NNNN.contents.bin` |
 //! | `DescriptorHeap` spine | `HeapSnap` + GPU/CPU start handles (no slot-run codec) |
-//! | Present picture / PresentX | Present plane tail (resource + rect + GetDesc WH/format) + optional re-issue |
+//! | Present picture / PresentX | Present plane tail (WH/format) + sidecar `present.bin` texels when mappable |
 //! | Offline `victory replay` | `xcl replay` inspect + `--listing` / `--edit` / `--pixel` / `--diverge` |
-//! | `--pixel` / `--diverge` / edit | Offline `frame_tools` on wire blobs (no live GPU texel probe) |
+//! | `--pixel` / `--diverge` / edit | Offline `frame_tools`; live same-process content diverge via `XCL_REPLAY_DIVERGE` |
 //!
 //! **Cross-process (impossible on Windows host):** `ID3D12CommandList` / queue COM pointers and
 //! title GPU VAs are meaningless after the recording process exits or the device is torn down.
@@ -51,6 +51,8 @@
 //! | `XCL_REPLAY_FENCES` | Re-issue recorded queue `SignalX` fences | off |
 //! | `XCL_REPLAY_CONTENTS` | Re-hash live title memory vs wire samples/chunks | on when `XCL_REPLAY_WIRE` |
 //! | `XCL_REPLAY_PRESENT` | Re-issue `PresentX` with recorded planes (same process) | off |
+//! | `XCL_RECORD_PRESENT_BIN` | Dump mappable present plane texels to `present.bin` | on with `XCL_RECORD_WIRE` |
+//! | `XCL_REPLAY_DIVERGE` | Same-process live content-hash diverge vs recorded + prior frame | off |
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -89,6 +91,10 @@ struct Settings {
     replay_fences: bool,
     /// Re-issue PresentX from recorded planes (`XCL_REPLAY_PRESENT=1`).
     replay_present: bool,
+    /// Sidecar present.bin texel dump (`XCL_RECORD_PRESENT_BIN`).
+    write_present_bin: bool,
+    /// Same-process live content diverge (`XCL_REPLAY_DIVERGE=1`).
+    replay_diverge: bool,
     replay_skip_presents: u64,
 }
 
@@ -137,6 +143,11 @@ fn settings() -> &'static Settings {
         } else {
             env_on("XCL_RECORD_LISTS")
         };
+        let write_present_bin = if write_wire {
+            !env_off_explicit("XCL_RECORD_PRESENT_BIN")
+        } else {
+            env_on("XCL_RECORD_PRESENT_BIN")
+        };
         let replay_contents = if replay_wire {
             !env_off_explicit("XCL_REPLAY_CONTENTS")
         } else {
@@ -152,11 +163,13 @@ fn settings() -> &'static Settings {
             write_wire,
             write_contents,
             write_lists,
+            write_present_bin,
             replay_wire,
             replay_contents,
             replay_execute,
             replay_fences: env_on("XCL_REPLAY_FENCES"),
             replay_present: env_on("XCL_REPLAY_PRESENT"),
+            replay_diverge: env_on("XCL_REPLAY_DIVERGE"),
             replay_skip_presents: parse_u64("XCL_REPLAY_AT").unwrap_or(0),
         }
     })
@@ -172,11 +185,16 @@ static WRITER: Mutex<Option<std::fs::File>> = Mutex::new(None);
 static FRAME_BUF: Mutex<Vec<RecordedEvent>> = Mutex::new(Vec::new());
 static FRAME_BOUND_HEAP_PTRS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 static FRAME_CONTENTS_BIN: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+static FRAME_PRESENT_BIN: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+/// Session-level `contents.bin` append (CGBJ-style shared file across frames).
+static SESSION_CONTENTS_BIN: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 static KNOWN_HEAPS: Mutex<Vec<HeapEntry>> = Mutex::new(Vec::new());
 static LIST_OPS: OnceLock<Mutex<HashMap<usize, Vec<u8>>>> = OnceLock::new();
 static PENDING_PRESENT: Mutex<Option<PendingPresent>> = Mutex::new(None);
 static REPLAY_FRAMES: OnceLock<Mutex<ReplayCatalog>> = OnceLock::new();
 static REPLAY_CURSOR: AtomicU64 = AtomicU64::new(0);
+/// Prior-frame content keys for live diverge: `(va, len, hash)`.
+static LIVE_DIVERGE_PREV: Mutex<Vec<(u64, u32, u32)>> = Mutex::new(Vec::new());
 
 #[derive(Clone, Debug)]
 struct PendingPresent {
@@ -195,6 +213,18 @@ struct PresentPlaneRec {
     height: u32,
     #[serde(default)]
     format: u32,
+    /// Row pitch in `present.bin` (0 when texels not dumped).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pitch: u32,
+    /// Offset into this frame's `present.bin` (`u64::MAX` / omitted = none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_off: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hash: Option<u32>,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,6 +274,46 @@ fn plane_desc(resource: usize) -> (u32, u32, u32) {
         };
         let d = res.GetDesc();
         (d.Width as u32, d.Height, d.Format.0 as u32)
+    }
+}
+
+/// Best-effort texel dump for a present plane into `present.bin` (CPU-mapped buffers only).
+/// DEFAULT textures need a copy-list readback (`XCL_FRAME_DUMP`); here we estimate pitch only.
+fn try_dump_plane_texels(resource: usize, present_bin: &mut Vec<u8>) -> (u32, Option<u64>, Option<u32>) {
+    if resource == 0 || !settings().write_present_bin {
+        return (0, None, None);
+    }
+    const CAP: usize = 64 << 20;
+    let raw = resource as *mut std::ffi::c_void;
+    unsafe {
+        let Some(res) = ID3D12Resource::from_raw_borrowed(&raw) else {
+            return (0, None, None);
+        };
+        let d = res.GetDesc();
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_BUFFER;
+        if d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER {
+            let bpp = match d.Format.0 {
+                28 | 87 | 90 | 91 => 4u32,
+                24 => 4,
+                _ => 4,
+            };
+            let pitch = (d.Width as u32).saturating_mul(bpp);
+            return (pitch, None, None);
+        }
+        let size = d.Width as usize;
+        if size == 0 || size > CAP || present_bin.len() + size > CAP {
+            return (0, None, None);
+        }
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        if res.Map(0, None, Some(&mut ptr)).is_err() || ptr.is_null() {
+            return (0, None, None);
+        }
+        let bytes = std::slice::from_raw_parts(ptr as *const u8, size);
+        let hash = super::frame_wire::fnv1a32(bytes);
+        let file_off = present_bin.len() as u64;
+        present_bin.extend_from_slice(bytes);
+        res.Unmap(0, None);
+        (size as u32, Some(file_off), Some(hash))
     }
 }
 
@@ -328,18 +398,24 @@ pub fn note_present_context(queue: *mut c_void, planes: &[(usize, Option<[i32; 4
     if settings().record_dir.is_none() && settings().replay_dir.is_none() {
         return;
     }
+    let mut present_bin = FRAME_PRESENT_BIN.lock().unwrap();
+    present_bin.clear();
     let rec = PendingPresent {
         queue: queue as usize,
         planes: planes
             .iter()
             .map(|(r, rect)| {
                 let (width, height, format) = plane_desc(*r);
+                let (pitch, file_off, hash) = try_dump_plane_texels(*r, &mut present_bin);
                 PresentPlaneRec {
                     resource: *r,
                     rect: *rect,
                     width,
                     height,
                     format,
+                    pitch,
+                    file_off,
+                    hash,
                 }
             })
             .collect(),
@@ -476,6 +552,13 @@ fn content_events_at(va: u64, contents_bin: &mut Vec<u8>) -> Vec<RecordedEvent> 
     if contents_bin.len() + hash_len <= super::frame_wire::CONTENTS_BIN_SOFT_CAP {
         let file_off = contents_bin.len() as u64;
         contents_bin.extend_from_slice(bytes);
+        // Also append into the session-level contents.bin (CGBJ shared-file role).
+        {
+            let mut session = SESSION_CONTENTS_BIN.lock().unwrap();
+            if session.len() + hash_len <= super::frame_wire::CONTENTS_BIN_SOFT_CAP.saturating_mul(4) {
+                session.extend_from_slice(bytes);
+            }
+        }
         out.push(RecordedEvent::ContentChunk {
             va,
             len: hash_len as u32,
@@ -890,6 +973,9 @@ fn recorded_from_wire(events: &[super::frame_wire::WireEvent]) -> Vec<RecordedEv
                         width: p.width,
                         height: p.height,
                         format: p.format,
+                        pitch: 0,
+                        file_off: None,
+                        hash: None,
                     })
                     .collect(),
             }),
@@ -927,6 +1013,7 @@ fn flush_frame_file(frame: u64) {
     let Some(dir) = &s.record_dir else { return };
     let events = std::mem::take(&mut *FRAME_BUF.lock().unwrap());
     let contents = std::mem::take(&mut *FRAME_CONTENTS_BIN.lock().unwrap());
+    let present = std::mem::take(&mut *FRAME_PRESENT_BIN.lock().unwrap());
     let notes = std::mem::take(&mut *FRAME_NOTES.lock().unwrap());
     if events.is_empty() {
         return;
@@ -950,6 +1037,25 @@ fn flush_frame_file(frame: u64) {
         let bin_path = dir.join("frames").join(format!("frame_{frame:04}.contents.bin"));
         if let Err(e) = std::fs::write(&bin_path, &contents) {
             crate::xlog_warn!("D3D12.X: contents.bin write {}: {e}", bin_path.display());
+        }
+        // Session-level shared contents.bin (append snapshot of cumulative bytes).
+        let session = SESSION_CONTENTS_BIN.lock().unwrap().clone();
+        if !session.is_empty() {
+            let shared = dir.join("contents.bin");
+            if let Err(e) = std::fs::write(&shared, &session) {
+                crate::xlog_warn!("D3D12.X: session contents.bin write {}: {e}", shared.display());
+            }
+        }
+    }
+    if s.write_present_bin && !present.is_empty() {
+        let bin_path = dir.join("frames").join(format!("frame_{frame:04}.present.bin"));
+        if let Err(e) = std::fs::write(&bin_path, &present) {
+            crate::xlog_warn!("D3D12.X: present.bin write {}: {e}", bin_path.display());
+        }
+        // Also mirror last frame into session present.bin (CGBJ folder role).
+        let shared = dir.join("present.bin");
+        if let Err(e) = std::fs::write(&shared, &present) {
+            crate::xlog_warn!("D3D12.X: session present.bin write {}: {e}", shared.display());
         }
     }
     let notes_path = dir.join("frames").join(format!("frame_{frame:04}.notes.txt"));
@@ -1427,11 +1533,99 @@ fn try_replay_frame(frame_idx: usize, token: u64) {
         }
     }
 
+    if settings().replay_diverge {
+        live_diverge_frame(frame_idx, events, content_ok, content_bad);
+    }
+
     if submits > 0 || signals > 0 || skipped > 0 || presents > 0 || content_ok + content_bad + content_skip > 0 {
         crate::xlog_info!(
             "D3D12.X: XCL_REPLAY: frame {frame_idx}: {submits} submit(s), {signals} signal(s), {presents} present(s), {skipped} skipped; content ok={content_ok} mismatch={content_bad} unread={content_skip}"
         );
     }
+}
+
+/// Same-process live content diverge: recorded hashes vs live title memory, and vs prior frame.
+/// GPU multi-run picture diverge (CGBJ `diverge_picture`) remains unsupported offline.
+fn live_diverge_frame(frame_idx: usize, events: &[RecordedEvent], content_ok: u32, content_bad: u32) {
+    let mut now: Vec<(u64, u32, u32)> = Vec::new();
+    let mut findings = Vec::new();
+    for ev in events {
+        let (va, len, want) = match ev {
+            RecordedEvent::ContentSample { va, len, hash, .. }
+            | RecordedEvent::ContentChunk { va, len, hash, .. } => (*va, *len, *hash),
+            _ => continue,
+        };
+        match verify_content_sample(va, len, want) {
+            Some(false) => {
+                let live = read_live_hash(va, len);
+                findings.push(serde_json::json!({
+                    "kind": "live_vs_recorded",
+                    "frame_idx": frame_idx,
+                    "va": va,
+                    "len": len,
+                    "recorded_hash": want,
+                    "live_hash": live,
+                }));
+                if let Some(h) = live {
+                    now.push((va, len, h));
+                }
+            }
+            Some(true) => now.push((va, len, want)),
+            None => {}
+        }
+    }
+    {
+        let prev = LIVE_DIVERGE_PREV.lock().unwrap();
+        for &(va, len, h) in &now {
+            if let Some(&(_, _, ph)) = prev.iter().find(|p| p.0 == va && p.1 == len) {
+                if ph != h {
+                    findings.push(serde_json::json!({
+                        "kind": "frame_to_frame",
+                        "frame_idx": frame_idx,
+                        "va": va,
+                        "len": len,
+                        "prev_hash": ph,
+                        "hash": h,
+                    }));
+                }
+            }
+        }
+    }
+    *LIVE_DIVERGE_PREV.lock().unwrap() = now;
+    if findings.is_empty() && content_bad == 0 {
+        return;
+    }
+    if let Some(dir) = settings().replay_dir.as_ref() {
+        let report_dir = dir.join("diverge");
+        let _ = create_dir_all(&report_dir);
+        let path = report_dir.join(format!("live_{frame_idx:04}.json"));
+        let body = serde_json::json!({
+            "frame_idx": frame_idx,
+            "content_ok": content_ok,
+            "content_bad": content_bad,
+            "findings": findings,
+            "note": "Same-process live content diverge — GPU multi-run picture diverge unsupported",
+            "gpu_multi_run_diverge": "impossible",
+        });
+        if let Ok(s) = serde_json::to_string_pretty(&body) {
+            let _ = std::fs::write(&path, s);
+        }
+        crate::xlog_info!(
+            "D3D12.X: XCL_REPLAY_DIVERGE: frame {frame_idx}: {} finding(s) → {}",
+            findings.len(),
+            path.display()
+        );
+    }
+}
+
+fn read_live_hash(va: u64, len: u32) -> Option<u32> {
+    let p = va as usize;
+    let n = len as usize;
+    if p == 0 || n == 0 || !crate::gpu::shader::readable(p, n) {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(p as *const u8, n) };
+    Some(super::frame_wire::fnv1a32(bytes))
 }
 
 /// Offline inspect for `xcl replay <dir>` (no GPU device).
@@ -1628,6 +1822,9 @@ mod tests {
                     width: 8,
                     height: 8,
                     format: 28,
+                    pitch: 0,
+                    file_off: None,
+                    hash: None,
                 }],
             },
         ];

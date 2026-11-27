@@ -4277,7 +4277,15 @@ pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices:
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
     if let Some(list) = graphics_bound(this) {
         if draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
-            super::list_x::note_frame_draw(this, false, vertices, instances, first_vertex, 0);
+            super::list_x::note_frame_draw(
+                this,
+                false,
+                vertices,
+                instances,
+                first_vertex,
+                0,
+                first_instance,
+            );
             if super::ambient::has_sky_psos() {
                 let pso = pso_for_draw(with(this, |s| s.pso));
                 super::ambient::after_draw(this, pso);
@@ -4286,7 +4294,15 @@ pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices:
         }
         super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
         list.DrawInstanced(vertices, instances, first_vertex, first_instance);
-        super::list_x::note_frame_draw(this, false, vertices, instances, first_vertex, 0);
+        super::list_x::note_frame_draw(
+            this,
+            false,
+            vertices,
+            instances,
+            first_vertex,
+            0,
+            first_instance,
+        );
         if super::ambient::has_sky_psos() {
             let pso = pso_for_draw(with(this, |s| s.pso));
             super::ambient::after_draw(this, pso);
@@ -4340,6 +4356,7 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
         instances,
         first_index,
         base_vertex,
+        first_instance,
     );
 }
 
