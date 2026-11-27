@@ -11,13 +11,17 @@
 
 mod alloc_pool;
 pub mod bind;
+pub(crate) mod clamp;
 pub mod console_heap;
+mod heap_strides;
 pub mod console_list;
+mod depth_uav;
 pub mod device_x;
 pub mod dxgi_device;
 mod cpu_writes;
 pub mod dred;
 mod fence_x;
+mod format_alias;
 pub mod frame;
 pub mod guard;
 pub(crate) mod join;

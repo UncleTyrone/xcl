@@ -1710,6 +1710,8 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         super::sparse::forget_buffer(this as usize);
         super::vram::forget(this as usize);
         super::title_textures::forget(this as usize);
+        super::depth_uav::forget(this as usize);
+        super::format_alias::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
@@ -2037,6 +2039,11 @@ unsafe extern "system" fn dev_copy_descriptors_simple_x(this: *mut c_void, n: u3
     }
     let f: unsafe extern "system" fn(*mut c_void, u32, u64, u64, u32) = std::mem::transmute(orig_fn(this, 24));
     f(this, n, dst, src, ty);
+    if ty == D3D12_DESCRIPTOR_HEAP_TYPE_DSV.0 as u32 && n > 0 && super::depth_uav::any() {
+        let get_inc: unsafe extern "system" fn(*mut c_void, u32) -> u32 = std::mem::transmute(orig_fn(this, 15));
+        let inc = get_inc(this, ty) as usize;
+        super::depth_uav::copy_dsv(dst as usize, src as usize, n, inc);
+    }
 }
 
 /// #23 CopyDescriptors(dst ranges, src ranges, type): range by range over console slots.
@@ -2053,7 +2060,39 @@ unsafe extern "system" fn dev_copy_descriptors_x(this: *mut c_void, nd: u32, dst
         }
         type F = unsafe extern "system" fn(*mut c_void, u32, *const u64, *const u32, u32, *const u64, *const u32, u32);
         let f: F = std::mem::transmute(orig_fn(this, 23));
-        return f(this, nd, dsts, dsizes, ns, srcs, ssizes, ty);
+        f(this, nd, dsts, dsizes, ns, srcs, ssizes, ty);
+        if ty == D3D12_DESCRIPTOR_HEAP_TYPE_DSV.0 as u32 && !dsts.is_null() && !srcs.is_null() && nd > 0 && ns > 0 && super::depth_uav::any() {
+            let get_inc: unsafe extern "system" fn(*mut c_void, u32) -> u32 = std::mem::transmute(orig_fn(this, 15));
+            let inc = get_inc(this, ty) as usize;
+            let (mut di, mut si) = (0usize, 0usize);
+            let (mut d_rem, mut s_rem) = (0u32, 0u32);
+            let (mut d_cur, mut s_cur) = (0u64, 0u64);
+            loop {
+                while d_rem == 0 {
+                    if di >= nd as usize {
+                        return;
+                    }
+                    d_cur = *dsts.add(di);
+                    d_rem = if dsizes.is_null() { 1 } else { *dsizes.add(di) };
+                    di += 1;
+                }
+                while s_rem == 0 {
+                    if si >= ns as usize {
+                        return;
+                    }
+                    s_cur = *srcs.add(si);
+                    s_rem = if ssizes.is_null() { 1 } else { *ssizes.add(si) };
+                    si += 1;
+                }
+                let run = d_rem.min(s_rem);
+                super::depth_uav::copy_dsv(d_cur as usize, s_cur as usize, run, inc);
+                d_cur = d_cur.wrapping_add(run as u64 * inc as u64);
+                s_cur = s_cur.wrapping_add(run as u64 * inc as u64);
+                d_rem -= run;
+                s_rem -= run;
+            }
+        }
+        return;
     }
     // every descriptor as (dst, src) handle, ranges walked in step
     let step = if ty == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0 as u32 { SAMPLER_SLOT } else { SLOT } as u64;
@@ -2183,7 +2222,9 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
     if copy.is_none() {
         copy = ID3D12Resource::from_raw_borrowed(&res).and_then(|r| default_dsv(&r.GetDesc()));
     }
-    f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu)
+    let dsv_flags = copy.as_ref().map_or(0, |c| c.Flags.0 as u32);
+    f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu);
+    super::depth_uav::note_dsv(cpu as usize, res as usize, dsv_flags);
 }
 
 /// The view a DSV without a description has, for a depth buffer `pc_resource_desc` made
@@ -2321,6 +2362,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     }
     super::console_heap::publish(&slot, false);
     super::console_heap::note_resource(&slot, res as usize);
+    super::heap_strides::note_view(slot.index, res as usize);
     if super::present::trace_frame() && super::title_textures::address(res as usize).is_some() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 24 {
@@ -2424,7 +2466,10 @@ unsafe extern "system" fn dev_create_srv_at_x(this: *mut c_void, rdesc: *const u
         let words = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
         return super::console_heap::write(&slot, &words);
     }
-    dev_create_srv_x(this, resource_at(this, rdesc, va), &v, cpu);
+    let placed = super::format_alias::placed_srv_resource(this, rdesc, va, v.Format.0 as u32);
+    let res = placed.as_ref().map_or(std::ptr::null_mut(), Interface::as_raw);
+    dev_create_srv_x(this, res, &v, cpu);
+    drop(placed);
 }
 
 /// device #71: the same for an unordered access view ({ the PC's UAV desc; GPU address @0x28;
@@ -2442,7 +2487,10 @@ unsafe extern "system" fn dev_create_uav_at_x(this: *mut c_void, rdesc: *const u
         let words = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
         return super::console_heap::write(&slot, &words);
     }
-    dev_create_uav_x(this, resource_at(this, rdesc, va), std::ptr::null_mut(), &v, cpu);
+    let placed = super::format_alias::placed_uav_resource(this, rdesc, va, v.Format.0 as u32);
+    let res = placed.as_ref().map_or(std::ptr::null_mut(), Interface::as_raw);
+    dev_create_uav_x(this, res, std::ptr::null_mut(), &v, cpu);
+    drop(placed);
 }
 
 /// V# of `n` elements from element `first` of the buffer at `va`.
@@ -2646,6 +2694,10 @@ fn uav_companion_srv(
 }
 
 unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {
+    let orig_desc = desc.as_ref().copied();
+    if let Some((twin, view)) = super::depth_uav::resolve_uav(this, res, orig_desc.as_ref()) {
+        return dev_create_uav_checked_x(this, twin, std::ptr::null_mut(), &view, cpu);
+    }
     // the view's format as the PC's for the resource (B5G5R5A1 of a target made R8G8B8A8,
     // `device_x::pc_resource_desc`: an invalid call, the device removed)
     let mut copy = desc.as_ref().copied();
@@ -2695,6 +2747,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     pc_uav(slot.pc_uav);
     super::console_heap::publish(&slot, true);
     super::console_heap::note_resource(&slot, res as usize);
+    super::heap_strides::note_view(slot.index + 1, res as usize);
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
         // A null image UAV was already created and published at `slot.index + 1`. Create a
         // matching null companion SRV at `slot.index` and write a valid T# referencing
@@ -2860,6 +2913,11 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
         super::device_x::pc_initial_state_for_desc(orig_flags, pc_flags, state as u32)
     });
     let hr = dev_create_committed_resource(this, props, flags, desc, st as usize, clear, riid, ppv);
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        if let Some(ref raw_x) = (console_desc != 0 && crate::gpu::shader::readable(console_desc, 0x38)).then(|| (console_desc as *const [u8; 0x38]).read_unaligned()) {
+            super::depth_uav::register_if_depth_uav(this, *ppv, raw_x, st, state as u32);
+        }
+    }
     if hr < 0 {
         let pw = |o: usize| if props == 0 { 0 } else { *((props + o) as *const u32) };
         crate::xlog_warn!(
@@ -3305,7 +3363,11 @@ pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_v
             u(0), u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()), u(0x18), u(0x20), u(0x2C), u(0x30)
         );
     }
-    hr3.unwrap_or(hr2)
+    let out_hr = hr3.unwrap_or(hr2);
+    if out_hr >= 0 && is_texture && !ppv.is_null() && !(*ppv).is_null() {
+        super::depth_uav::register_if_depth_uav(this, *ppv, &x, st, state as u32);
+    }
+    out_hr
 }
 
 /// A texture the title placed in a heap by the console's size (`get_resource_allocation_info_x`
@@ -3339,6 +3401,9 @@ unsafe fn own_memory_if_larger_on_the_pc(this: *mut c_void, heap: usize, offset:
         // as in the past-the-end fallback: a state the PC refuses for this desc (e.g. UAV
         // without the UAV flag) – COMMON rather than falling back to the overlapping placement
         hr = dev_create_committed_resource(this, &h.Properties as *const _ as usize, 0, d.as_ptr() as usize, 0, clear, riid, ppv);
+    }
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        super::depth_uav::register_if_depth_uav(this, *ppv, &x, st, state as u32);
     }
     static N: AtomicU64 = AtomicU64::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -7086,6 +7151,9 @@ unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *co
 }
 
 unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rtvs: *const usize, single: i32, dsv: *const usize) {
+    if !dsv.is_null() {
+        super::depth_uav::before_bind_dsv(this, *dsv);
+    }
     type F = unsafe extern "system" fn(*mut c_void, u32, *const usize, i32, *const usize);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "OMSetRenderTargets")));
     f(this, n, rtvs, single, dsv);
