@@ -2087,6 +2087,10 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) {
     super::diag_env::on_refresh_start();
     super::library_env::note_boot();
     super::texture_env::on_refresh_start();
+    super::view_env::on_view_path();
+    super::wave_env::on_shader_path();
+    super::wide_env::on_refresh_path();
+    super::window_env::on_window_path();
     let _ = (
         super::texture_policy::texture_away_ms(),
         super::texture_policy::stale_rule(),

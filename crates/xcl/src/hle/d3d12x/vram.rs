@@ -123,6 +123,18 @@ static MADE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 pub fn arena_bytes() -> (usize, usize) {
     (ARENAS.lock().unwrap().bytes(), MADE_BYTES.load(std::sync::atomic::Ordering::Relaxed))
 }
+
+/// True when Windows available virtual commit (`ullAvailPageFile`) is below ~1.5 GiB.
+pub(super) fn commit_low() -> bool {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return false;
+    }
+    m.ullAvailPageFile < (1536 << 20)
+}
+
 static PLACED_TEXTURES: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
 /// A texture backed by one of the aliasable D3D12 heaps.

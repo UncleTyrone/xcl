@@ -14,6 +14,7 @@ static HEADROOM: AtomicU64 = AtomicU64::new(u64::MAX);
 static NEXT_COMMIT_SAMPLE: AtomicU64 = AtomicU64::new(0);
 static AVAILABLE_COMMIT: AtomicU64 = AtomicU64::new(u64::MAX);
 static RETRY_UPLOAD_AT: AtomicU64 = AtomicU64::new(0);
+static STAGING_GROW_BACKOFF_UNTIL: AtomicU64 = AtomicU64::new(0);
 static STAGING_LIVE: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
@@ -118,10 +119,16 @@ pub(crate) fn allow_staging_growth(bake: bool) -> bool {
         return true;
     }
     let now = coarse_ms();
-    if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
+    if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) || now < STAGING_GROW_BACKOFF_UNTIL.load(Ordering::Relaxed) {
         return false;
     }
     has_growth_reserve(sample_commit(now), bake)
+}
+
+pub(crate) fn note_staging_growth_failed() {
+    if on() {
+        STAGING_GROW_BACKOFF_UNTIL.store(coarse_ms().saturating_add(500), Ordering::Relaxed);
+    }
 }
 
 pub(crate) fn limited_host_ram() -> bool {

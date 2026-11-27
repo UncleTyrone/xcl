@@ -390,4 +390,19 @@ pub fn on_refresh_start() {
         host_rdna(),
         host_wave(),
     );
+    super::misc_env::on_refresh_start();
+    super::bench_env::on_boot();
+    let _ = (
+        super::partial_fill::bind_cache(),
+        super::partial_fill::bvh_builder(),
+        super::partial_fill::dump_targets(),
+        super::partial_fill::fast_cores(),
+        super::partial_fill::heap_sync(),
+        super::partial_fill::heap_sync_aside(),
+        super::partial_fill::pipeline_wait_ms(),
+        super::partial_fill::port_cbv_place(),
+        super::partial_fill::rdna_float(),
+        super::partial_fill::texture_budget_mb(),
+        super::partial_fill::warp(),
+    );
 }

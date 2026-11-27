@@ -31,6 +31,14 @@ pub fn console_pipes() -> PipeConfig {
     }
 }
 
+/// Bytes held in shared staging / upload buffers (nvidia tree: no pooled staging yet).
+pub fn staging_live_bytes() -> u64 {
+    0
+}
+
+/// Reclaim idle upload staging buffers under pressure (no-op until pooled staging lands).
+pub fn trim_idle_staging(_frame: u64, _low_commit: bool) {}
+
 /// Linear data of one subresource: `depth` slices (3D, else 1) of `rows` rows of `row_bytes`
 /// (elements: pixels or 4×4 blocks).
 #[derive(Clone, Debug, PartialEq, Eq)]

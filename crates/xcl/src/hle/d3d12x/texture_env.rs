@@ -209,6 +209,162 @@ pub fn take_parts() -> bool {
     })
 }
 
+/// Skip hash when write-watch says unchanged (`XCL_TEXTURE_GUARD`; default on).
+pub fn texture_guard() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = env_os("XCL_TEXTURE_GUARD", "VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0");
+        if env_os("XCL_TEXTURE_GUARD", "VICTORY_TEXTURE_GUARD").is_some_and(|v| v == "0") {
+            log_once("XCL_TEXTURE_GUARD", "=0 — hash every check");
+        }
+        on
+    })
+}
+
+/// Prefer hot textures every frame early on (`XCL_TEXTURE_HOT`; default on).
+pub fn texture_hot() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = env_os("XCL_TEXTURE_HOT", "VICTORY_TEXTURE_HOT").is_none_or(|v| v != "0");
+        if env_os("XCL_TEXTURE_HOT", "VICTORY_TEXTURE_HOT").is_some_and(|v| v == "0") {
+            log_once("XCL_TEXTURE_HOT", "=0 — every eighth frame only");
+        }
+        on
+    })
+}
+
+/// Idle-texture keep policy (`XCL_TEXTURE_KEEP`: unset adaptive, `0`/`1` older rules).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextureKeep {
+    Adaptive,
+    Off,
+    Long,
+}
+
+pub fn texture_keep() -> TextureKeep {
+    static KEEP: OnceLock<TextureKeep> = OnceLock::new();
+    *KEEP.get_or_init(|| {
+        let keep = match env_var("XCL_TEXTURE_KEEP", "VICTORY_TEXTURE_KEEP").as_deref().map(str::trim) {
+            Ok("0") => TextureKeep::Off,
+            Ok("1") => TextureKeep::Long,
+            _ => TextureKeep::Adaptive,
+        };
+        if env_os("XCL_TEXTURE_KEEP", "VICTORY_TEXTURE_KEEP").is_some() {
+            log_once("XCL_TEXTURE_KEEP", &format!("{keep:?}"));
+        }
+        keep
+    })
+}
+
+/// Whether keep is not explicitly `0` (host idle-ms path).
+pub fn texture_keep_enabled() -> bool {
+    !matches!(texture_keep(), TextureKeep::Off)
+}
+
+/// Whether sweep uses adaptive free-room keep (unset; not `0`/`1`).
+pub fn texture_keep_adaptive() -> bool {
+    matches!(texture_keep(), TextureKeep::Adaptive)
+}
+
+/// First upload skips write-watch / guards (`XCL_TEXTURE_ONCE`; default on).
+pub fn texture_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = env_os("XCL_TEXTURE_ONCE", "VICTORY_TEXTURE_ONCE").is_none_or(|v| v != "0");
+        if env_os("XCL_TEXTURE_ONCE", "VICTORY_TEXTURE_ONCE").is_some_and(|v| v == "0") {
+            log_once("XCL_TEXTURE_ONCE", "=0 — ask write-watch on first upload");
+        }
+        on
+    })
+}
+
+/// Percent of card budget left free for textures (`XCL_TEXTURE_ROOM_PERCENT`; default 90, clamp 50..=97).
+pub fn texture_room_percent() -> u64 {
+    static P: OnceLock<u64> = OnceLock::new();
+    *P.get_or_init(|| {
+        let p = env_var("XCL_TEXTURE_ROOM_PERCENT", "VICTORY_TEXTURE_ROOM_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(90, |percent| percent.clamp(50, 97));
+        if env_os("XCL_TEXTURE_ROOM_PERCENT", "VICTORY_TEXTURE_ROOM_PERCENT").is_some() {
+            log_once("XCL_TEXTURE_ROOM_PERCENT", &format!("{p}% room kept free"));
+        }
+        p
+    })
+}
+
+/// Skip reupload when host copy bytes match (`XCL_TEXTURE_SAME`; default on).
+pub fn texture_same() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = env_os("XCL_TEXTURE_SAME", "VICTORY_TEXTURE_SAME").is_none_or(|v| v != "0");
+        if env_os("XCL_TEXTURE_SAME", "VICTORY_TEXTURE_SAME").is_some_and(|v| v == "0") {
+            log_once("XCL_TEXTURE_SAME", "=0 — always reupload");
+        }
+        on
+    })
+}
+
+/// Per-frame staging budget override in MiB (`XCL_TEXTURE_STAGE_MB`; unset → heuristic).
+pub fn texture_stage_mb() -> Option<u64> {
+    static MB: OnceLock<Option<u64>> = OnceLock::new();
+    *MB.get_or_init(|| {
+        let mb = env_var("XCL_TEXTURE_STAGE_MB", "VICTORY_TEXTURE_STAGE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse().ok());
+        if let Some(mb) = mb {
+            log_once("XCL_TEXTURE_STAGE_MB", &format!("{mb} MiB per-frame staging"));
+        }
+        mb
+    })
+}
+
+pub fn texture_stage_bytes() -> Option<u64> {
+    texture_stage_mb().map(|mb| mb.saturating_mul(1 << 20))
+}
+
+/// Staging time slice in ms (`XCL_TEXTURE_STAGE_MS`; default 250).
+pub fn texture_stage_ms() -> u64 {
+    static MS: OnceLock<u64> = OnceLock::new();
+    *MS.get_or_init(|| {
+        let ms = env_var("XCL_TEXTURE_STAGE_MS", "VICTORY_TEXTURE_STAGE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(250);
+        if env_os("XCL_TEXTURE_STAGE_MS", "VICTORY_TEXTURE_STAGE_MS").is_some() {
+            log_once("XCL_TEXTURE_STAGE_MS", &format!("{ms} ms staging slice"));
+        }
+        ms
+    })
+}
+
+/// Idle texture reclaim (`XCL_TEXTURE_SWEEP`: unset batched, `0` off, `whole` all).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextureSweep {
+    Off,
+    Batched,
+    Whole,
+}
+
+pub fn texture_sweep() -> TextureSweep {
+    static MODE: OnceLock<TextureSweep> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = match env_var("XCL_TEXTURE_SWEEP", "VICTORY_TEXTURE_SWEEP").as_deref().map(str::trim) {
+            Ok("0") => TextureSweep::Off,
+            Ok("whole") => TextureSweep::Whole,
+            _ => TextureSweep::Batched,
+        };
+        if env_os("XCL_TEXTURE_SWEEP", "VICTORY_TEXTURE_SWEEP").is_some() {
+            log_once("XCL_TEXTURE_SWEEP", &format!("{mode:?}"));
+        }
+        mode
+    })
+}
+
+pub fn texture_sweep_on() -> bool {
+    !matches!(texture_sweep(), TextureSweep::Off)
+}
+
 /// Touch latches once from the texture refresh path so log-once fires early.
 pub fn on_refresh_start() {
     let _ = (
@@ -216,6 +372,15 @@ pub fn on_refresh_start() {
         texture_catchup(),
         texture_copy(),
         texture_fill(),
+        texture_guard(),
+        texture_hot(),
+        texture_keep(),
+        texture_once(),
+        texture_room_percent(),
+        texture_same(),
+        texture_stage_mb(),
+        texture_stage_ms(),
+        texture_sweep(),
         refresh_ahead(),
         refresh_check(),
         refresh_front(),
