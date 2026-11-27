@@ -2367,9 +2367,15 @@ pub fn fine_timer() {
         PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
     };
     let size = std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32;
+    // `XCL_EFFICIENCY_MODE=1` leaves execution-speed throttling alone (system choice).
+    let execution = if crate::hle::d3d12x::diag_env::efficiency_mode() {
+        0
+    } else {
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+    };
     let combined = PROCESS_POWER_THROTTLING_STATE {
         Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        ControlMask: execution | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
         StateMask: 0,
     };
     let mut kept = unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &combined as *const _ as *const c_void, size) } != 0;
@@ -2380,12 +2386,14 @@ pub fn fine_timer() {
             StateMask: 0,
         };
         kept = unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &timer_only as *const _ as *const c_void, size) } != 0;
-        let eco_only = PROCESS_POWER_THROTTLING_STATE {
-            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-            ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-            StateMask: 0,
-        };
-        unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &eco_only as *const _ as *const c_void, size) };
+        if execution != 0 {
+            let eco_only = PROCESS_POWER_THROTTLING_STATE {
+                Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+                StateMask: 0,
+            };
+            unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &eco_only as *const _ as *const c_void, size) };
+        }
     }
     let boosted = if priority_boost_enabled() {
         unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) != 0 }

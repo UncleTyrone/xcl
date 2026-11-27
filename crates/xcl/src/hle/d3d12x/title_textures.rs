@@ -1019,6 +1019,19 @@ unsafe fn wait_queue_uploads(queue: &ID3D12CommandQueue) {
 }
 
 unsafe fn refresh_once(queue: *mut c_void) {
+    super::ask_env::on_refresh_start();
+    super::render_env::on_refresh_start();
+    super::diag_env::on_refresh_start();
+    super::library_env::note_boot();
+    super::texture_env::on_refresh_start();
+    let _ = (
+        super::texture_policy::texture_away_ms(),
+        super::texture_policy::stale_rule(),
+        super::texture_policy::tabled_textures_keep(),
+        super::texture_env::refresh_ahead(),
+        super::texture_env::refresh_check(),
+        super::texture_env::refresh_front(),
+    );
     reclaim_completed_on_queue(queue as usize);
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
         super::texture_upload_ahead::wait_for(q);
@@ -1170,6 +1183,9 @@ unsafe fn refresh_once(queue: *mut c_void) {
     });
     seed_stream_recheck(&todo, &ranges, recheck_frame);
     let uploaded = !todo.is_empty();
+    if super::render_env::heap_textures() || super::render_env::heap_pass_aside() {
+        let _ = super::render_env::memory_card_bytes();
+    }
     let upload_prof = super::prof::span(super::prof::Kind::SubmitTextures);
     upload_all(todo, ID3D12CommandQueue::from_raw_borrowed(&queue));
     drop(upload_prof);
@@ -1400,7 +1416,10 @@ static STREAM_RECHECK_HITS: AtomicU64 = AtomicU64::new(0);
 /// `XCL_TEXTURE_STREAM_RECHECK=0` disables spaced-milestone fingerprinting for unwatched textures.
 fn stream_recheck_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XCL_TEXTURE_STREAM_RECHECK").map_or(true, |v| v.trim() != "0"))
+    *ON.get_or_init(|| {
+        super::render_env::heap_recheck()
+            && std::env::var("XCL_TEXTURE_STREAM_RECHECK").map_or(true, |v| v.trim() != "0")
+    })
 }
 
 /// Whether every 4 KiB page of `[src, src + len)` is covered by the sorted, disjoint
@@ -1493,10 +1512,17 @@ unsafe fn recheck_streamed_unwatched_at(watched: &[(usize, usize)], frame: u64) 
         if g.is_empty() {
             return;
         }
+        let spread = super::render_env::heap_spread();
         g.iter()
             .filter_map(|(&res, st)| {
                 let target = *STREAM_RECHECK_MILESTONES.get(st.stage as usize)?;
-                (frame.saturating_sub(st.base_frame) >= target).then_some((res, st.last_fp))
+                if frame.saturating_sub(st.base_frame) < target {
+                    return None;
+                }
+                if spread && (res.wrapping_mul(0x9E37_79B9) ^ frame as usize) % 16 != frame as usize % 16 {
+                    return None;
+                }
+                Some((res, st.last_fp))
             })
             .collect()
     };
@@ -1607,6 +1633,12 @@ fn batch_bytes_cap() -> usize {
         BATCH_BYTES_LOW_COMMIT
     } else {
         BATCH_BYTES
+    };
+    let backlog = PENDING.load(Ordering::Relaxed);
+    let base = if super::texture_env::texture_catchup() && backlog >= 1024 {
+        base.saturating_mul(3)
+    } else {
+        base
     };
     if !super::residency::on() {
         return base;
@@ -2205,7 +2237,14 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12C
             return;
         }
         if !super::residency::admit_texture_pass(baking) {
-            return;
+            if !super::texture_env::reupload_when_full() {
+                return;
+            }
+            let only_refresh: Vec<_> = todo.into_iter().filter(|(_, u)| u.dirty_pages.is_some()).collect();
+            if only_refresh.is_empty() {
+                return;
+            }
+            return unsafe { upload_all_inner(only_refresh, title) };
         }
     }
     if baking {
@@ -2535,7 +2574,16 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
     // (the coherent window is committed as a whole: no `VirtualQuery`, which sizes a region by
     // walking it)
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
-        std::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), len);
+        if super::texture_env::texture_copy() {
+            copy_committed_region(at, out.as_mut_ptr(), len);
+        } else {
+            std::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), len);
+        }
+        return out;
+    }
+    if !super::texture_env::texture_fill()
+        && !super::texture_policy::memory_stable_for_read(at, len)
+    {
         return out;
     }
     let mut p = at;

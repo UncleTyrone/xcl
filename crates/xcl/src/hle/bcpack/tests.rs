@@ -102,6 +102,31 @@ fn junk_streams_do_not_panic() {
     }
 }
 
+/// Compares with reference outputs outside the repo (`XCL_BCPACK_TABLES` / `VICTORY_BCPACK_TABLES`
+/// and `XCL_BCPACK_CASES` / `VICTORY_BCPACK_CASES`; CGBJ `victory-formats::reference_chunks`).
+#[test]
+#[ignore = "needs the format tables and reference chunks"]
+fn reference_chunks() {
+    let tables = std::env::var_os("XCL_BCPACK_TABLES")
+        .or_else(|| std::env::var_os("VICTORY_BCPACK_TABLES"))
+        .expect("XCL_BCPACK_TABLES or VICTORY_BCPACK_TABLES");
+    let cases = super::env::reference_cases_dir().expect("XCL_BCPACK_CASES or VICTORY_BCPACK_CASES");
+    let t = super::load::tables_from_file(std::path::Path::new(&tables)).expect("tables");
+    let mut n = 0;
+    for entry in std::fs::read_dir(cases).unwrap() {
+        let path = entry.unwrap().path();
+        let Some(bc) = path.extension().and_then(|e| e.to_str()?.strip_prefix("bc")?.parse().ok()) else {
+            continue;
+        };
+        let want = std::fs::read(path.with_extension("out")).unwrap();
+        let mut got = vec![0u8; want.len()];
+        super::victory::decode(bc, &std::fs::read(&path).unwrap(), &mut got, t).unwrap();
+        assert!(got == want, "{}", path.display());
+        n += 1;
+    }
+    assert!(n > 0);
+}
+
 /// The BC7 dictionary indices follow VIctory PR #658: a set with 0 bits holds no
 /// indices, and pixel 0 is the anchor (top bit clear). Entry 0 stores all 32 indices
 /// directly without the repeated width word, keeping its leading `[2, 1, 0, ...]` values.

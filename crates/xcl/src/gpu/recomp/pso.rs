@@ -316,11 +316,13 @@ mod translated {
             } else {
                 id
             };
-            if let Some(tag) = crate::gpu::recomp::shader_opt::cache_tag() {
+            let id = if let Some(tag) = crate::gpu::recomp::shader_opt::cache_tag() {
                 identity_for(&id.to_string(), tag)
             } else {
                 id
-            }
+            };
+            let fp = crate::gpu::shader_env::translation_fingerprint();
+            identity_for(&id.to_string(), &format!("xcl-shader-fp-{:016x}", crate::gpu::shader::fnv64(&fp)))
         })
     }
 

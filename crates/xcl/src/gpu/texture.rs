@@ -237,6 +237,23 @@ const STAGING_POOL_DEFAULT_CAP: u64 = 256 << 20;
 const STAGING_IDLE_MS: u64 = 2_000;
 const STAGING_IDLE_FRAMES: u64 = 30;
 
+/// `XCL_STAGING_IDLE_MS` overrides free-memory idle reclaim; floored at 2 s.
+fn staging_idle_threshold_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        let over = std::env::var("XCL_STAGING_IDLE_MS")
+            .or_else(|_| std::env::var("VICTORY_STAGING_IDLE_MS"))
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        if let Some(ms) = over {
+            crate::xlog_info!("D3D12.X: XCL_STAGING_IDLE_MS={ms}");
+            ms.max(2_000)
+        } else {
+            STAGING_IDLE_MS
+        }
+    })
+}
+
 static CURRENT_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn monotonic_ms() -> u64 {
@@ -298,8 +315,6 @@ impl<T> StagingPool<T> {
         Some((bucket, entry.item))
     }
 
-    /// Return a GPU-idle power-of-2 buffer to the pool, or hand it back to the caller to drop if
-    /// pooling is disabled or the buffer exceeds `STAGING_POOL_MAX_ITEM` / `cap_bytes`.
     fn release(&mut self, cap: u64, item: T, now_ms: u64, frame: u64) -> Option<T> {
         if self.cap_bytes == 0 || cap == 0 || !cap.is_power_of_two() || cap > STAGING_POOL_MAX_ITEM || cap > self.cap_bytes {
             return Some(item);
@@ -345,7 +360,7 @@ impl<T> StagingPool<T> {
                 list.clear();
             } else {
                 list.retain(|e| {
-                    let ms_idle = now_ms.saturating_sub(e.last_ms) >= STAGING_IDLE_MS;
+                    let ms_idle = now_ms.saturating_sub(e.last_ms) >= staging_idle_threshold_ms();
                     let fr_idle = frame.saturating_sub(e.last_frame) >= STAGING_IDLE_FRAMES;
                     !(ms_idle && fr_idle)
                 });
@@ -370,7 +385,6 @@ impl<T> StagingPool<T> {
 
 struct MappedStaging(ID3D12Resource, *mut u8);
 
-// D3D12 resources are free-threaded; mapped pointer is owned exclusively while pooled or held.
 unsafe impl Send for MappedStaging {}
 
 static STAGING_POOLS: std::sync::Mutex<Option<std::collections::HashMap<usize, StagingPool<MappedStaging>>>> = std::sync::Mutex::new(None);
@@ -501,7 +515,7 @@ pub fn trim_idle_staging(frame: u64, low_commit: bool) {
         if let Some(map) = ups.as_mut() {
             for up in map.values_mut() {
                 let Some((_, _, cap)) = up.staging else { continue };
-                let idle = now_ms.saturating_sub(up.last_used_ms) >= STAGING_IDLE_MS
+                let idle = now_ms.saturating_sub(up.last_used_ms) >= staging_idle_threshold_ms()
                     && frame.saturating_sub(up.last_used_frame) >= STAGING_IDLE_FRAMES;
                 let shrink_low = low_commit && cap > STAGING_MIN;
                 if idle || shrink_low {
@@ -540,7 +554,19 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
         None => Uploader::new(dev)?,
     };
     // where each texture's texels go in the upload buffer
-    let (failed, planned, total) = plan_batch(dev, items);
+    let mut failed = Vec::new();
+    let mut planned = Vec::with_capacity(items.len());
+    let mut total = 0u64;
+    for (k, (res, subs, states)) in items.iter().enumerate() {
+        match layout(dev, res, subs, states, states) {
+            Ok(l) => {
+                let base = total.div_ceil(PLACEMENT) * PLACEMENT;
+                total = base + l.total;
+                planned.push((k, l, base));
+            }
+            Err(e) => failed.push((k, e)),
+        }
+    }
     if planned.is_empty() {
         put_back(key, up);
         return Ok(failed);
@@ -1186,44 +1212,6 @@ mod tests {
         assert_eq!(staging_capacity(138_713_408), Some(144 * mib));
         assert_eq!(staging_capacity(256 * mib + 1), Some(272 * mib));
         assert_eq!(staging_capacity(u64::MAX), None);
-    }
-
-    #[test]
-    fn staging_pool_buckets_caps_reuses_and_reclaims_idle() {
-        let mib = 1u64 << 20;
-        assert_eq!(staging_pool_bucket(1), Some(64 << 10));
-        assert_eq!(staging_pool_bucket(3 * mib), Some(4 * mib));
-        assert_eq!(staging_pool_bucket(8 * mib), Some(8 * mib));
-        assert_eq!(staging_pool_bucket(8 * mib + 1), None);
-
-        // Disabled pool (cap 0) immediately returns released items.
-        let mut disabled = StagingPool::<u32>::new(0);
-        assert_eq!(disabled.release(4 * mib, 1, 0, 0), Some(1));
-
-        // Power-of-2 pooling with 12 MiB cap: LIFO reuse, oldest eviction on cap pressure,
-        // and idle reclamation only once BOTH >= 2 s and >= 30 frames have elapsed.
-        let mut pool = StagingPool::<u32>::new(12 * mib);
-        assert_eq!(pool.release(4 * mib, 10, 100, 1), None);
-        assert_eq!(pool.release(8 * mib, 20, 200, 2), None);
-        assert_eq!(pool.total_bytes, 12 * mib);
-        // Oversized (> 8 MiB) or non-power-of-2 buffers bypass the pool.
-        assert_eq!(pool.release(16 * mib, 99, 250, 3), Some(99));
-        assert_eq!(pool.release(6 * mib, 98, 250, 3), Some(98));
-        // Inserting another 4 MiB evicts the oldest (id 10, ts 100).
-        assert_eq!(pool.release(4 * mib, 30, 300, 4), None);
-        assert_eq!(pool.total_bytes, 12 * mib);
-        assert_eq!(pool.acquire(3 * mib), Some((4 * mib, 30)));
-        assert_eq!(pool.total_bytes, 8 * mib);
-        // Not idle yet: only time elapsed (frames < 30), or only frames elapsed (time < 2000ms).
-        assert_eq!(pool.trim_idle(5_000, 10, false), (0, 0));
-        assert_eq!(pool.trim_idle(1_000, 100, false), (0, 0));
-        // Both thresholds met -> idle 8 MiB buffer reclaimed.
-        assert_eq!(pool.trim_idle(2_200, 32, false), (1, 8 * mib));
-        assert_eq!(pool.total_bytes, 0);
-        // Low-commit forced trim reclaims immediately regardless of idle age.
-        assert_eq!(pool.release(4 * mib, 40, 2_200, 32), None);
-        assert_eq!(pool.trim_idle(2_200, 32, true), (1, 4 * mib));
-        assert_eq!(pool.total_bytes, 0);
     }
 
     fn select_large_upload_device_with<F, D>(

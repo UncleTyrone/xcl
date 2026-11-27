@@ -442,8 +442,17 @@ fn pso_worker_threads() -> usize {
                     .and_then(|v| v.trim().parse::<usize>().ok())
                     .filter(|&n| n > 0)
             })
+            .or_else(|| {
+                std::env::var("XCL_PIPELINE_WORKERS")
+                    .ok()
+                    .or_else(|| std::env::var("VICTORY_PIPELINE_WORKERS").ok())
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .filter(|&n| n > 0)
+            })
             .map(|n| n.clamp(1, 64))
-            .unwrap_or_else(|| crate::gpu::recomp::dxc::compile_threads().min(6).max(2))
+            .unwrap_or_else(|| {
+                super::pipeline_env::pipeline_workers().min(6).max(2)
+            })
     })
 }
 
@@ -454,20 +463,34 @@ fn preload_worker_threads() -> usize {
 
 fn queue() -> &'static Arc<PsoQueue> {
     WORK_QUEUE.get_or_init(|| {
+        super::pipeline_env::note_boot();
+        super::library_env::note_boot();
         let q = Arc::new(PsoQueue::new());
         // translation recurses deeply on big programs; DXC itself runs on its own pool
         let n = pso_worker_threads();
+        let _ = super::pipeline_env::pipeline_slow_limit(n);
+        let lowest = super::pipeline_env::pipeline_lowest();
         for k in 0..n {
             let q = q.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(16 << 20).spawn(move || loop {
-                while let Some(p) = next_needed() {
-                    build_queued(&p);
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(16 << 20).spawn(move || {
+                if lowest {
+                    unsafe {
+                        use windows_sys::Win32::System::Threading::{
+                            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST,
+                        };
+                        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+                    }
                 }
-                let work = q.pop();
-                while let Some(p) = next_needed() {
-                    build_queued(&p);
+                loop {
+                    while let Some(p) = next_needed() {
+                        build_queued(&p);
+                    }
+                    let work = q.pop();
+                    while let Some(p) = next_needed() {
+                        build_queued(&p);
+                    }
+                    work();
                 }
-                work();
             });
         }
         q

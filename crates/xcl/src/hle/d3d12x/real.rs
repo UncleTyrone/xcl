@@ -584,7 +584,10 @@ pub fn init() -> Result<String, String> {
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI: {e}"))?;
         let mut device: Option<ID3D12Device> = None;
         let mut name = String::new();
-        let sel = crate::gpu::adapter::Selector::from_env_or(&cfg.d3d12_adapter);
+        let mut sel = crate::gpu::adapter::Selector::from_env_or(&cfg.d3d12_adapter);
+        if super::d3d12_boot::force_warp() {
+            sel = crate::gpu::adapter::Selector::Warp;
+        }
         if sel != crate::gpu::adapter::Selector::Warp {
             let mut list = crate::gpu::adapter::candidates(&factory, &sel);
             if list.is_empty() {
@@ -597,6 +600,7 @@ pub fn init() -> Result<String, String> {
                     super::gpu_awake::start(&dev, desc.VendorId);
                     device = Some(dev);
                     name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
+                    super::session::set_dedicated_vram_mb((desc.DedicatedVideoMemory >> 20) as u64);
                     break;
                 }
             }
@@ -611,6 +615,7 @@ pub fn init() -> Result<String, String> {
                 d
             }
         };
+        super::d3d12_boot::apply_device_boot(&device, debug);
         if debug {
             // the debug layer's messages into XCL's log (they otherwise go to a debugger only)
             if let Ok(q) = device.cast::<ID3D12InfoQueue1>() {
@@ -5748,6 +5753,10 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if !is_console(cs) {
         return None;
     }
+    let record = crate::gpu::shader::fnv64(cs);
+    if crate::gpu::shader_env::defrag_off() && record == crate::gpu::shader_env::DEFRAG_SHADER_HASH {
+        return None;
+    }
     // Under `XCL_RT_GATE=hold` (default), RT traversal and RT companion shaders are held back
     // without translating or compiling on the driver (belt-and-suspenders guard for direct paths).
     if rt_gate_mode() == RtGateMode::Hold && is_rt_gated_cs(cs) {
@@ -5772,7 +5781,6 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if big && crate::gpu::recomp::dxc::defer() {
         return Some(Err(()));
     }
-    let record = crate::gpu::shader::fnv64(cs);
     if let Some(plan) = compiled.dispatch_chain {
         if let Some(rs) = dispatch_chain::build(this, f, d, riid, ppv, record, dxil.clone(), &compiled.samplers, plan) {
             LAST_COMPUTE_RS.with(|c| c.set(rs));
@@ -9218,6 +9226,13 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
 /// A stand-in pipeline is bound as its real pipeline once that is built (compute: waited for at its use).
 /// SetPipelineState on the PC list (a pipeline still building in the background: its stand-in)
 pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
+    let _ = (
+        crate::gpu::shader_env::skip_pipelines(),
+        super::root_env::rt_resolve(),
+        crate::gpu::shader_env::shader_save_dir(),
+        crate::gpu::shader_env::shader_census_path(),
+        crate::gpu::shader_env::shader_loop_limit(),
+    );
     cl_set_pipeline_state(this, pso)
 }
 

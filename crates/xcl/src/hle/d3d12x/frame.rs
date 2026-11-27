@@ -367,6 +367,16 @@ pub unsafe extern "system" fn wait_frame_event_x(_this: *mut std::ffi::c_void, t
             .then(|| (c.kinds[ty as usize].internal as usize, Arc::clone(&c.kinds[ty as usize].extra)))
     });
     let Some((internal, scheduled_extra)) = scheduled else { return E_INVALIDARG };
+    let timeout_ms = if !super::render_env::late_waits() && timeout_ms > 0 {
+        let h = internal as HANDLE;
+        if WaitForMultipleObjects(1, &h, 0, 0) == WAIT_OBJECT_0 {
+            0
+        } else {
+            timeout_ms
+        }
+    } else {
+        timeout_ms
+    };
     let token_in = if token.is_null() { 0 } else { *token };
     if ty == 0 && token_in != 0 && (!ISSUED.lock().unwrap().iter().any(|e| e.0 == token_in) || flags & TOKEN_ON_TIMEOUT != 0) {
         return E_INVALIDARG;

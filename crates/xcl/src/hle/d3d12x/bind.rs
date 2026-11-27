@@ -1058,6 +1058,8 @@ pub(super) unsafe extern "system" fn set_graphics_root_constants(this: *mut c_vo
 /// #42 / #44 / #46 SetGraphicsRoot{ConstantBuffer,ShaderResource,UnorderedAccess}View (PC #38 /
 /// #40 / #42)
 pub(super) unsafe extern "system" fn set_graphics_root_descriptor(this: *mut c_void, i: u32, va: u64) {
+    super::root_env::on_root_bind();
+    let _ = (super::root_env::root_view_bytes(), super::root_env::root_uav_bytes());
     note_address(va);
     let va = resolve_root_for_list(this, va);
     put_in(this, true, i, 0, &va.to_le_bytes());
@@ -4683,6 +4685,7 @@ pub(super) unsafe extern "system" fn set_compute_root_constants(this: *mut c_voi
 /// #41 / #43 / #45 SetComputeRoot{ConstantBuffer,ShaderResource,UnorderedAccess}View (PC #37 /
 /// #39 / #41): the 64-bit GPU address
 pub(super) unsafe extern "system" fn set_compute_root_descriptor(this: *mut c_void, i: u32, va: u64) {
+    super::root_env::on_root_bind();
     note_address(va);
     let va = resolve_root_for_list(this, va);
     put(this, i, 0, &va.to_le_bytes());
@@ -4871,17 +4874,19 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
 /// with 1 in Y is folded into Y; any other count past 65 535 is clamped (logged once).
 pub(super) fn fold(x: u32, y: u32, z: u32) -> (u32, [u32; 3]) {
     use crate::gpu::recomp::FOLD_X;
-    if x <= FOLD_X && y <= 65_535 && z <= 65_535 {
+    let dim = super::render_env::dispatch_dim_cap(true); // amd-dev tree
+    let _ = super::render_env::indirect_card_budget();
+    if x <= FOLD_X && y <= dim && z <= dim {
         return (0, [x, y, z]);
     }
-    if y == 1 && z <= 65_535 && x.div_ceil(FOLD_X) <= 65_535 {
+    if y == 1 && z <= dim && x.div_ceil(FOLD_X) <= dim {
         return (x, [FOLD_X, x.div_ceil(FOLD_X), z]);
     }
     static N: AtomicU64 = AtomicU64::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 4 {
-        crate::xlog_warn!("D3D12.X: a dispatch of {x}x{y}x{z} groups cannot be folded – clamped to 65535 a dimension");
+        crate::xlog_warn!("D3D12.X: a dispatch of {x}x{y}x{z} groups cannot be folded – clamped to {dim} a dimension");
     }
-    (0, [x.min(65_535), y.min(65_535), z.min(65_535)])
+    (0, [x.min(dim), y.min(dim), z.min(dim)])
 }
 
 /// Allocate a dedicated compute `io` buffer in UMA for an indirect dispatch whose `IO_GROUP_LIMIT`

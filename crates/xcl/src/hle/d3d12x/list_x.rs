@@ -4955,7 +4955,11 @@ unsafe fn ensure_console_view_heap(this: *mut c_void) {
 /// view heap with 0 sampler heaps). Returns `true` when all required shared heaps exist and are
 /// bound on `this` so callers may cache the check until `SetDescriptorHeaps` / `Reset`.
 pub(super) unsafe fn ensure_view_heap(this: *mut c_void) -> bool {
-    let need_view = crate::gpu::recomp::pso::heap_windows();
+    if !super::render_env::lent_heap() && !crate::gpu::recomp::pso::heap_windows() {
+        return false;
+    }
+    let _ = super::render_env::list_views();
+    let need_view = crate::gpu::recomp::pso::heap_windows() || super::render_env::lent_heap();
     let view_raw = if need_view {
         super::console_heap::global_heap_raw()
     } else {

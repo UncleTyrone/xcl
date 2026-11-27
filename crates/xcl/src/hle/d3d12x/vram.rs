@@ -2840,7 +2840,8 @@ pub unsafe fn place_pages(
         }
     }
     // (one slice: the tiles of an array's packed levels are not asked about here)
-    let lazy = should_use_lazy_levels(level_pages(), aliases_live, desc);
+    let big_enough = console_bytes.map_or(true, |b| b >= super::render_env::levels_min_bytes());
+    let lazy = big_enough && should_use_lazy_levels(level_pages(), aliases_live, desc);
     place_on_pages(dev, this, va, desc, state, clear, console_bytes, false, lazy, riid, ppv)
 }
 

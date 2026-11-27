@@ -320,7 +320,21 @@ pub(crate) fn note_write_watch_dirty(dirty: &[usize], page_size: usize) {
         return;
     }
     let step = page_size.max(KERNEL_PAGE);
-    let pages: Vec<(usize, u16)> = dirty.iter().map(|&p| (p & !(step - 1), WHOLE)).collect();
+    let parts_on = super::page_env::page_parts() && super::texture_env::take_parts();
+    let _ = super::page_env::page_writes();
+    let _ = super::page_env::open_one_view();
+    let pages: Vec<(usize, u16)> = dirty
+        .iter()
+        .map(|&p| {
+            if parts_on {
+                let block = p & !(BLOCK - 1);
+                let bit = ((p - block) / KERNEL_PAGE).min(PARTS - 1) as u16;
+                (block, 1u16 << bit)
+            } else {
+                (p & !(step - 1), WHOLE)
+            }
+        })
+        .collect();
     let now = {
         let began = std::time::Instant::now();
         let mut j = match JOURNAL.try_write() {
@@ -387,6 +401,19 @@ impl Port7Counts {
             ms(P7_PART_WAITS + 1),
             n(P7_SKIPPED),
         )
+    }
+}
+
+/// Heartbeat for `XCL_ASK_EARLY` background thread (journal path stays warm).
+pub(crate) fn tick_early_ask() {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n == 0 {
+        super::ask_env::on_refresh_start();
+        super::keep_env::note_boot();
+        super::page_env::note_boot();
+        super::pop_env::note_boot();
+        super::read_env::note_boot();
     }
 }
 
