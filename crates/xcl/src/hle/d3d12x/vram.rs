@@ -290,9 +290,14 @@ pub(super) fn level_pages() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("XCL_TEXTURE_LEVEL_PAGES").is_ok_and(|v| v.trim() == "1");
+        let by_pages = std::env::var("XCL_TEXTURE_LEVEL_PAGES").is_ok_and(|v| v.trim() == "1");
+        let on_demand = super::texture_policy::levels_on_demand();
+        let on = by_pages || on_demand;
         if on {
-            crate::xlog_info!("D3D12.X: XCL_TEXTURE_LEVEL_PAGES=1 - a sampled texture's levels get their video memory pages when an upload first has texels for them");
+            let via = if on_demand && !by_pages { "XCL_LEVELS_ON_DEMAND" } else { "XCL_TEXTURE_LEVEL_PAGES" };
+            crate::xlog_info!(
+                "D3D12.X: {via}=1 - a sampled texture's levels get their video memory pages when an upload first has texels for them"
+            );
         }
         on
     })

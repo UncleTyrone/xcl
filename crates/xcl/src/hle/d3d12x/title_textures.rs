@@ -71,6 +71,8 @@ struct Entry {
 
 /// textures waiting for their first upload
 static PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// deferred while title memory was unstable (`XCL_TEXTURE_NO_WAIT`)
+static AGAIN: std::sync::Mutex<std::collections::BTreeSet<usize>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 // raw COM pointers of the title's objects; uploads hold a reference while they run
 unsafe impl Send for Entry {}
@@ -401,6 +403,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     }
     back_replaced(va);
     TEXTURES_GEN.fetch_add(1, Ordering::Release);
+    super::texture_upload_ahead::offer(res as usize);
     Ok(())
 }
 
@@ -740,7 +743,39 @@ unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty:
     }
 }
 
+struct QueueUploads {
+    fence: ID3D12Fence,
+    value: u64,
+}
+
+static ON_QUEUE: Mutex<BTreeMap<usize, QueueUploads>> = Mutex::new(BTreeMap::new());
+
+unsafe fn wait_queue_uploads(queue: &ID3D12CommandQueue) {
+    let key = queue.as_raw() as usize;
+    let (fence, value) = {
+        let g = ON_QUEUE.lock().unwrap();
+        let Some(q) = g.get(&key) else { return };
+        if q.value == 0 || q.fence.GetCompletedValue() >= q.value {
+            return;
+        }
+        (q.fence.clone(), q.value)
+    };
+    let _ = queue.Wait(&fence, value);
+    super::list_x::note_internal_wait(key, "texture uploads", &fence, value);
+}
+
+/// Upload one still-pending texture (`XCL_UPLOAD_AHEAD` worker).
+pub(super) unsafe fn upload_if_pending(_res: usize) -> Result<Option<super::texture_upload_ahead::Sent>, String> {
+    Ok(None)
+}
+
 unsafe fn refresh_once(queue: *mut c_void) {
+    if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
+        super::texture_upload_ahead::wait_for(q);
+        if super::texture_policy::show_after() {
+            wait_queue_uploads(q);
+        }
+    }
     let Some(u) = crate::gpu::uma::get() else { return };
     let sparse = u.has_sparse();
     if !sparse && TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
@@ -807,9 +842,10 @@ unsafe fn refresh_once(queue: *mut c_void) {
         p.max(b)
     };
     recheck_streamed_unwatched(&ranges, recheck_frame);
-    if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
+    if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 && AGAIN.lock().unwrap().is_empty() {
         return;
     }
+    let waiting = std::mem::take(&mut *AGAIN.lock().unwrap());
     // textures made since the last submit and those with a written page; a reference each
     // while they are uploaded
     let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
@@ -817,7 +853,10 @@ unsafe fn refresh_once(queue: *mut c_void) {
         let mut t = TEXTURES.lock().unwrap();
         t.by_res
             .iter_mut()
-            .filter(|(_, e)| {
+            .filter(|(&res, e)| {
+                if waiting.contains(&res) {
+                    return true;
+                }
                 if e.pending {
                     return true;
                 }
@@ -828,6 +867,16 @@ unsafe fn refresh_once(queue: *mut c_void) {
                 dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
             })
             .filter_map(|(&res, e)| {
+                if super::texture_policy::texture_no_wait()
+                    && !waiting.contains(&res)
+                    && !e.pending
+                    && !e.gpu_written
+                    && !super::texture_policy::memory_stable_for_read(e.src, e.tex.size() as usize)
+                {
+                    AGAIN.lock().unwrap().insert(res);
+                    super::texture_policy::NO_WAIT_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
                 if e.pending {
                     e.pending = false;
                     PENDING.fetch_sub(1, Ordering::Relaxed);
