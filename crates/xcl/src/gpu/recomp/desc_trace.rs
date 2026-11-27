@@ -415,6 +415,34 @@ fn compare_uses_readfirstlane(insts: &[Decoded], cmp_pc: u64, reads: &[(u64, u64
     })
 }
 
+/// Each compare pairs with a distinct readfirstlane (per-compare BDD subset when masks_ok).
+fn compares_pair_reads(wf: &ScannedWaterfall, insts: &[Decoded]) -> bool {
+    let reads_flat: Vec<(u64, u64, u64)> = wf
+        .reads
+        .iter()
+        .map(|&(pc, _, dst, v)| (pc, dst, v))
+        .collect();
+    let mut used = vec![false; wf.reads.len()];
+    for &cmp in &wf.compares {
+        let mut hit = false;
+        for (i, &(rpc, _, dst, vgpr)) in wf.reads.iter().enumerate() {
+            if used[i] {
+                continue;
+            }
+            let pair = [(rpc, dst, vgpr)];
+            if compare_uses_readfirstlane(insts, cmp, &pair) {
+                used[i] = true;
+                hit = true;
+                break;
+            }
+        }
+        if !hit {
+            return false;
+        }
+    }
+    true
+}
+
 fn waterfall_meet_ok(
     insts: &[Decoded],
     wf: &ScannedWaterfall,
@@ -439,22 +467,22 @@ fn waterfall_meet_ok(
         .iter()
         .map(|&(pc, _, dst, v)| (pc, dst, v))
         .collect();
-    if !wf
-        .compares
-        .iter()
-        .all(|&c| compare_uses_readfirstlane(insts, c, &reads_flat))
-    {
+    if !masks_ok {
+        if !wf
+            .compares
+            .iter()
+            .all(|&c| compare_uses_readfirstlane(insts, c, &reads_flat))
+        {
+            return false;
+        }
+    } else if !compares_pair_reads(wf, insts) {
         return false;
     }
     let apcs: Vec<u64> = wf.accesses.iter().map(|&(p, _)| p).collect();
     if apcs.iter().any(|pc| guarded.contains(pc)) {
         return false;
     }
-    if !masks_ok {
-        return true;
-    }
-    // BDD subset: compares pair with readfirstlanes; nested loops still get structural meet when !split.
-    wf.compares.len() <= wf.reads.len().saturating_add(2)
+    true
 }
 
 fn prove_waterfalls(
