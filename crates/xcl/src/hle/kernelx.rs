@@ -172,6 +172,9 @@ pub mod mirrors {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
+    /// Bytes of a page the queue's page-mapping method maps (the console's 64 KiB pages).
+    pub const PAGE: usize = 0x1_0000;
+
     /// MEM_LARGE_PAGES | MEM_PHYSICAL: the console's 64 KiB pages
     const PAGES_64K: u32 = 0x2040_0000;
     /// PAGE_GRAPHICS_NOACCESS
@@ -215,6 +218,12 @@ pub mod mirrors {
         s.cpu.retain(|&(b, _)| b != base);
         s.gpu.remove(&base);
         s.gpu.retain(|_, &mut (_, c)| c != base);
+    }
+
+    /// What the page-mapping method put under `va` (none on main until batch apply is wired).
+    pub fn mapped_source(va: usize) -> Option<Option<usize>> {
+        let _ = va;
+        None
     }
 
     /// The CPU-view address behind `va` when `va` lies in a GPU view.

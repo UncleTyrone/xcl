@@ -432,6 +432,11 @@ pub fn device_raw() -> *mut c_void {
     DEVICE.load(Ordering::Acquire) as *mut c_void
 }
 
+/// Whether BVH traversal compute shaders are allowed to run (RT gate; ambient probes).
+pub(super) fn bvh_traversal_allowed() -> bool {
+    true
+}
+
 /// The process's video memory on the device's adapter: (local, non-local) bytes in use.
 pub fn video_memory() -> Option<(u64, u64)> {
     use windows::Win32::Graphics::Dxgi::*;
@@ -661,6 +666,11 @@ fn module_of(addr: usize) -> usize {
 /// Whether `obj` is an object XCL adopted (its vtable is one of XCL's).
 pub(super) unsafe fn is_adopted(obj: *mut c_void) -> bool {
     !obj.is_null() && crate::gpu::shader::readable(obj as usize, 8) && is_ext(*(obj as *const usize))
+}
+
+/// GetCompletedValue without re-entering the title's fence hook (`console_heap::settle_for_fence`).
+pub(super) unsafe fn fence_completed(fence: &ID3D12Fence) -> u64 {
+    fence.GetCompletedValue()
 }
 
 /// A struct-returning method's first two arguments: true when `a` is the object (the C++ way:
@@ -1489,11 +1499,23 @@ pub(super) unsafe fn place_at_title_address(this: *mut c_void, va: usize, desc: 
     let (base, size) = u.window(k);
     let mut d: D3D12_RESOURCE_DESC = std::ptr::read_unaligned(desc.as_ptr() as *const D3D12_RESOURCE_DESC);
     let bytes = d.Width as usize;
+    if bytes == 0 {
+        return None;
+    }
+    if super::port_constants::on() && (va as u64) < (1u64 << 32) {
+        d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+        d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        d.Alignment = 0;
+        if let Some(hr) = super::port_constants::place_console_buffer(va, bytes, riid, ppv) {
+            UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (va, bytes, false));
+            return Some(hr);
+        }
+    }
     // a placed PC buffer starts at 64 KiB: one at another address starts below it and XCL adds
     // the difference where PC methods take an offset into it (`buffer_delta`)
     let start = va & !0xFFFF;
     let delta = va - start;
-    if bytes == 0 || va - base + bytes > size {
+    if va - base + bytes > size {
         return None;
     }
     // the title's own memory (a sparse window): a resource over its video-memory tiles
@@ -1976,6 +1998,9 @@ unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12
     }
     let (va, size) = if in_uma { (va, size) } else { (0, 0) };
     super::console_heap::write(&slot, &crate::gpu::desc::cbv_words(va, size));
+    if va != 0 {
+        let _ = super::card_steps::defer_fill_to_prelude(va as usize, size as usize, cpu);
+    }
 }
 
 /// #22 CreateSampler: the PC sampler at the slot's index, the S# in XCL ABI form (word 3
@@ -7507,9 +7532,16 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
 
 /// Title `ExecuteCommandLists` after refresh / translate join.
 unsafe fn execute_command_lists_body(this: *mut c_void, lists: &[*mut c_void]) {
+    super::pcores::pin_current_thread_fast();
     let _in_pc = super::pso_async::pc_call();
+    if !super::late_wait::relax_relay_wait_before_submit() {
+        super::relay::wait_before_submit();
+    }
     super::submit::begin_refresh();
-    super::title_textures::refresh(this);
+    {
+        let _heaps = super::port_journal::begin_at_submit();
+        super::title_textures::refresh(this);
+    }
     let mapped = super::thin::map_lists(lists);
     super::frame_replay::on_submit(this, lists, &mapped);
     if super::submit::run_async_mapped(this, mapped.clone()) {
@@ -7533,8 +7565,10 @@ pub(super) unsafe fn execute_mapped_lists(this: *mut c_void, mapped: &[*mut c_vo
     type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
     super::list_x::note_queue_for_lists(this as usize, mapped);
+    let _card = super::card_steps::try_prep_before_lists(this, mapped);
+    let relay_through = super::relay::submit_order();
     let submit_chunk = |chunk: &[*mut c_void]| {
-        let _fid = super::late_wait::begin_chunk(this as usize, 0);
+        let _fid = super::late_wait::begin_chunk(this as usize, relay_through);
         unsafe { super::late_wait::settle_bop_before_submit(this) };
         if super::alloc_pool::note_resubmits(this, chunk) > 0 {
             super::submit::pause_refresh(|| super::alloc_pool::wait_for_previous_submits(chunk));

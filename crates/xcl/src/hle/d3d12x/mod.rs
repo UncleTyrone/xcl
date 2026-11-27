@@ -10,12 +10,14 @@
 #![allow(non_snake_case)]
 
 mod alloc_pool;
+mod ambient;
 pub mod bind;
 pub(crate) mod clamp;
 pub mod console_heap;
 pub(crate) mod heap_strides;
 pub mod console_list;
 mod depth_uav;
+pub(crate) mod descriptor_sites;
 pub mod device_x;
 pub mod dxgi_device;
 mod cpu_writes;
@@ -26,14 +28,23 @@ pub mod frame;
 pub mod guard;
 pub(crate) mod card_rehash;
 pub(crate) mod join;
+pub(crate) mod card_steps;
+pub(crate) mod land;
+pub(crate) mod relay;
+pub(crate) mod wide_back;
 mod frame_replay;
 mod late_release;
 mod late_wait;
 pub mod layout;
 pub mod list_x;
+mod pcores;
 pub mod null;
 pub mod port;
+pub(crate) mod port_constants;
+pub(crate) mod port_cbv;
+pub(crate) mod port_journal;
 pub mod present;
+mod residency;
 pub mod pso_async;
 pub mod real;
 mod shader_cache_session;
@@ -45,7 +56,7 @@ pub mod title_list;
 mod texture_policy;
 mod texture_upload_ahead;
 pub mod title_textures;
-mod uma_driver;
+pub(crate) mod watch;
 pub mod vram;
 
 use std::ffi::c_void;
@@ -86,16 +97,15 @@ pub enum Backend {
 }
 
 /// Decided once: the real backend unless disabled or the driver refuses.
-static BACKEND: OnceLock<Backend> = OnceLock::new();
-
-fn backend_with_remap(allow_driver_remap: bool) -> Backend {
-    *BACKEND.get_or_init(|| {
+pub fn backend() -> Backend {
+    static B: OnceLock<Backend> = OnceLock::new();
+    *B.get_or_init(|| {
         let cfg = crate::state::config();
         if cfg.graphics.eq_ignore_ascii_case("null") {
             crate::xlog_info!("D3D12.X: backend 'null' (from the config)");
             return Backend::Null;
         }
-        match real::init_with_remap(allow_driver_remap) {
+        match real::init() {
             Ok(desc) => {
                 crate::xlog_info!("D3D12.X: backend 'real' – {desc}");
                 Backend::Real
@@ -106,14 +116,6 @@ fn backend_with_remap(allow_driver_remap: bool) -> Backend {
             }
         }
     })
-}
-
-pub fn backend() -> Backend {
-    backend_with_remap(false)
-}
-
-pub(crate) fn backend_before_guest() -> Backend {
-    backend_with_remap(true)
 }
 
 /// Call a function of the system d3d12.dll by name.

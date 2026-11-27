@@ -230,16 +230,82 @@ pub fn shared_heap_stats() -> Option<(u32, u32)> {
 
 static SUBMIT_HOLDS: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
 
+struct PendingDynamic {
+    fence: ID3D12Fence,
+    value: u64,
+    ranges: Vec<(u32, u32)>,
+}
+
+static PENDING_DYNAMIC: Mutex<Vec<PendingDynamic>> = Mutex::new(Vec::new());
+
 pub fn hold_for_submit(first: u32, count: u32) {
     if count > 0 && first >= MIN_DYNAMIC {
         SUBMIT_HOLDS.lock().unwrap().push((first, count));
     }
 }
 
-pub fn recycle_after_submit() {
+pub fn recycle_after_submit(queue: usize) {
     let holds = std::mem::take(&mut *SUBMIT_HOLDS.lock().unwrap());
+    if holds.is_empty() {
+        return;
+    }
+    if super::residency::defer_dynamic_slots() {
+        if let Some((fence, value)) = super::alloc_pool::queue_submission_mark(queue) {
+            PENDING_DYNAMIC.lock().unwrap().push(PendingDynamic { fence, value, ranges: holds });
+            return;
+        }
+    }
     for (first, count) in holds {
         release_global(first, count);
+    }
+}
+
+fn pending_dynamic_len() -> usize {
+    PENDING_DYNAMIC.lock().unwrap().len()
+}
+
+/// Retry fence-driven release of deferred dynamic descriptor ranges (CGBJ `settle_for_fence`).
+pub unsafe fn settle_for_fence() {
+    if !super::residency::defer_dynamic_slots() {
+        return;
+    }
+    for _ in 0..4 {
+        let before = pending_dynamic_len();
+        drain_completed_dynamic_slots();
+        if pending_dynamic_len() == before {
+            break;
+        }
+    }
+}
+
+/// Ranges held until the submit fence that recorded them has completed.
+pub unsafe fn drain_completed_dynamic_slots() {
+    if !super::residency::defer_dynamic_slots() {
+        return;
+    }
+    let mut pending = PENDING_DYNAMIC.lock().unwrap();
+    let mut released = 0u32;
+    let mut i = 0;
+    while i < pending.len() {
+        let done = pending[i].ranges.is_empty()
+            || super::real::fence_completed(&pending[i].fence) >= pending[i].value;
+        if done {
+            let gone = pending.swap_remove(i);
+            for (first, count) in gone.ranges {
+                release_global(first, count);
+                released = released.saturating_add(count);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    if released > 0 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static RELEASED: AtomicU64 = AtomicU64::new(0);
+        let n = RELEASED.fetch_add(released as u64, Ordering::Relaxed) + released as u64;
+        if n == released as u64 || (n >= 4096 && n.saturating_sub(released as u64) < 4096) {
+            crate::xlog_info!("D3D12.X: released {released} dynamic descriptor slots after GPU fence completion ({n} total)");
+        }
     }
 }
 
@@ -445,7 +511,13 @@ pub fn unregister(obj: usize) {
             if h.sampler {
                 release_global_sampler(f, sampler_page_descriptors(h.n, p as u32));
             } else {
-                release_global(f, page_descriptors(h.n, p as u32));
+                let first = f;
+                let count = page_descriptors(h.n, p as u32);
+                if super::residency::defer_dynamic_slots() && first >= MIN_DYNAMIC {
+                    hold_for_submit(first, count);
+                } else {
+                    release_global(first, count);
+                }
             }
         }
         match h.memory {

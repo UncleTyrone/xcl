@@ -150,6 +150,68 @@ pub fn target_variants() -> bool {
     *ON.get_or_init(|| std::env::var_os("XCL_TARGET_VARIANTS").is_none_or(|v| v != "0"))
 }
 
+/// CGBJ relay stage (`XCL_RELAY`: absent/0 off, `1` or `2`).
+pub fn relay_stage() -> u32 {
+    static STAGE: OnceLock<u32> = OnceLock::new();
+    *STAGE.get_or_init(|| match std::env::var("XCL_RELAY").ok().as_deref() {
+        Some("1") => {
+            once("XCL_RELAY", true);
+            1
+        }
+        Some("2") => {
+            once("XCL_RELAY", true);
+            2
+        }
+        _ => 0,
+    })
+}
+
+/// Fetch GPU-written ranges on the sparse copy queue (`XCL_RELAY_COPY=1`).
+pub fn relay_copy() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    latch(&ON, "XCL_RELAY_COPY")
+}
+
+/// Parallel merge/compare during landing (`XCL_WIDE_BACK=1`).
+pub fn wide_back() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    latch(&ON, "XCL_WIDE_BACK")
+}
+
+/// Multi-threaded title merge after GPU fetch (`XCL_LAND=1`).
+pub fn land() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    latch(&ON, "XCL_LAND")
+}
+
+/// Land through guard-adjacent views (`XCL_LAND_BESIDE=1`).
+pub fn land_beside() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    latch(&ON, "XCL_LAND_BESIDE")
+}
+
+/// GPU-side fill/copy prelude (`XCL_CARD_STEPS`: `1` or `2`, default `2` when set empty).
+pub fn card_steps_stage() -> u32 {
+    static STAGE: OnceLock<u32> = OnceLock::new();
+    *STAGE.get_or_init(|| match std::env::var("XCL_CARD_STEPS").ok().as_deref().map(str::trim) {
+        None | Some("") | Some("0") | Some("off") => 0,
+        Some("1") => {
+            once("XCL_CARD_STEPS", true);
+            1
+        }
+        Some(_) => {
+            once("XCL_CARD_STEPS", true);
+            2
+        }
+    })
+}
+
+/// Coalesce adjacent title buffer copy steps (`XCL_JOIN_COPIES=1`).
+pub fn join_copies() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    latch(&ON, "XCL_JOIN_COPIES")
+}
+
 /// Join compare re-hash passes across runs (`XCL_CARD_REHASH_RUNS=1`, legacy `VICTORY_CARD_REHASH_RUNS=1`).
 pub fn card_rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();

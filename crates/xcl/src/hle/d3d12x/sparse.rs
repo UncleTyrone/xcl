@@ -1248,6 +1248,18 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     if ranges.is_empty() {
         return;
     }
+    let raw = queue.as_raw() as *mut c_void;
+    if super::relay::defer_sparse_readback(raw, ranges) {
+        return;
+    }
+    readback_after_execute_sync(queue, ranges);
+}
+
+/// Synchronous sparse GPU→CPU readback (submit or relay worker thread).
+pub(super) unsafe fn readback_after_execute_sync(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
+    if ranges.is_empty() {
+        return;
+    }
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     s.note_queue(queue);
@@ -1273,6 +1285,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
         super::list_x::note_internal_wait(s.queue.as_raw() as usize, "sparse readback behind a title queue", &s.rb_fence, v);
     }
     s.readback_ranges(&merged);
+    super::land::note_sparse_landed(&merged);
 }
 
 /// Synchronize `[va, va + len)` in a sparse window for a CPU read (`ID3D12Resource::Map` with
@@ -1554,6 +1567,16 @@ pub fn note_watch(t: std::time::Duration, pages: usize) {
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
     let t0 = std::time::Instant::now();
+    let dirty: Vec<usize> = if super::port_constants::on() {
+        dirty.iter().copied().filter(|&p| !super::port_constants::touches_page(p)).collect()
+    } else {
+        dirty.to_vec()
+    };
+    let _tile_claims = if super::port::guard() {
+        Some(super::watch::claim_blocks(&super::watch::blocks_for_dirty(&dirty, page)))
+    } else {
+        None
+    };
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     s.note_queue(queue);
@@ -1571,8 +1594,9 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     }
     let mut dirty_runs = std::mem::take(&mut s.scratch_runs);
     dirty_runs.clear();
-    let mut i = 0;
-    while i < dirty.len() {
+    let mut scan_dirty = || {
+        let mut i = 0;
+        while i < dirty.len() {
         let a = dirty[i];
         let mut n = page;
         i += 1;
@@ -1598,8 +1622,15 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
             }
             x = end;
         }
+        }
+    };
+    if super::watch::guard_plan_on() {
+        super::watch::with_guards_shared(|| scan_dirty());
+    } else {
+        scan_dirty();
     }
     dirty_runs = super::card_rehash::join_runs(dirty_runs);
+    dirty_runs = super::card_steps::join_compare_runs(dirty_runs);
     let t_scanned = std::time::Instant::now();
     PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Ordering::Relaxed);
     PHASES[3].fetch_add((zero_runs.len() + dirty_runs.len()) as u64, Ordering::Relaxed);

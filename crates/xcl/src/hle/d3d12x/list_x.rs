@@ -166,13 +166,13 @@ pub(super) unsafe fn restore_after_internal_pass(list: *mut c_void, clobbered_gf
 }
 
 /// `op` with the window buffer `res` as a copy destination (back to COMMON after it)
-unsafe fn as_copy_dest(list: *mut c_void, res: usize, op: impl FnOnce()) {
+pub(crate) unsafe fn as_copy_dest(list: *mut c_void, res: usize, op: impl FnOnce()) {
     transition(list, res, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     op();
     transition(list, res, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
 }
 
-unsafe fn copy_buffer_region(list: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
+pub(crate) unsafe fn copy_buffer_region(list: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
     pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(list, PC_COPY_BUFFER_REGION)(list, dst, dst_off, src, src_off, n);
 }
 
@@ -2260,6 +2260,11 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
         note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) is not in unified memory"));
     };
+    if super::card_steps::defer_copy_to_prelude(dst as usize, src as usize, size as usize) {
+        note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
+        note_write(this as usize, dst, size);
+        return;
+    }
     note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
     if d == s && dst < src + size && src < dst + size {
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) overlap"));

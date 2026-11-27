@@ -58,6 +58,7 @@ fn refresh() {
             }
         }
     }
+    unsafe { super::console_heap::settle_for_fence() };
 }
 
 unsafe fn arm(fence: usize, value: u64) {

@@ -18,6 +18,44 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use super::console_list::{self, Layout, Param};
 
+#[derive(Clone, Copy, Debug)]
+struct PreludeGuardJob {
+    buf_idx: usize,
+    dst_off: u32,
+    src_win: u32,
+    src_off: u32,
+    most: u32,
+    lim_win: u32,
+    lim_off: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PreludeScaleJob {
+    buf_idx: usize,
+    dst_off: u32,
+    count: u32,
+    stride: u32,
+    mesh_offset: u32,
+    split: u32,
+    cap: u32,
+    src_win: u32,
+    src_off: u32,
+    has_cnt: u32,
+    cnt_win: u32,
+    cnt_off: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PreludeDrawJob {
+    buf_idx: usize,
+    dst_off: u32,
+    count: u32,
+    stride: u32,
+    draw_offset: u32,
+    src_win: u32,
+    src_off: u32,
+}
+
 #[derive(Default)]
 struct State {
     layout: Option<Arc<Layout>>,
@@ -34,6 +72,16 @@ struct State {
     uma: Vec<usize>,
     /// where the next draw's io and argument table go (blocks in `uma`)
     arena: crate::gpu::uma::Arena,
+    /// Hoisted indirect-argument clamps disabled for this segment after GPU writes or ordered indirect.
+    prelude_blocked: bool,
+    prelude_guards: Vec<PreludeGuardJob>,
+    prelude_scales: Vec<PreludeScaleJob>,
+    prelude_draws: Vec<PreludeDrawJob>,
+    /// Merged single-record mesh draws when `XCL_INDIRECT_WINDOW=1`.
+    window_clamp: super::clamp::WindowOpen,
+    /// Open inline indirect-dispatch guard batch (invalidated on barriers / ordered indirect).
+    inline_guard: bool,
+    arg_order_clean: bool,
 }
 
 static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
@@ -89,6 +137,13 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
+        s.prelude_blocked = false;
+        s.prelude_guards.clear();
+        s.prelude_scales.clear();
+        s.prelude_draws.clear();
+        s.window_clamp.clear();
+        s.inline_guard = false;
+        s.arg_order_clean = false;
         (old, std::mem::take(&mut s.uma))
     });
     console_list::hold_until_reset(old, blocks);
@@ -293,17 +348,51 @@ fn console_indirect_count(count_buf: usize, count_off: u64) -> Option<usize> {
 }
 
 fn constants_order_active(commands_at: Option<(usize, usize)>, count_at: Option<usize>, span: usize) -> bool {
-    if !super::port::constants_order() {
-        return false;
-    }
-    commands_at.is_some_and(|(_, n)| {
-        let need = if span > 0 { span } else { 1 };
-        n >= need
-    }) || count_at.is_some()
+    super::port::constants_order()
+        && super::port_constants::on()
+        && (commands_at.is_some_and(|(p, n)| {
+            let len = span.min(n);
+            len > 0 && super::port_constants::touches_range(p, len)
+        }) || count_at.is_some_and(|p| super::port_constants::touches_range(p, 4)))
 }
 
-fn prepare_constants_order_indirect(_this: *mut c_void) {
-    let _ = (_this, super::port::constants_order_alone());
+/// In-place indirect arguments: clamp at ExecuteIndirect time, not in the prelude batch.
+fn prepare_constants_order_indirect(this: *mut c_void) {
+    flush_window_draw(this);
+    invalidate_inline_guard(this);
+    with(this, |s| {
+        if super::port::constants_order_alone() || super::clamp::indirect_batch() != 1 {
+            s.prelude_guards.clear();
+            s.prelude_scales.clear();
+            s.prelude_draws.clear();
+        }
+        s.prelude_blocked = true;
+        s.arg_order_clean = false;
+    });
+}
+
+fn flush_window_draw(this: *mut c_void) {
+    with(this, |s| {
+        let w = s.window_clamp;
+        if w.is_open() {
+            s.prelude_draws.push(PreludeDrawJob {
+                buf_idx: w.buf_idx,
+                dst_off: w.dst_off,
+                count: w.count,
+                stride: w.stride,
+                draw_offset: w.draw_offset,
+                src_win: w.src_win,
+                src_off: w.src_off,
+            });
+            s.window_clamp.clear();
+        }
+    });
+}
+
+pub(super) fn invalidate_inline_guard(list: *mut c_void) {
+    with(list, |s| {
+        s.inline_guard = false;
+    });
 }
 
 /// HLSL prefix for indirect clamp shaders (`REST`, CGBJ batch budget policy).

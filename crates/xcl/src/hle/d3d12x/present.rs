@@ -122,9 +122,12 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         if let Some(t) = LAST.lock().unwrap().replace(now) {
             crate::xlog_info!("D3D12.X: {frames} frames presented, {:.1} fps over the last 300", 300.0 / (now - t).as_secs_f64());
             super::late_wait::log_frame_stats(300.0);
+            super::relay::note_frame(300.0);
         }
     }
     super::real::stop_if_device_removed();
+    super::port_constants::tick_log();
+    super::port_cbv::tick_log();
     if !PRESENTX.swap(true, Ordering::Relaxed) {
         crate::xlog_info!("D3D12.X: PresentX – the title presents its own frames ({plane_count} plane(s))");
     }
@@ -314,7 +317,7 @@ pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
             q.push(queue as usize);
         }
     }
-    super::console_heap::recycle_after_submit();
+    super::console_heap::recycle_after_submit(queue as usize);
     let (draws_skipped, _) = super::bind::skipped_counts();
     super::console_heap::maybe_log_shared_heap(draws_skipped);
     super::late_release::drain_known(false);
